@@ -20,7 +20,14 @@ system_design_oracle/
 │   └── Content/
 │       ├── <domain>.json         One file per domain (10), each with its topics
 │       └── problems/<id>.json    One file per worked design problem (10)
+├── website/
+│   ├── index.html                Page shell: sidebar, toolbar, feedback dialog
+│   ├── styles.css                Layout and theme (light/dark, phone drawer)
+│   ├── app.js                    Loads content.json; routing, layers, search, feedback
+│   └── icon.png, favicon.png     Icons
+├── .github/workflows/pages.yml   Builds the website and deploys it to GitHub Pages
 ├── scripts/
+│   ├── build_site.py             Validate content, build build/site/ (+ content.json); --serve
 │   ├── build_app.sh              Validate content, build, bundle "build/System Design Oracle.app"
 │   ├── validate_content.py       Checks content against the schema and topic/problem lists
 │   ├── make_icon.swift           Draws the app icon
@@ -32,8 +39,9 @@ system_design_oracle/
 │   ├── TOPICS.md                 Every domain and topic id, in display order
 │   ├── PROBLEMS.md               Every design problem id, domain and prompt
 │   └── images/                   README screenshots
-└── build/                        Built .app (not committed)
+└── build/                        Built .app and build/site/ (not committed)
 ```
 
 Content is copied into `System Design Oracle.app/Contents/Resources/Content` at build time;
-`swift run` reads it from `Sources/SystemDesignOracle/Content` directly.
+`swift run` reads it from `Sources/SystemDesignOracle/Content` directly. The website reads the
+same files, merged into `content.json` by `scripts/build_site.py`, so app and site never drift.

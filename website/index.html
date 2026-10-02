@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>System Design Oracle</title>
+  <meta name="description" content="Learn system design across the stack — operating systems to autonomous vehicles — in four layers of depth.">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar" aria-label="Topics">
+      <div class="sidebar-top">
+        <a class="brand" href="#/"><img src="icon.png" alt="" width="28" height="28"> System Design Oracle</a>
+        <input id="search" type="search" placeholder="Search every layer" aria-label="Search every layer" autocomplete="off">
+      </div>
+      <nav id="nav" class="nav"></nav>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+
+    <div class="main">
+      <header class="toolbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Show topics">☰</button>
+        <button class="icon-btn" id="back-btn" aria-label="Back" title="Back">‹</button>
+        <div class="toolbar-title" id="toolbar-title">System Design Oracle</div>
+        <div class="depth" role="radiogroup" aria-label="Depth">
+          <span class="depth-label">Depth</span>
+          <button role="radio" data-depth="1" title="The Gist (1)">1</button>
+          <button role="radio" data-depth="2" title="The Picture (2)">2</button>
+          <button role="radio" data-depth="3" title="How It Works (3)">3</button>
+          <button role="radio" data-depth="4" title="Expert Depth (4)">4</button>
+        </div>
+      </header>
+      <main id="content" class="content" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <button class="feedback-tab" id="feedback-btn" title="Report a mistake or suggest a topic">Feedback</button>
+  <dialog id="feedback" class="feedback">
+    <form method="dialog" id="feedback-form">
+      <h2>Send Feedback</h2>
+      <p class="muted">Spotted a mistake, want a topic, or hit a bug? This opens a pre-filled GitHub issue — nothing is sent until you submit it there.</p>
+      <div class="segmented" id="fb-kind">
+        <label><input type="radio" name="kind" value="Content fix" checked><span>Content fix</span></label>
+        <label><input type="radio" name="kind" value="Topic idea"><span>Topic idea</span></label>
+        <label><input type="radio" name="kind" value="Bug"><span>Bug</span></label>
+        <label><input type="radio" name="kind" value="Other"><span>Other</span></label>
+      </div>
+      <input id="fb-summary" type="text" placeholder="One-line summary" required>
+      <textarea id="fb-details" rows="5" placeholder="Details (optional)"></textarea>
+      <p class="muted small" id="fb-context"></p>
+      <div class="dialog-buttons">
+        <button value="cancel" formnovalidate class="btn">Cancel</button>
+        <button value="send" class="btn primary" id="fb-send">Open GitHub Issue</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

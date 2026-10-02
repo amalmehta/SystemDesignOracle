@@ -4,7 +4,7 @@
 
 - macOS 14 (Sonoma) or later
 - Xcode 15+ or the Xcode command-line tools (for `swift`) — only needed to build
-- Python 3 — only needed to build (it runs the content check)
+- Python 3 — only needed to build (it runs the content check and builds the website)
 
 ## Build and install
 
@@ -35,6 +35,26 @@ swift run
 
 `swift run` reads content straight from `Sources/SystemDesignOracle/Content`, so edits to the JSON
 show up on the next launch without rebuilding the `.app`.
+
+## Website
+
+The website in `website/` shows the same content as the app. Build it and preview it locally:
+
+```bash
+python3 scripts/build_site.py --serve
+```
+
+Then open http://localhost:8000. The build checks the content, copies `website/` to
+`build/site/`, and merges all content into `build/site/content.json`.
+
+**Deploying:** every push to `main` runs `.github/workflows/pages.yml`, which builds the site
+and publishes it to GitHub Pages at https://amalmehta.github.io/SystemDesignOracle/. In the repo's
+**Settings ▸ Pages**, the source must be **GitHub Actions**.
+
+The website has the same features as the app (depth control, search, design problems, related
+links, hidden answers, feedback tab), with web keys instead of ⌘ shortcuts: **1–4** set the depth,
+**/** focuses search, **[** goes back, **j / k** go to the next or previous topic. The depth is
+remembered in the browser. On a phone, ☰ opens the topic list.
 
 ## Use
 
@@ -69,7 +89,7 @@ show up on the next launch without rebuilding the `.app`.
    python3 scripts/validate_content.py
    ```
 
-4. Rebuild with `scripts/build_app.sh`.
+4. Rebuild with `scripts/build_app.sh` (app) and `python3 scripts/build_site.py` (website).
 
 ## Screenshots
 

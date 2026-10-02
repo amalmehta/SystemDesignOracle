@@ -73,8 +73,13 @@ Decided without asking:
 - Extras that support the brief: search across every layer, related-topic links with
   Back, hidden answers on interview questions, depth remembered between launches, a
   generated app icon.
-- The website step is not started. Per the meta-instructions it comes after the Mac app,
-  as its own step.
+- Website (built 2026-10-02 after the user asked): a static site (HTML, CSS and JS, no
+  framework) in website/. It reads the same content JSON as the app, merged by
+  scripts/build_site.py, and has the same features as the app. A GitHub Actions workflow
+  deploys it to GitHub Pages; the site is public even though the repo is private. Web keys
+  are 1–4, /, [ and j/k instead of ⌘ shortcuts.
+- The feedback tab (app and site) opens issues on the private repo, so only people with
+  access to the repo can file them.
 
 CHANGELOG:
 
@@ -94,3 +99,4 @@ CHANGELOG:
 - 2026-09-29 — changed meta-instruction: GitHub repo names have no "_" or "-"
 - 2026-10-02 — added a DELIVERABLES field after CONTEXT
 - 2026-10-02 — built v1.0 of the Mac app: 10 domains, 56 topics, 10 worked design problems, 4 reading layers; filled in OPEN QUESTIONS / ASSUMPTIONS
+- 2026-10-02 — built the website version (same content and features) with GitHub Pages deploy
