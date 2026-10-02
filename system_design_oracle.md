@@ -56,8 +56,9 @@ Asked and answered (2026-10-02):
 - Design problems (added after the user's AV trajectory-prediction example): 10 worked,
   end-to-end answers, one per domain, read in the same 4 layers. The user's prompt is
   used word for word.
-- GitHub: private repo SystemDesignOracle. The feedback tab opens a pre-filled GitHub
-  issue in the browser.
+- GitHub: repo SystemDesignOracle, created private and made public on 2026-10-02 so
+  GitHub Pages could host the website (Pages on a private repo needs a paid plan). The
+  feedback tab opens a pre-filled GitHub issue in the browser.
 
 Decided without asking:
 - Built as a SwiftUI Swift package plus a script that bundles "System Design
@@ -76,10 +77,8 @@ Decided without asking:
 - Website (built 2026-10-02 after the user asked): a static site (HTML, CSS and JS, no
   framework) in website/. It reads the same content JSON as the app, merged by
   scripts/build_site.py, and has the same features as the app. A GitHub Actions workflow
-  deploys it to GitHub Pages; the site is public even though the repo is private. Web keys
+  deploys it to GitHub Pages at https://amalmehta.github.io/SystemDesignOracle/. Web keys
   are 1–4, /, [ and j/k instead of ⌘ shortcuts.
-- The feedback tab (app and site) opens issues on the private repo, so only people with
-  access to the repo can file them.
 
 CHANGELOG:
 
@@ -100,3 +99,4 @@ CHANGELOG:
 - 2026-10-02 — added a DELIVERABLES field after CONTEXT
 - 2026-10-02 — built v1.0 of the Mac app: 10 domains, 56 topics, 10 worked design problems, 4 reading layers; filled in OPEN QUESTIONS / ASSUMPTIONS
 - 2026-10-02 — built the website version (same content and features) with GitHub Pages deploy
+- 2026-10-02 — made the repo public so GitHub Pages can host the website; site live
