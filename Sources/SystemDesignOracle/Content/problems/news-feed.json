@@ -1,0 +1,174 @@
+{
+  "id": "news-feed",
+  "title": "Social News Feed at 500M Users",
+  "domain": "distributed",
+  "prompt": "Design a social news feed for 500 million users: posting, fan-out, ranking hooks, caching, and consistency.",
+
+  "gist": "Store posts once, push post IDs into followers' cached inboxes on write, pull celebrity posts at read time, then merge, rank and hydrate from caches; accept seconds of eventual consistency except for your own posts.",
+
+  "overview": [
+    "A news feed answers one question millions of times a second: what are the newest, most interesting posts from the people I follow? The naive way is to look up everyone you follow and query their recent posts every time you open the app. That works for a thousand users but collapses at 500 million, because each feed open would touch hundreds of databases.",
+    "The standard answer is to do the work when a post is written instead of when it is read. When you post, a background job copies a tiny pointer (just the post ID) into a precomputed feed list for each of your followers, kept in memory. Opening the app then means reading one short list and filling in the post details from a cache. This is called **fan-out on write**, and it makes reads cheap because people read feeds about 100 times more often than they post.",
+    "The catch is celebrities. A user with 100 million followers would trigger 100 million writes per post. So the design is a **hybrid**: ordinary users fan out on write, while posts from very-high-follower accounts are pulled in at read time and merged. On top of the candidate list sits a ranking service that orders posts by predicted interest rather than strict time.",
+    "Finally, we deliberately choose eventual consistency: a follower may see your post a few seconds late, which nobody notices. The one exception is that you must always see your own post immediately, which we handle by stitching it into your own feed on the read path."
+  ],
+  "diagram": {
+    "caption": "Hybrid fan-out: writes push IDs to follower inboxes; reads merge, rank and hydrate.",
+    "steps": [
+      { "label": "Post API", "detail": "write post, get Snowflake ID" },
+      { "label": "Post store + log", "detail": "durable row, event to Kafka" },
+      { "label": "Fan-out workers", "detail": "push ID to followers' inboxes" },
+      { "label": "Feed cache", "detail": "per-user list of ~800 IDs" },
+      { "label": "Feed service", "detail": "merge celebs, rank, paginate" },
+      { "label": "Hydration", "detail": "post, author, counts from cache" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Users create posts (text, media references, links) and see them in their own feed immediately.",
+      "Users see a feed of posts from accounts they follow, ranked, with infinite scroll pagination.",
+      "Follow and unfollow take effect on the next feed load; deleted or hidden posts disappear from all feeds quickly.",
+      "Expose ranking hooks so ML ranking, ads insertion and integrity filtering can plug into the read path.",
+      "Show near-real-time engagement counts (likes, comments) on hydrated posts."
+    ],
+    "nonFunctional": [
+      "Feed read p99 < 200 ms server-side; post publish acknowledged < 500 ms.",
+      "99.95% availability for reads; degrade to a stale or chronological feed rather than fail.",
+      "New posts visible to followers within ~5 s p95 (eventual consistency); read-your-own-writes for the author.",
+      "Deletions and privacy changes propagate to all feeds within ~1 minute.",
+      "Cost-efficient: feed cache memory bounded per user, not per follow edge forever."
+    ],
+    "estimates": [
+      { "metric": "Feed reads", "value": "500M DAU × 10 opens ≈ 5B/day ≈ 58K QPS avg, ~150K QPS peak" },
+      { "metric": "Posts written", "value": "500M × 0.2 posts/day ≈ 100M/day ≈ 1.2K QPS avg, ~4K peak" },
+      { "metric": "Fan-out writes", "value": "100M posts × ~300 avg followers ≈ 30B inbox inserts/day ≈ 350K/s avg" },
+      { "metric": "Feed cache size", "value": "500M users × 800 IDs × ~16 B ≈ 6.4 TB raw, ~15 TB with overhead and replicas" },
+      { "metric": "Post storage", "value": "100M/day × ~1 KB metadata ≈ 100 GB/day ≈ 36 TB/year (media in blob store)" },
+      { "metric": "Hydration reads", "value": "150K feed QPS × 20 posts/page ≈ 3M post lookups/s, ~99% cache hits" }
+    ]
+  },
+  "stages": [
+    {
+      "name": "API & Post Write Path",
+      "summary": "Accept a post durably and cheaply, then hand off all expensive work asynchronously via a log.",
+      "points": [
+        "Generate a 64-bit time-sortable ID (Snowflake-style: timestamp + shard + sequence) so post IDs sort chronologically without a central counter.",
+        "Write the post row to a sharded store (sharded by post ID or author ID) and emit a `PostCreated` event to Kafka in the same transaction via an outbox table, so no post is ever lost between DB and log.",
+        "Media uploads go directly to the blob store via presigned URLs; the post only carries media references, keeping the write path small.",
+        "Return success once the row and outbox are committed; fan-out, notifications, search indexing and integrity scanning all consume the event independently.",
+        "Idempotency key per client request prevents double posts on retries over flaky mobile networks."
+      ],
+      "deepDive": [
+        "The **transactional outbox** pattern matters because dual writes (DB then Kafka) fail partially: the DB commits and the process crashes before publishing, or vice versa. Writing the event to an outbox table in the same local transaction and having a relay (or CDC from the binlog, e.g. Debezium) publish it gives at-least-once delivery; downstream consumers are idempotent on post ID, so duplicates are harmless.",
+        "Integrity checks (spam, CSAM hashes, policy classifiers) run both synchronously for cheap checks (hash match < 20 ms) and asynchronously for heavy models. A post can be fanned out in a `pending` visibility state and revealed when async checks clear, or fan-out can be delayed a few seconds for new or low-trust accounts — a useful lever against spam bursts."
+      ]
+    },
+    {
+      "name": "Data Model",
+      "summary": "Separate the social graph, the post store and the per-user feed inbox, because each has a radically different access pattern.",
+      "points": [
+        "Posts: `post_id → {author_id, created_at, body, media_refs, visibility}` in a sharded MySQL/Vitess or Cassandra-style store; immutable except edits and deletes.",
+        "Social graph: two adjacency lists, `followers(user)` and `following(user)`, sharded by user ID (like Meta's TAO or Twitter's FlockDB), because fan-out needs followers and the pull path needs following.",
+        "Feed inbox: a per-user capped list of `(post_id, author_id, ts)` in Redis-like memory, trimmed to ~800 entries; it is a derived cache, rebuildable from the graph and post store.",
+        "Engagement counters live in a separate high-write store with sharded counters, since likes are 10–100× more frequent than posts.",
+        "Celebrity flag on users (followers > ~100K or high post rate) decides push vs pull per author."
+      ],
+      "deepDive": [
+        "Storing only IDs in the inbox is the key memory decision: 16 bytes per entry versus ~1 KB for a full post means the inbox for every user fits in tens of terabytes of RAM across a cluster, and edits or deletions only touch the single canonical post row. The price is a hydration step on read, which a post cache with a high hit rate makes cheap.",
+        "Graph shards for celebrity accounts are hot: a 100M-follower list is ~800 MB of IDs. Store such lists paged (follower IDs in chunks of e.g. 10K) so fan-out workers and unfollow operations can stream them, and so a single huge row never blocks a shard."
+      ]
+    },
+    {
+      "name": "Fan-out",
+      "summary": "Push post IDs into followers' inboxes for normal authors; skip push for celebrities and inactive followers.",
+      "points": [
+        "Fan-out workers consume `PostCreated`, page through the author's followers, and batch `LPUSH + LTRIM` into inbox shards grouped by destination shard to cut round trips.",
+        "Hybrid threshold: authors above ~100K followers are not pushed; their posts are pulled at read time. This caps worst-case fan-out per post and removes the celebrity write storm.",
+        "Skip inactive followers (no login in 30 days); their feed is rebuilt on next login from the pull path, saving a large share of writes and memory.",
+        "Prioritise: fan out to recently active followers first, so the people most likely to open the app see the post soonest.",
+        "Deletes and unfollows emit events too; workers remove entries lazily, and the read path filters by visibility as a safety net."
+      ],
+      "deepDive": [
+        "With ~350K inbox inserts per second average and spikes several times that, fan-out is the dominant write load. Grouping inserts by destination shard and pipelining turns millions of individual writes into tens of thousands of batched calls. Workers are horizontally scaled consumers of a partitioned topic; lag on that topic is the main SLO metric because it directly equals feed staleness.",
+        "The push/pull threshold is not one number but a cost model: push cost ≈ followers × write cost, pull cost ≈ reads of followers × merge cost. Twitter's historical design pushed for most accounts and pulled for very large ones; Instagram and Facebook lean further toward pull plus heavy ranking because their candidate sets are larger. Tuning it per author by follower count and post frequency keeps both costs bounded."
+      ]
+    },
+    {
+      "name": "Read Path & Ranking Hooks",
+      "summary": "Assemble candidates from the inbox plus pulled celebrity posts, pass them through ranking and filtering stages, and return a stable page.",
+      "points": [
+        "Candidate generation: read the user's inbox (~800 IDs), plus recent posts from each followed celebrity (cached per-author timelines), plus optional out-of-network recommendations.",
+        "Ranking hook: a pluggable stage that scores ~500–1,500 candidates with a lightweight model, then a heavier model on the top ~100; budget ~50 ms total.",
+        "Filtering hook: remove blocked, muted, deleted or policy-violating posts and apply diversity rules (no five posts in a row from one author).",
+        "Pagination by cursor over a ranked snapshot cached for the session (~10 min), so scrolling does not reshuffle or duplicate posts.",
+        "Stitch the user's own most recent posts in at the top for read-your-own-writes, regardless of fan-out progress."
+      ],
+      "deepDive": [
+        "Ranking is the reason feeds stopped being simple timelines. A modern stack has candidate sources, a first-stage ranker (e.g. a two-tower or GBDT model on cheap features), a second-stage ranker (a larger multitask model predicting like, comment, share, dwell, hide) and a final blending layer for ads and diversity. The feed system's job is to make those hooks fast: precompute features in a feature store keyed by user and post, cap candidate counts, and enforce a timeout so a slow model falls back to the previous stage's order rather than an error.",
+        "The ranked snapshot cache solves a subtle consistency problem: if every page request reranks, new posts and changed scores move items between pages, creating duplicates and gaps. Snapshotting the ranked ID list on the first page and paginating through it with an opaque cursor gives the user a stable session; new posts are surfaced via a 'new posts' pill on pull-to-refresh."
+      ]
+    },
+    {
+      "name": "Caching & Hydration",
+      "summary": "Turn a page of post IDs into full posts with sub-millisecond cache reads, protected against hot keys and stampedes.",
+      "points": [
+        "Layered caches: post objects, user profiles and counts in a Memcached/Redis tier sharded by key, with a small in-process cache on feed servers for the hottest items.",
+        "Multi-get per page (20 posts → one batched request per shard) keeps hydration to a couple of round trips.",
+        "Lease or request-coalescing on cache miss prevents thundering herds when a viral post's entry expires.",
+        "Hot-key replication: detect keys above a QPS threshold and replicate them across several cache nodes or into local caches.",
+        "Invalidate on write via the same event log (edit, delete, count updates), with short TTLs as a backstop."
+      ],
+      "deepDive": [
+        "At ~3M post lookups per second, even a 1% miss rate is 30K DB reads per second, so cache hit rate is a capacity plan, not a nicety. Meta's memcache paper describes the key tricks still used in 2026: leases to stop stampedes and stale sets, regional pools so a cold region warms from a warm one, and gutter pools that absorb load when a cache node dies instead of letting misses fall through to the database.",
+        "Counts are handled differently from post bodies: exact like counts on every render are expensive and unnecessary. Serve approximate counts from a counter cache updated asynchronously (aggregated in a stream processor every second or so), and only show exact values on the post detail page."
+      ]
+    },
+    {
+      "name": "Consistency & Scaling",
+      "summary": "Choose which guarantees matter (own writes, deletes, privacy) and accept eventual consistency elsewhere; scale by sharding everything on user ID and running active-active regions.",
+      "points": [
+        "Read-your-own-writes via author stitching and routing the author's reads to the region that took the write for a short window.",
+        "Deletes and privacy changes are enforced at read time by checking post visibility during hydration, so a stale inbox entry can never leak a deleted post.",
+        "Inbox and graph sharded by user ID with consistent hashing; feed servers are stateless and autoscale on QPS.",
+        "Multi-region: posts replicate asynchronously across regions; each region runs its own fan-out and feed caches, so a region failure loses at most seconds of feed freshness.",
+        "Degradation ladder: if ranking is down, serve chronological; if the inbox shard is down, rebuild on the fly via pull from following; if hydration is slow, return fewer posts."
+      ],
+      "deepDive": [
+        "The feed is a materialised view, and the whole design follows from treating it that way: the source of truth is posts plus graph, everything else is derived and can be rebuilt. That lets us use cheaper, weaker storage for the inbox (memory with async replication), bound its size, and recover from corruption or a lost shard by re-running pull-based assembly for affected users, throttled so the rebuild itself does not overload the graph and post stores.",
+        "Cross-region replication lag (typically 100 ms to a few seconds) is fine for followers but breaks read-your-own-writes if the author's next request lands in another region. Sticky routing for a few seconds after a write, or carrying a 'last write timestamp' in the session and waiting for or bypassing the local replica when it is behind, closes that gap without global strong consistency."
+      ]
+    }
+  ],
+  "tradeoffs": [
+    { "choice": "Fan-out on write (push)", "pro": "Reads are a single cheap list fetch; latency predictable.", "con": "Write amplification proportional to followers; wasted work for inactive users; celebrity storms." },
+    { "choice": "Fan-out on read (pull)", "pro": "No write amplification; always fresh; trivial follow/unfollow.", "con": "Each read touches many author timelines; high and variable read latency at scale." },
+    { "choice": "Store IDs only in inboxes", "pro": "Tiny memory footprint; edits and deletes touch one row.", "con": "Requires a hydration step and a very high cache hit rate on posts." },
+    { "choice": "Eventual consistency for followers", "pro": "Async fan-out, cheap multi-region, high availability.", "con": "Posts appear seconds late; needs special handling for own writes and deletions." },
+    { "choice": "Ranked feed vs chronological", "pro": "Higher engagement; surfaces best content from large candidate sets.", "con": "Ranking latency, feature infrastructure cost, and user complaints about missed posts." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Celebrity fan-out storm", "description": "A mis-set threshold or a mass-follow event triggers tens of millions of inbox writes, building Kafka lag that delays every user's feed. Mitigate with the hybrid threshold, per-author rate limits on fan-out, and separate topics/worker pools for large authors." },
+      { "name": "Cache stampede on a viral post", "description": "A hot post's cache entry expires and thousands of requests miss simultaneously, hammering one DB shard. Leases, request coalescing, jittered TTLs and hot-key replication prevent it." },
+      { "name": "Deleted post resurfaces", "description": "Stale inbox entries or a lagging replica serve a post after deletion, a serious trust and legal problem. Enforce visibility at hydration time from the canonical post row, not from inbox state." },
+      { "name": "Ranking dependency outage", "description": "The ranking model service times out and the whole feed fails. Hard timeouts with fallback to the previous stage's ordering or chronological order keep the feed up." },
+      { "name": "Inbox shard loss", "description": "A memory shard dies and millions of users have empty feeds. Replicate inbox shards, and rebuild affected users lazily via pull with rate limiting to avoid overloading the graph store." }
+    ],
+    "realSystems": [
+      { "name": "Twitter/X timelines", "note": "Classic hybrid: fan-out of tweet IDs into Redis-backed home timelines, with very large accounts merged at read time, followed by a multi-stage ML ranking pipeline." },
+      { "name": "Meta Facebook/Instagram Feed", "note": "TAO for the social graph, memcache at massive scale, and ranking-heavy candidate generation with multi-stage models over thousands of candidates." },
+      { "name": "LinkedIn Feed", "note": "Mix of push and pull with a feed-mixer service, Kafka for event fan-out, and a multi-objective ranker balancing engagement and creator distribution." }
+    ],
+    "questions": [
+      { "q": "How do you pick the celebrity threshold?", "a": "Model it as cost: push cost ≈ followers × write cost per post × post rate, pull cost ≈ active followers' feed opens × per-author merge cost. Start around 100K followers, then tune per author on observed fan-out lag and read latency; prolific posters with many followers flip to pull earlier." },
+      { "q": "A user unfollows someone. What happens to their feed?", "a": "Record the edge removal in the graph immediately. The read path filters candidates by the current following set (a cached bloom filter or set check), so the author vanishes on the next load; an async job removes stale inbox entries later." },
+      { "q": "How do you handle a user who has been away for 3 months?", "a": "We skipped fan-out to them, so their inbox is empty or evicted. On login, rebuild via pull: fetch recent posts from their ~top-N followed accounts' timelines, rank, and write the result back into the inbox, then resume push for them." },
+      { "q": "How do you make the feed survive a full region outage?", "a": "Run active-active regions with async replication of posts and graph. Route users to a healthy region; their inbox there may be slightly stale or cold, so fall back to pull-based assembly while fan-out catches up. Accept seconds of lost freshness rather than unavailability." },
+      { "q": "Where does ads insertion fit?", "a": "As a blending stage after organic ranking: an ads service returns candidate ads with bids and predicted engagement, and a mixer places them at allowed slots under spacing and frequency-cap rules. It runs in parallel with organic ranking to stay within the latency budget." }
+    ]
+  },
+
+  "related": [ "caching", "partitioning", "message-queues", "replication", "stream-processing" ]
+}

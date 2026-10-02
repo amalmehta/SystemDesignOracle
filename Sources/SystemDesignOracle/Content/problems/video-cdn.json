@@ -1,0 +1,173 @@
+{
+  "id": "video-cdn",
+  "title": "Global CDN for On-Demand Video",
+  "domain": "networking",
+  "prompt": "Design a global CDN for on-demand video streaming. Cover request routing, caching tiers, transport, and handling a viral spike.",
+
+  "gist": "Chop video into segments, cache them in edge servers inside ISPs backed by regional mid-tier caches and an origin shield, steer clients by DNS/anycast and load, and collapse viral-spike misses.",
+
+  "overview": [
+    "Streaming video is the largest consumer of internet bandwidth, so the core idea of a CDN is simple: keep copies of the video close to viewers so bytes travel a few kilometres from a nearby server instead of across oceans from the origin. Videos are encoded at several qualities and chopped into small segments (2–6 seconds each), and the player fetches them one at a time over HTTP, switching quality as network conditions change.",
+    "Copies live in layers. **Edge** servers sit in internet exchanges and even inside ISPs' networks, holding the most popular content on fast SSDs. When an edge does not have a segment, it asks a larger **regional** cache, which in turn asks an **origin shield** in front of the storage where the master copies live. Each layer absorbs most of the requests from the one below it, so the origin sees a tiny fraction of traffic.",
+    "Routing decides which edge serves each viewer. DNS or anycast gets a viewer to a nearby site, and a steering service picks a specific server based on health, load and what that server already has cached. The transport is HTTP over TCP or, increasingly in 2026, HTTP/3 over QUIC, tuned for throughput.",
+    "A viral spike is the stress test: a video suddenly wanted by millions. The design handles it by collapsing duplicate misses into one upstream fetch, spreading hot content across more servers, pre-positioning content we predict will be popular, and gracefully lowering bitrate before anything falls over."
+  ],
+  "diagram": {
+    "caption": "Viewer requests flow edge → regional → shield → origin, each tier absorbing most misses.",
+    "steps": [
+      { "label": "Player", "detail": "ABR over HLS/DASH segments" },
+      { "label": "Steering", "detail": "DNS/anycast + manifest URLs" },
+      { "label": "Edge cache", "detail": "in-ISP/IXP, SSD + RAM, ~90–95% hits" },
+      { "label": "Regional tier", "detail": "large HDD/SSD, catches long tail" },
+      { "label": "Origin shield", "detail": "one collapsed fetch per object" },
+      { "label": "Origin storage", "detail": "object store of encoded renditions" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Serve HLS/DASH (CMAF) manifests and media segments for a catalogue of on-demand titles at multiple bitrates and codecs (H.264, HEVC, AV1).",
+      "Route each viewer to a healthy, nearby, lightly loaded server that is likely to have the content cached.",
+      "Support DRM license flows and signed, expiring URLs so only entitled viewers fetch content.",
+      "Purge or update content across the network within minutes; pre-position new releases before launch.",
+      "Report per-session QoE telemetry (start time, rebuffers, bitrate) for routing and capacity decisions."
+    ],
+    "nonFunctional": [
+      "Video start time < 2 s p90; rebuffer ratio < 0.5% of watch time.",
+      "Origin offload > 98% of bytes; edge hit ratio > 90% by bytes.",
+      "99.99% availability per region, with automatic failover around server, site and ISP link failures.",
+      "Scale to tens of Tbps aggregate peak and absorb a 10× spike on a single title within minutes.",
+      "Cost: most bytes served from in-ISP appliances to minimise transit spend."
+    ],
+    "estimates": [
+      { "metric": "Peak egress", "value": "20M concurrent streams × 5 Mbps avg ≈ 100 Tbps" },
+      { "metric": "Segment request rate", "value": "20M streams ÷ 4 s segments ≈ 5M req/s (plus manifests)" },
+      { "metric": "Per edge server", "value": "~400 Gbps NIC capacity per box; 100 Tbps ÷ ~200 Gbps usable ≈ 500 boxes minimum, ~5–10K with geography and headroom" },
+      { "metric": "Catalogue size", "value": "50K titles × 2 h × ~10 renditions × ~2 GB/h ≈ 2 PB at origin" },
+      { "metric": "Edge working set", "value": "Top ~10–20% of catalogue serves ~80–90% of views → ~200–400 TB per region, fits a site of SSD boxes" },
+      { "metric": "Origin load", "value": "2% miss of 100 Tbps ≈ 2 Tbps at the shield, far less at origin after collapsing" }
+    ]
+  },
+  "stages": [
+    {
+      "name": "Content Preparation",
+      "summary": "Encode once into segmented, cache-friendly renditions so every downstream layer deals in small immutable objects.",
+      "points": [
+        "Per-title (or per-shot) encoding ladders: choose bitrate/resolution pairs by content complexity, cutting bytes 20–50% versus a fixed ladder.",
+        "Package as CMAF fMP4 segments of 2–6 s, shared by HLS and DASH manifests so one set of bytes serves every player.",
+        "Offer AV1 (and HEVC) alongside H.264; AV1 saves ~30% bytes at equal quality on devices with hardware decode.",
+        "Segment URLs are content-addressed or versioned, making objects immutable so caches never need revalidation.",
+        "Encrypt with CENC (common encryption) once; DRM keys are delivered separately via a license service."
+      ],
+      "deepDive": [
+        "Segment duration is a real trade: short segments (2 s) let ABR react fast and start quicker, but multiply request count and per-request overhead, and hurt compression slightly because each segment must start with a keyframe. On-demand services typically settle around 4–6 s; low-latency live uses shorter segments or chunked CMAF parts.",
+        "Immutability is what makes the cache hierarchy simple. Because a segment URL never changes meaning, edges can cache with very long TTLs, there is no invalidation on the hot path, and purge is only needed for takedowns or re-encodes, which publish new URLs and let old ones age out."
+      ]
+    },
+    {
+      "name": "Request Routing",
+      "summary": "Get each viewer to the best edge server using a mix of DNS or anycast for coarse placement and an application-level steering service for precise choice.",
+      "points": [
+        "Coarse: DNS-based geo/ISP mapping (using resolver IP and EDNS Client Subnet) or anycast VIPs that BGP routes to the nearest site.",
+        "Fine: the playback API returns manifests whose segment URLs point to specific servers or clusters chosen by a steering service using health, load, link utilisation and cache affinity.",
+        "Content-aware hashing: consistent hashing (e.g. rendezvous hashing) of title/segment to servers within a site so each object lives on few boxes, maximising site-level hit ratio.",
+        "Client-side failover: manifests list multiple CDN hosts; the player retries the next host on errors or slow throughput.",
+        "Multi-CDN: a steering layer can split traffic between in-house and third-party CDNs by real-time QoE and cost."
+      ],
+      "deepDive": [
+        "Anycast is operationally simple and fails over automatically through BGP, but it routes by network topology, not by load or cache contents, and route changes mid-session can break TCP connections. DNS steering knows more but is limited by resolver location and TTL caching. Large video services therefore lean on **application-layer steering**: the playback API already knows the user, device and title, so it can embed explicit server URLs in the manifest, giving per-session control and instant reaction to load.",
+        "Within a site, cache affinity matters as much as distance. If every server cached everything, the effective site cache would be one server's size. Hashing objects to a subset of servers (with popular objects replicated to more servers) makes the site behave like one large cache with aggregate capacity, which can lift hit ratio by tens of points for the long tail."
+      ]
+    },
+    {
+      "name": "Caching Tiers",
+      "summary": "Build an edge → regional → shield hierarchy where each tier is sized and tuned for a different slice of the popularity curve.",
+      "points": [
+        "Edge (in-ISP appliances and IXP sites): RAM + NVMe SSD, holds the hot head of the catalogue; serves the vast majority of bytes.",
+        "Regional/mid-tier: big HDD-heavy boxes holding a much larger slice, catching edge misses for the long tail within a continent.",
+        "Origin shield: a small set of designated caches per origin so a miss from any region becomes at most one fetch from origin.",
+        "Eviction by a popularity-aware policy (LRU variants with admission control like TinyLFU or 'second hit' admission) so one-off views do not flush hot content.",
+        "Proactive fill: predicted-popular content (new releases, regional trends) is pushed to edges overnight during off-peak hours using spare link capacity."
+      ],
+      "deepDive": [
+        "Video popularity is Zipf-like with a heavy tail, so cache admission is as important as eviction. Admitting every miss into SSD churns flash (wearing it out) and evicts objects that will be requested again. Admission filters that only cache an object on its second request within a window, or a frequency sketch like TinyLFU, keep SSD write amplification down and hit ratios up.",
+        "Netflix Open Connect shows the extreme of proactive fill: because its catalogue and release schedule are known, it predicts what each appliance will need and fills it during off-peak 'fill windows', so peak-hour traffic is almost all hits. A general-purpose CDN cannot predict as well and relies more on reactive pull-through caching with tiered fetching."
+      ]
+    },
+    {
+      "name": "Transport",
+      "summary": "Move segments at high throughput with low startup delay using tuned HTTP/2 or HTTP/3 and kernel-efficient serving.",
+      "points": [
+        "HTTP/3 over QUIC avoids TCP head-of-line blocking, gives 0/1-RTT connection setup and connection migration across Wi-Fi/cellular changes.",
+        "Congestion control BBR (v2/v3) on servers sustains throughput on lossy, high-BDP mobile paths better than loss-based CUBIC.",
+        "Kernel TLS and sendfile (or io_uring) serve encrypted bytes straight from page cache/NVMe with minimal copies, letting one box push 400 Gbps class.",
+        "Connection reuse and TLS session resumption cut handshake overhead per segment.",
+        "Player ABR (throughput plus buffer-based, e.g. BOLA-style) picks the bitrate per segment; server-side pacing avoids bursty queues."
+      ],
+      "deepDive": [
+        "Throughput per server is a hardware and kernel problem. Netflix has published serving close to 400 Gbps of TLS video from a single FreeBSD box by combining kernel TLS (often with NIC TLS offload), async sendfile and NUMA-aware memory placement, avoiding copies between kernel and user space. The lesson for design: the edge fleet size, and therefore cost, is driven by bytes per second per box, which depends on these optimisations more than on CPU count.",
+        "QUIC moves congestion control into user space, so it is easier to iterate but costs more CPU per byte than kernel TCP with offloads. Many video CDNs in 2026 serve HTTP/3 to mobile clients where connection migration and loss recovery help most, while keeping tuned TCP with kTLS for TVs and fixed broadband where throughput per watt dominates."
+      ]
+    },
+    {
+      "name": "Viral Spike Handling",
+      "summary": "Absorb a sudden surge on one title by collapsing misses, replicating hot objects wider, and shedding quality before availability.",
+      "points": [
+        "Request collapsing: concurrent misses for the same segment at an edge or shield become one upstream fetch; others wait on it.",
+        "Hot-object replication: when an object's QPS crosses a threshold, consistent hashing widens its replica set from 1–2 servers to many in the site.",
+        "Tiered fetching ensures the origin sees one request per object per shield, no matter how many edges miss simultaneously.",
+        "Overflow steering: when a site's links saturate, steer new sessions to neighbouring sites or a partner CDN.",
+        "Graceful degradation: cap the top bitrate for new sessions in a congested region before admitting failures."
+      ],
+      "deepDive": [
+        "The dangerous moment is not steady-state popularity but the first minutes, when the title is cold everywhere and millions of players request the first segments at once. Without collapsing, each edge server passes every miss upstream, and the mid-tier and origin see a multiplicative storm. Collapsing at every tier (with a short wait timeout and stale-while-revalidate for manifests) bounds upstream load to roughly one request per object per cache node per tier.",
+        "For predictable spikes (a premiere, a big match replay) we pre-warm: push the first N minutes of every rendition to all edges ahead of time, raise replica counts and reserve partner-CDN capacity. For unpredictable virality, trend detection on request logs (seconds-granularity counts per title per region) triggers the same actions automatically within a minute or two."
+      ]
+    },
+    {
+      "name": "Operations & Observability",
+      "summary": "Close the loop between QoE telemetry, routing and capacity so the system steers around problems automatically.",
+      "points": [
+        "Client QoE beacons (startup time, rebuffers, bitrate, errors) aggregated per ISP, site and server in near real time.",
+        "Health checks plus passive signals (error rates, throughput per connection) feed the steering service, which drains bad servers in seconds.",
+        "Capacity planning per ISP link: peak-hour utilisation targets ~70–80% to keep headroom for failover.",
+        "Safe rollout of cache software and config by canarying on a few servers per site and watching QoE deltas.",
+        "Purge API with fan-out to all tiers, used for legal takedowns, completing within minutes."
+      ],
+      "deepDive": [
+        "Server-side metrics alone hide the real problem: a server can be healthy while a congested ISP peering link ruins throughput. Client-side QoE is the ground truth, and mapping it to (ISP, site, server, path) lets the steering system detect a bad link and shift traffic, often before users complain. This feedback loop is what separates a good video CDN from a generic HTTP cache."
+      ]
+    }
+  ],
+  "tradeoffs": [
+    { "choice": "Anycast vs DNS/app-layer steering", "pro": "Anycast is simple and fails over via BGP automatically.", "con": "Ignores load and cache contents; route flaps can break sessions. App-layer steering is precise but more complex." },
+    { "choice": "Deep in-ISP appliances vs IXP sites", "pro": "In-ISP boxes eliminate transit cost and sit closest to users.", "con": "Many small sites to operate, limited capacity per site, lower hit ratio per box." },
+    { "choice": "Short vs long segments", "pro": "Short segments start faster and adapt quicker.", "con": "More requests, more overhead, slightly worse compression." },
+    { "choice": "Proactive fill vs pull-through", "pro": "Proactive fill makes peak-hour traffic almost all hits.", "con": "Needs accurate popularity prediction and wastes capacity on misses in the forecast." },
+    { "choice": "HTTP/3 (QUIC) vs tuned TCP", "pro": "QUIC gives faster setup, no HOL blocking, connection migration on mobile.", "con": "Higher CPU per byte and less mature hardware offload than kTLS over TCP." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Thundering herd on a cold title", "description": "A surprise release sends millions of misses upstream at once, overloading mid-tier and origin. Request collapsing at every tier, origin shields and pre-warming prevent it." },
+      { "name": "Peering link congestion", "description": "Servers are healthy but an ISP interconnect saturates at peak, causing rebuffers for a whole ISP. Detect via client QoE per path and steer to alternative sites or reduce bitrate." },
+      { "name": "Cache pollution", "description": "A crawler or one-off long-tail views evict hot content, dropping hit ratio and spiking origin load. Use admission control and separate pools for suspected bots." },
+      { "name": "Bad config push", "description": "A global config change (e.g. wrong cache key including a query parameter) collapses hit ratio network-wide. Stage rollouts per site with automatic rollback on hit-ratio or QoE regressions." },
+      { "name": "Token or DRM service outage", "description": "Segments are cached but license or URL-signing services fail, so nobody can start playback. Run them multi-region with generous token lifetimes and cached licenses for active sessions." }
+    ],
+    "realSystems": [
+      { "name": "Netflix Open Connect", "note": "Purpose-built appliances embedded in ISPs, proactive off-peak fill and app-layer steering; serves essentially all Netflix video bytes." },
+      { "name": "YouTube / Google Global Cache", "note": "Google Global Cache nodes inside ISPs plus Google's edge network, with QUIC widely deployed for video delivery." },
+      { "name": "Akamai, Cloudflare, Fastly", "note": "General-purpose CDNs offering tiered caching, origin shields, request collapsing and anycast or DNS-based routing for many video customers." }
+    ],
+    "questions": [
+      { "q": "How do you decide which server inside a site holds a given segment?", "a": "Consistent or rendezvous hashing on the object key picks a small replica set, so the site behaves like one big cache. Popularity raises the replica count for hot objects so no single server becomes a bottleneck." },
+      { "q": "Why not just make every edge cache everything?", "a": "Edges have tens to hundreds of TB while the full catalogue with all renditions is petabytes; and duplicating everything on every box would cut effective site capacity to one server's disk. Tiering and hashing give better aggregate hit ratio per dollar." },
+      { "q": "How would you support live streaming on the same CDN?", "a": "Live segments are created in real time, so there is no proactive fill. Use short segments or LL-HLS/CMAF chunks, aggressive request collapsing, short manifest TTLs with stale-while-revalidate, and fan-out from a small set of origin packagers through the tiers." },
+      { "q": "What metrics would you alert on first?", "a": "Client-side rebuffer ratio and video start time per ISP and region, then edge byte hit ratio, origin egress, and per-link utilisation. Server CPU is a lagging indicator." },
+      { "q": "How do signed URLs interact with caching?", "a": "Strip the token from the cache key: validate the signature at the edge, then look up the object by its path only. Otherwise every viewer's unique token creates a unique cache entry and the hit ratio collapses." }
+    ]
+  },
+
+  "related": [ "cdn", "dns", "quic-http", "tcp-ip", "caching", "load-balancing" ]
+}

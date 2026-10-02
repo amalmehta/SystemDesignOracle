@@ -1,0 +1,183 @@
+{
+  "id": "av-trajectory-prediction",
+  "title": "Trajectory Prediction for an Autonomous Vehicle",
+  "domain": "autonomous-vehicles",
+  "prompt": "Design the ML system that predicts the future trajectories of other agents (vehicles, pedestrians, cyclists) around an autonomous vehicle, and feeds those predictions into the planner. Cover it end to end: data, model, training, evaluation, and deployment on the vehicle.",
+
+  "gist": "Auto-label fleet logs into agent tracks, train a vectorized scene transformer that outputs several weighted future trajectories per agent, judge it by planner-in-the-loop closed-loop sim, and ship it under a ~20 ms onboard budget.",
+
+  "overview": [
+    "An autonomous vehicle has to guess what everyone around it will do over the next few seconds: will that car merge, will that pedestrian step off the curb? The prediction system takes the tracked objects from perception plus the map, and outputs for each nearby agent a handful of possible future paths, each with a probability. The planner then picks a path for our own car that is safe against the likely futures and cautious against the dangerous unlikely ones.",
+    "The fuel is data. Every car in the fleet records its drives. Because we already know what each agent actually did next, the logs label themselves: a large offline perception model (which can look at the future and use far more compute than the car) reconstructs clean tracks of every agent, and the future of each track becomes the training target. No humans draw trajectories; humans only audit and fix the hard cases.",
+    "The model reads the scene as a set of vectors (lane polylines, crosswalks, traffic-light states and each agent's recent history) and uses a transformer to let agents and map elements attend to each other. It outputs multiple futures per agent because the future really is multimodal: a car at an intersection might go straight, turn or stop, and averaging those into one path gives a path nobody would drive.",
+    "The hardest part is knowing whether a new model is better. Open-loop metrics like minADE are cheap but can improve while driving gets worse, so the release gate is the planner driving in closed-loop simulation and on the road in shadow mode. On the car, the model must run in roughly 20 ms every 100 ms cycle on shared automotive compute, with a safe fallback if it is late."
+  ],
+
+  "diagram": {
+    "caption": "From fleet logs to predictions the planner consumes, and back again.",
+    "steps": [
+      { "label": "Fleet logs", "detail": "sensor + perception logs, PBs per week" },
+      { "label": "Auto-labeling", "detail": "offboard tracker builds ground-truth futures" },
+      { "label": "Scene encoder", "detail": "vectorized map + agent histories into a transformer" },
+      { "label": "Multimodal decoder", "detail": "K=6 trajectories + probabilities per agent" },
+      { "label": "Evaluation", "detail": "minADE/FDE, miss rate, closed-loop sim" },
+      { "label": "Onboard runtime", "detail": "TensorRT, ~20 ms at 10 Hz" },
+      { "label": "Planner", "detail": "cost + safety checks over predicted futures" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Predict 6–8 s future trajectories for every relevant agent (vehicles, pedestrians, cyclists, others) within ~100–150 m, at 10 Hz.",
+      "Output multiple modes per agent (e.g. K=6), each with a probability, a time-indexed path and per-step uncertainty (e.g. Gaussian or Laplace scales).",
+      "Condition on HD or online map, traffic-light state, agent history (~1–2 s) and, optionally, the AV's own planned route so interactions are modeled.",
+      "Expose predictions through a stable, versioned interface the planner can consume, including per-agent intent/semantic labels (yielding, crossing, cutting in).",
+      "Continuously ingest new fleet data and mine failures so each release fixes the long tail."
+    ],
+    "nonFunctional": [
+      "Latency: p99 under ~20–30 ms for the whole prediction module on the onboard SoC, within a 100 ms perception-to-control cycle.",
+      "Safety: graceful degradation (constant-velocity or physics fallback) on timeout or failure; deterministic, reproducible builds; traceability to ISO 26262 / SOTIF (ISO 21448) processes.",
+      "Coverage of rare-but-critical behaviors (jaywalkers, emergency vehicles, U-turns) judged by scenario-slice metrics, not averages.",
+      "Scale: train on 10^8+ agent-trajectory samples; iterate in days, not months.",
+      "Calibration: probabilities must mean what they say, since the planner treats a 5% mode differently from a 50% mode."
+    ],
+    "estimates": [
+      { "metric": "Agents per scene", "value": "~20 typical, 200+ in dense urban scenes; predict for the ~64–128 nearest/most relevant" },
+      { "metric": "Output size per cycle", "value": "128 agents × 6 modes × 80 steps (8 s at 10 Hz) × (x,y,σ) ≈ 184k floats ≈ 0.7 MB" },
+      { "metric": "Training samples", "value": "1M hours of driving × 3,600 s ÷ ~5 s sampling stride ≈ 700M scenes; ×~20 agents ≈ 1.4e10 agent-futures (subsample heavily)" },
+      { "metric": "Raw log volume", "value": "~1 TB per car per 8 h shift (cameras + lidar); 1,000 cars ≈ 1 PB/day before selection" },
+      { "metric": "Model compute", "value": "~10–30M params; ~5–20 GFLOPs per cycle; on a ~250–1,000 TOPS SoC at ~20–30% utilization fits in ~5–15 ms" },
+      { "metric": "Training cost", "value": "~700M scenes × a few epochs on 64–256 GPUs ≈ 1–3 days per run" }
+    ]
+  },
+
+  "stages": [
+    {
+      "name": "Data",
+      "summary": "Turn raw fleet logs into clean agent tracks with known futures, and deliberately over-sample the interesting moments.",
+      "points": [
+        "**Auto-label offboard**: run a large non-causal perception and tracking model over logs (it sees past and future frames, uses bigger models and multi-sweep lidar), then smooth tracks; the future of each track is the label. No human draws trajectories.",
+        "**Store scenes, not frames**: materialize each sample as a 9–10 s window (1–2 s history + 8 s future) with map polylines, light states and all agent tracks in a columnar format (Parquet/TFRecord) keyed by log, timestamp and map version.",
+        "**Mine the tail**: triggers on disengagements, hard brakes, near-misses, high prediction error from the current model, and planner-prediction disagreement feed a selection queue; embedding search finds more of the same rare scenario.",
+        "**Rebalance**: highway cruising is 90%+ of miles and nearly zero information; weight samples by behavior class (turns, lane changes, cut-ins, pedestrians crossing) and by model loss.",
+        "**Quality gates**: flag ID switches, teleporting tracks, physically impossible accelerations and occluded segments; mask (do not delete) those timesteps in the loss.",
+        "**Split by geography and time**, not random frames, so the same intersection on the same day never appears in both train and test."
+      ],
+      "deepDive": [
+        "The offboard auto-labeler is its own system and usually the biggest quality lever. It runs bidirectional tracking (forward and backward in time), uses a much larger detector than the car can afford, fuses many lidar sweeps per object to get tight boxes, and fits smooth kinematic models (e.g. a bicycle model for vehicles) to remove jitter. Label noise in heading and velocity propagates directly into prediction targets, so teams measure auto-label quality against a small human-audited set and track it like a product metric.",
+        "Partial observability matters: agents enter and leave the sensor range and get occluded. Instead of dropping incomplete futures, keep a per-timestep validity mask so a pedestrian who walks behind a bus still contributes the steps we did see. Also record the AV's own actual future: it is needed to train interaction-aware (conditional) prediction and to avoid the model learning that the AV's presence never matters."
+      ]
+    },
+    {
+      "name": "Model",
+      "summary": "A vectorized scene encoder with agent–map–agent attention, and a decoder that produces K weighted trajectory modes per agent.",
+      "points": [
+        "**Vectorized over rasterized**: represent lanes, crosswalks and agent histories as polylines (VectorNet-style) rather than a bird's-eye-view image. It is 5–10× cheaper, keeps exact geometry at long range, and scales with scene content rather than area.",
+        "**Agent-centric frames**: express each agent's context in its own coordinate frame (or use relative positional encodings, as in query-centric models like QCNet) so the model is translation/rotation invariant and generalizes across cities.",
+        "**Encoder**: per-element MLP or PointNet over polyline points, then a few layers of factorized attention: agent-history over time, agent-to-map, and agent-to-agent, which captures yielding and following.",
+        "**Decoder**: K learnable mode queries (MTR / Wayformer style) cross-attend to the scene and regress full trajectories plus a probability each; output a Gaussian Mixture so each mode carries uncertainty.",
+        "**Joint vs marginal**: marginal per-agent predictions are cheap and usually enough; add joint or AV-conditioned prediction for interactive pairs (merges, unprotected lefts) where the planner needs to know 'if I go, will they yield?'.",
+        "**Auxiliary outputs**: intent classes (turn left/right, stop, cross), occupancy for unknown or occluded agents, and goal endpoints to improve long-horizon accuracy."
+      ],
+      "deepDive": [
+        "Why multimodal outputs: with an L2 loss on one trajectory, a car that goes left 50% and right 50% of the time is predicted to drive into the median. A mixture model with a winner-takes-all (WTA) loss lets each mode specialize. The cost is mode collapse (all K modes near-identical) and poor coverage of rare maneuvers; anchors (precomputed trajectory clusters, as in MultiPath), intention points (MTR) or diversity losses keep modes spread out. Non-maximum suppression over endpoints at inference de-duplicates modes before they reach the planner.",
+        "In 2026 the frontier includes autoregressive 'motion token' models (MotionLM-style, treating trajectories as sequences of discretized actions decoded like language) and large pre-trained scene foundation models shared with perception and planning, sometimes fully end to end. The production trade is that a modular prediction head with an explicit output interface remains easier to test, certify and debug; many stacks keep explicit prediction even when the planner is learned, and use the big model offboard as a teacher for distillation."
+      ]
+    },
+    {
+      "name": "Training",
+      "summary": "Train with a mixture likelihood plus winner-takes-all regression, on rebalanced data, with augmentation and distillation from larger offboard models.",
+      "points": [
+        "**Loss**: negative log-likelihood of the ground truth under the best-matching mode (regression), plus cross-entropy on which mode was best (classification); weight later timesteps carefully so long horizons do not dominate.",
+        "**Augmentation**: random rotation and translation of the scene, history dropout to simulate perception gaps, track noise injection matching onboard tracker error, and agent dropout for occlusion robustness.",
+        "**Train on onboard-like inputs**: feed the model tracks from the *onboard* perception stack (noisier, causal) while supervising with offboard clean futures, otherwise it is trained on cleaner inputs than it will see in the car.",
+        "**Distillation**: a large offboard teacher (hundreds of millions of parameters, longer context) produces soft targets for the small onboard student; this typically recovers most of the gap at a fraction of the compute.",
+        "**Infrastructure**: data-parallel training on 64–256 GPUs with BF16, streaming shuffled shards; full retrain every 1–2 weeks with fine-tunes in between on newly mined scenarios.",
+        "**Reproducibility**: pin dataset snapshot, map version, code hash and seeds per run; every shipped model must be rebuildable for safety audits."
+      ],
+      "deepDive": [
+        "Winner-takes-all training has a known pathology: early in training one mode wins everything and the others never get gradient. Fixes include assigning the winner by endpoint distance to fixed anchors or intention points rather than to the current predictions, annealing from soft (all modes get some gradient) to hard assignment, and auxiliary losses on goal classification. Measure mode usage histograms during training as a health signal.",
+        "Covariate shift between log replay and deployment is subtle: in logs the other drivers reacted to what the *human* or old-stack AV did, not to the new planner. For conditional prediction, train on the AV's actual future as a conditioning input and randomize or perturb it to teach counterfactual reactions; validate those in closed-loop sim with reactive agents rather than trusting log metrics."
+      ]
+    },
+    {
+      "name": "Evaluation",
+      "summary": "Use open-loop metrics to iterate fast, scenario slices to catch regressions, and planner-in-the-loop closed-loop simulation plus shadow mode to decide releases.",
+      "points": [
+        "**Open-loop metrics** at 3/5/8 s: **minADE_K** and **minFDE_K** (best of K modes average and final displacement error), **miss rate** (no mode's endpoint within ~2 m laterally / scaled longitudinal threshold), and **mAP / soft-mAP** (Waymo Open Motion style), which also rewards correct probabilities.",
+        "**Calibration and likelihood**: NLL of ground truth, Brier score on mode probabilities, and reliability diagrams; the planner relies on these numbers.",
+        "**Slice everything**: report per agent type, per maneuver (cut-in, U-turn, crossing pedestrian), per distance band, per city and per weather; a 2% average gain that hides a 20% pedestrian regression is a block.",
+        "**Planner-in-the-loop metrics**: replay logs with the new predictions feeding the real planner and measure collisions, time-to-collision violations, hard braking, false yields (phantom braking), progress and comfort.",
+        "**Closed-loop simulation**: run millions of scenario-miles with reactive agents (learned sim agents or rules) and adversarially perturbed scenarios; gate releases on safety-critical event rates with confidence intervals.",
+        "**Shadow mode**: deploy the candidate on the fleet running silently next to the production model; log disagreements where the planner would have acted differently, then triage those."
+      ],
+      "deepDive": [
+        "Open-loop metrics are necessary but misleading. minADE rewards any mode being close, so a model can improve it by spraying modes while assigning bad probabilities, which makes the planner either over-cautious or blind. Errors also have asymmetric cost: predicting a pedestrian stays on the curb when they step out is far worse than the reverse. Hence planner-centric metrics (does the plan change? does it become unsafe?) and weighting errors by their effect on the AV's plan, like the 'planning-informed' metrics now used across the industry.",
+        "Release gating is statistical. Severe events are rare (say one per 10^5–10^6 miles), so showing improvement needs either enormous sim mileage or importance-sampled, scenario-based testing: a curated library of thousands of known-hard scenarios (from incidents, NHTSA pre-crash typologies, and fuzzing) that must all pass, plus aggregate sim mileage with rate estimates and confidence bounds. Any regression in the hard-scenario suite blocks the release regardless of averages."
+      ]
+    },
+    {
+      "name": "Deployment on the vehicle",
+      "summary": "Compile the model for the automotive SoC, fit a hard latency budget inside the 10 Hz cycle, and fail safe when anything goes wrong.",
+      "points": [
+        "**Latency budget** (100 ms cycle, sensors to actuation): perception ~40 ms, tracking ~5 ms, **prediction ~15–20 ms**, planning ~20–30 ms, control and margin the rest. Prediction gets a p99 budget, not an average.",
+        "**Compile and quantize**: export to ONNX, build with TensorRT (or the SoC vendor compiler) in FP16/INT8 with quantization-aware training; validate numerics against the reference model on a fixed test suite (trajectory deltas under a few cm).",
+        "**Bound the work**: cap agents at ~128 and map polylines at ~512 by relevance (distance, lane connectivity, time-to-interaction) with fixed tensor shapes so latency is predictable; pad rather than resize.",
+        "**Cache the map**: static map polyline encodings are computed once per region tile and reused across cycles; only agent and dynamic tokens are re-encoded every 100 ms.",
+        "**Fallbacks**: if inference misses its deadline or outputs are invalid (NaN, off-road, physically impossible), fall back to a constant-velocity / constant-turn-rate model with inflated uncertainty, and alert. A watchdog on separate cores monitors it.",
+        "**Rollout**: shadow mode first, then staged deployment by fleet percentage and operational design domain (ODD), with OTA rollback and per-version telemetry."
+      ],
+      "deepDive": [
+        "Onboard compute is shared and thermally limited: on platforms like NVIDIA DRIVE Orin (~254 TOPS) or Thor (~1,000 INT8 TOPS-class), perception takes the lion's share, and peak TOPS are rarely achievable for attention-heavy models. Practical tricks: fuse attention layers into a few large kernels, use sparse local attention (each agent attends to its k nearest map elements) to cap the quadratic cost, run the encoder once and decode modes in parallel, and pin the model to a dedicated GPU stream with priority so camera processing bursts cannot starve it. Measure worst-case execution time under thermal throttling, not just bench numbers.",
+        "Determinism matters for safety cases and debugging: the same inputs must produce the same outputs bit-for-bit so a field incident can be replayed exactly. That rules out some non-deterministic GPU reductions, requires recording all inputs (tracks, map version, model hash) in the onboard log, and pushes teams to freeze TensorRT engines per hardware SKU rather than building at boot."
+      ]
+    },
+    {
+      "name": "Planner interface",
+      "summary": "Hand the planner calibrated, multimodal, uncertainty-aware predictions through a stable contract, and let it react to how the AV's own choice changes them.",
+      "points": [
+        "**Contract**: per agent, a list of modes, each with probability, timestamps, (x, y, heading, velocity) per step, and a covariance or scale per step; plus agent type, intent label and a 'prediction confidence / out-of-distribution' flag. Versioned schema (protobuf) shared by onboard, sim and log tools.",
+        "**How the planner uses it**: high-probability modes enter the cost function as soft constraints; low-probability but high-severity modes (pedestrian darting out) become hard safety checks with buffers, often via a separate rule-based safety layer (RSS-style).",
+        "**Interaction**: for interactive agents, the planner queries conditional predictions for a few candidate AV plans ('if I nudge, does the cyclist slow?'), or uses a game-theoretic / contingency planner that keeps a fallback branch for each likely mode.",
+        "**Uncertainty growth**: covariance inflating with horizon tells the planner to commit only to near-term actions and keep options open, rather than trusting an 8 s path.",
+        "**Feedback loop**: log every cycle where the planner's chosen action relied on a mode that did not happen, or was surprised by an unpredicted one, and send those back to data mining."
+      ],
+      "deepDive": [
+        "The interface is where many real problems live. Miscalibrated probabilities cause either phantom braking (rare modes weighted too high) or overconfidence. Teams therefore calibrate post hoc (temperature scaling on mode logits, per agent type) and test calibration on the planner's operating regime. Some stacks pass a top-N after NMS (e.g. up to 6 modes, drop under 2%), plus an occupancy grid for unknown agents and occluded regions so the planner can be cautious near a parked truck that could hide a pedestrian.",
+        "Conditional and joint prediction close the loop: marginal predictions treat other agents as if they ignore the AV, which makes merges and unprotected turns impossible (everyone looks like they will hit you). Conditioning on the AV's candidate plan lets the planner reason about yielding, but creates a risk the planner 'bullies' by assuming others will always yield. A common safeguard is to plan against conditional predictions for efficiency while checking safety against marginal worst cases."
+      ]
+    }
+  ],
+
+  "tradeoffs": [
+    { "choice": "Vectorized (polyline) vs rasterized (BEV image) scene encoding", "pro": "Vectors are cheaper, keep exact geometry at long range, and scale with scene content; transformers handle sets naturally.", "con": "Rasters plug into standard CNNs, handle arbitrary map semantics and occupancy easily, and are simpler to fuse with perception BEV features." },
+    { "choice": "Marginal vs joint / AV-conditioned prediction", "pro": "Marginal is cheap, parallel, and easy to evaluate; enough for most agents that do not interact with the AV.", "con": "Ignores interactions, so the planner is over-cautious in merges and can produce inconsistent futures (two agents in the same spot); joint models cost more and are harder to evaluate." },
+    { "choice": "Modular prediction head vs end-to-end driving model", "pro": "Explicit, inspectable outputs; can test, certify and debug prediction separately; stable planner contract.", "con": "Information is lost at the interface and errors compound; end-to-end models can learn subtler cues and scale better with data." },
+    { "choice": "Bigger model vs latency budget", "pro": "Larger encoders and longer histories improve rare-case accuracy and calibration.", "con": "Every ms of prediction comes out of planning or safety margin; distillation and agent capping are usually the better deal." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Mode collapse", "description": "All K modes converge to the same maneuver, so rare but real behaviors (a U-turn, a sudden stop) get zero probability. Detect via mode diversity metrics and miss rate on maneuver slices; fix with anchors, intention points and WTA annealing." },
+      { "name": "Perception noise amplification", "description": "A heading error of 10° on a parked car turns into a predicted cut-in, causing phantom braking. Training on onboard (noisy) tracks and inflating uncertainty for low-confidence tracks reduces it." },
+      { "name": "Open-loop gains, closed-loop losses", "description": "minADE improves while sim collision or hard-braking rates worsen, because the improvement came from spraying modes or from cases the planner never cares about. Gate on planner-in-the-loop metrics." },
+      { "name": "Distribution shift to new cities or ODDs", "description": "Different road layouts, driving culture (aggressive merging, scooters) or map conventions degrade accuracy. Mitigate with agent-centric frames, geographic eval splits, shadow mode in the new region and targeted data collection." },
+      { "name": "Deadline misses under load", "description": "Dense scenes (stadium exit, 300 pedestrians) blow the latency budget. Fixed caps, relevance-based agent selection and a physics fallback keep the cycle on time." }
+    ],
+    "realSystems": [
+      { "name": "Waymo (MultiPath++, Wayformer, MotionLM, MTR on WOMD)", "note": "Waymo's papers and the Waymo Open Motion Dataset defined much of the field: anchors and GMM outputs, factorized attention, autoregressive motion tokens, and mAP / soft-mAP metrics." },
+      { "name": "Argoverse 2 and nuPlan / NAVSIM", "note": "Public benchmarks for multimodal forecasting (minADE/minFDE/miss rate) and for closed-loop, planner-centric evaluation that showed open-loop metrics alone mislead." },
+      { "name": "Tesla FSD v12+ and Wayve", "note": "End-to-end learned driving where prediction is implicit inside a large network, trained on fleet video; the counterpoint to modular stacks." },
+      { "name": "NVIDIA DRIVE Orin / Thor", "note": "Typical onboard compute targets, with TensorRT deployment and safety-certified software stacks." }
+    ],
+    "questions": [
+      { "q": "Why not just predict the single most likely trajectory?", "a": "Because the future is multimodal and the planner needs to know about the alternatives. A single L2-trained trajectory averages modes into a path nobody drives, and hides the 10% chance the pedestrian crosses. K weighted modes with uncertainty let the planner optimize for the likely futures and stay safe against dangerous unlikely ones." },
+      { "q": "Your new model improves minADE by 8% but closed-loop sim shows more hard braking. What do you do?", "a": "Do not ship. Check calibration (are low-probability modes now inflated?), slice which agents and scenarios cause the braking, and look at mode diversity. Often the model spread modes to improve min-of-K metrics, which the planner reads as risk. Fix calibration or the loss, and treat the planner-in-the-loop metric as the gate." },
+      { "q": "How do you handle a pedestrian occluded behind a parked van?", "a": "Prediction cannot predict an agent it cannot see, so add an occupancy or 'phantom agent' output for occluded regions near crosswalks and parked vehicles, and keep a short memory of recently seen but now-occluded tracks with growing uncertainty. The planner slows near such regions as a hard rule." },
+      { "q": "How would you reduce latency by 2× without losing accuracy?", "a": "Profile first. Typical wins: cap and prioritize agents, cache static map encodings per tile, sparse kNN attention instead of dense, INT8 with QAT, fuse kernels via TensorRT, and distill from the current model into a smaller student. Validate on the hard-scenario suite and closed-loop sim, not only on minADE." },
+      { "q": "How do you know auto-labels are good enough?", "a": "Maintain a human-audited gold set and measure position, heading and velocity error and ID-switch rate of the auto-labeler against it, sliced by class and range. Also check that prediction metrics on gold vs auto labels agree; if they diverge, label noise is limiting the model." }
+    ]
+  },
+
+  "related": [ "prediction-planning", "perception", "av-data-engine", "av-safety", "av-stack", "quantization" ]
+}

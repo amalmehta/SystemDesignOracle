@@ -1,0 +1,173 @@
+{
+  "id": "blob-store",
+  "title": "S3-like Exabyte Object Store",
+  "domain": "storage",
+  "prompt": "Design an S3-like object store that holds exabytes with eleven nines of durability. Cover metadata, data placement, erasure coding, and repair.",
+
+  "gist": "Split the system into a strongly consistent sharded metadata index and a fleet of storage nodes holding erasure-coded shards spread across failure domains, with continuous scrubbing and fast parallel repair.",
+
+  "overview": [
+    "An object store keeps files (objects) under names (keys) inside buckets, and promises you will get exactly those bytes back years later. At exabyte scale, hard drives fail every day, so durability does not come from reliable hardware; it comes from redundancy, spreading copies across independent failures, and repairing faster than failures accumulate.",
+    "The design has two halves. A **metadata** service maps bucket and key to where the bytes live, and must be fast, strongly consistent and highly available, because every request starts there. A **data** layer stores the bytes on tens of thousands of drives. Instead of keeping three full copies, we use **erasure coding**: split each object into, say, 10 data pieces plus 4 parity pieces, so any 10 of the 14 can rebuild it. That gives better durability than three copies at less than half the storage cost.",
+    "Placement puts those 14 pieces on different drives, servers, racks and, for regional buckets, different data centres, so one fire, power loss or bad rack cannot take out more pieces than we can afford to lose. Background processes constantly read data back to catch silent corruption and rebuild lost pieces in parallel across thousands of drives, typically within hours.",
+    "Eleven nines (99.999999999%) means losing on average one object in 100 billion per year. We reach it with arithmetic: drive failure rate, number of parity pieces, failure-domain separation and repair time together give the probability of losing more pieces than parity before repair finishes."
+  ],
+  "diagram": {
+    "caption": "Front ends consult metadata, then stream erasure-coded shards to storage nodes across zones.",
+    "steps": [
+      { "label": "API front end", "detail": "auth, S3 REST, chunking" },
+      { "label": "Metadata index", "detail": "bucket/key → version, shard map" },
+      { "label": "Placement", "detail": "pick 14 nodes across zones/racks" },
+      { "label": "Storage nodes", "detail": "append-only extents on HDD" },
+      { "label": "Scrub & repair", "detail": "checksums, rebuild lost shards" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "PUT, GET (with byte ranges), DELETE, HEAD and LIST by prefix on objects up to 5 TB, with multipart upload for large objects.",
+      "Strong read-after-write consistency for PUT, DELETE and LIST (as S3 has provided since 2020).",
+      "Object versioning, lifecycle rules (transition to cold tiers, expiration) and object lock for compliance.",
+      "Server-side encryption with per-object data keys wrapped by a KMS.",
+      "Storage classes trading cost for latency and durability placement: regional multi-zone, single-zone, and cold archive."
+    ],
+    "nonFunctional": [
+      "Durability 99.999999999% per object per year; availability 99.99% for regional buckets.",
+      "First-byte latency ~10–50 ms p50 for standard tier; throughput scales linearly with clients and prefixes.",
+      "Survive the loss of an entire availability zone without data loss or extended unavailability.",
+      "Storage overhead ~1.4–1.8× rather than 3× replication to keep cost per TB low.",
+      "Tens of millions of requests per second aggregate across the region."
+    ],
+    "estimates": [
+      { "metric": "Raw capacity", "value": "1 EB logical × 1.4 (EC 10+4) ≈ 1.4 EB raw" },
+      { "metric": "Drive count", "value": "1.4 EB ÷ 24 TB HDD ≈ 58K drives; ~60 drives/server ≈ 1K servers per EB" },
+      { "metric": "Drive failures", "value": "58K drives × ~1% AFR ≈ 580/year ≈ 1–2 per day, every day" },
+      { "metric": "Object count", "value": "1 EB ÷ ~250 KB average ≈ 4 trillion objects" },
+      { "metric": "Metadata size", "value": "4T objects × ~500 B (key, version, shard locations, checksum) ≈ 2 PB of metadata" },
+      { "metric": "Repair of one drive", "value": "24 TB lost; EC reads 10× = 240 TB; spread over 1K drives at 50 MB/s ≈ 50 GB/s → ~80 min" }
+    ]
+  },
+  "stages": [
+    {
+      "name": "API & Front End",
+      "summary": "Stateless front ends terminate the S3 API, authenticate, and orchestrate metadata lookups and shard I/O so clients see one simple interface.",
+      "points": [
+        "Stateless HTTP front ends behind load balancers; any node can serve any request, scaling with request rate.",
+        "Authenticate SigV4-style signed requests and evaluate bucket policies/IAM before touching data.",
+        "Large objects split client-side via multipart upload into parts (5 MB–5 GB), each independently erasure-coded and uploaded in parallel.",
+        "PUT flow: stream and encode into shards, write shards to storage nodes, wait for a write quorum, then commit metadata; the object exists only once metadata commits.",
+        "GET flow: read metadata, fetch the 10 fastest of 14 shards (or data shards first), decode if needed, verify checksum, stream to client."
+      ],
+      "deepDive": [
+        "Ordering data before metadata gives atomic PUTs for free: if the front end crashes mid-upload, the shards are orphaned garbage (reclaimed later by a GC that finds extents with no metadata reference), but no reader ever sees a partial object. Overwrites write a new version and flip the metadata pointer atomically, so concurrent readers see either the old or the new object, never a mix.",
+        "Tail latency is managed with hedged reads: request all 14 shards or the 10 data shards plus 1–2 parity, and decode from the first 10 that arrive. This costs a little extra disk I/O but cuts p99 dramatically, because one slow or busy HDD no longer determines request latency."
+      ]
+    },
+    {
+      "name": "Metadata Service",
+      "summary": "A sharded, replicated, strongly consistent index from (bucket, key, version) to object location, built to handle trillions of entries and hot prefixes.",
+      "points": [
+        "Partition the keyspace by range of (bucket, key) so LIST by prefix is a range scan; split and move partitions automatically as they grow or get hot.",
+        "Each partition is a Raft/Paxos replicated group across three zones, giving linearizable writes and read-after-write consistency.",
+        "Store per-object records: version ID, size, checksum, encryption key ID, storage class, and the placement group or shard locations.",
+        "Indirection: metadata points to a placement group ID, and a separate mapping says which nodes hold that group, so repair moves shards without rewriting billions of object records.",
+        "Cache bucket configuration and partition maps at front ends; metadata nodes use an LSM-based store on SSD."
+      ],
+      "deepDive": [
+        "Range partitioning is necessary for efficient LIST but invites hot spots when keys share a prefix (timestamps, sequential IDs). The service watches per-partition request rates and splits hot ranges, often within minutes, which is why S3 documents a per-prefix request rate (on the order of 3,500 writes and 5,500 reads per second) that scales as prefixes are added. Clients with extreme rates are told to spread load across prefixes.",
+        "At ~2 PB of metadata, the index itself is a large distributed database. Keeping it separate from data means it can run on SSD with replication (cheap relative to data) while the bytes run on HDD with erasure coding. The strong consistency guarantee comes entirely from this layer: shard writes are idempotent and versioned, and only the metadata commit defines what exists."
+      ]
+    },
+    {
+      "name": "Data Placement",
+      "summary": "Place each object's shards across independent failure domains while keeping the cluster balanced as hardware arrives and retires.",
+      "points": [
+        "Hierarchy of failure domains: drive → server → rack → power/network cell → availability zone; no two shards of a stripe share a domain at the chosen level.",
+        "For multi-zone storage with 3 zones, spread a stripe so losing one full zone still leaves ≥ k shards (e.g. 6 shards per zone for a 9+9 or LRC layout, or 10+4 across 4+ zones).",
+        "Placement groups: allocate stripes into groups of drives chosen by a CRUSH-like or allocator-driven algorithm, limiting the number of distinct drive combinations to control correlated-loss risk.",
+        "Storage nodes write shards into large append-only extents (~hundreds of MB) to keep HDD I/O sequential and minimise per-object filesystem overhead.",
+        "Balance on fill level and heat: new drives receive new writes first; a rebalancer migrates cold extents to fill new capacity gradually."
+      ],
+      "deepDive": [
+        "There is a subtle durability trade in how randomly you scatter shards. Fully random placement means any set of 5 simultaneous drive failures (for 10+4) almost certainly overlaps some stripe, so a rare correlated event loses a little data. Constraining stripes to a limited set of placement groups (copysets) makes such an event much less likely to lose anything, at the cost of slower repair because fewer drives share each failed drive's work. Production systems tune this balance explicitly.",
+        "HDD capacity keeps growing (24–30+ TB HAMR/SMR drives in 2026) while per-drive IOPS stays near ~100–200. That means IOPS per TB falls every generation, so placement must also spread heat: hot new data is mixed with cold data on every drive, and very hot small objects may be cached or replicated on SSD rather than relying on HDD seeks."
+      ]
+    },
+    {
+      "name": "Erasure Coding",
+      "summary": "Encode stripes with Reed-Solomon or Local Reconstruction Codes to reach eleven nines at ~1.4–1.8× overhead instead of 3×.",
+      "points": [
+        "Reed-Solomon RS(k, m): k data + m parity shards; any k of k+m reconstruct. RS(10,4) gives 1.4× overhead and tolerates 4 losses.",
+        "Local Reconstruction Codes (as in Azure) add local parity per group so a single lost shard is rebuilt from ~6 shards instead of 10–12, cutting repair traffic.",
+        "Small objects are packed together into stripes (or replicated) since erasure coding a 1 KB object into 14 shards is wasteful.",
+        "Encode at the front end with SIMD-accelerated libraries (ISA-L) at multiple GB/s per core, so CPU is not a bottleneck.",
+        "Per-shard and per-object checksums (CRC32C plus a strong hash) detect corruption end-to-end."
+      ],
+      "deepDive": [
+        "The durability arithmetic: with 1% AFR and a repair time of ~1–2 hours, the chance that a given drive fails within one repair window is ~1% × (1.5 h ÷ 8,760 h) ≈ 1.7×10⁻⁶. Losing a 10+4 stripe needs 5 shards failing before repair, roughly C(14,5) × p⁵ ≈ 2,000 × (1.7×10⁻⁶)⁵, which is vanishingly small per stripe per window. Multiplied over trillions of stripes and thousands of windows a year it stays far beyond eleven nines; the real threats are correlated failures, bugs and operator error, which is why domain separation, software diversity and deletion safeguards matter more than adding parity.",
+        "Erasure coding's cost shows up in repair and reads: rebuilding one shard of RS(10,4) reads 10 shards across the network, so repair bandwidth is 10× the lost data. That is the motivation for LRC and similar codes; Azure's LRC(12,2,2) achieves ~1.33× overhead with single-failure repair reading only 6 shards. For cold archive tiers, wider stripes (e.g. 20+6) lower overhead further at the price of higher read and repair cost."
+      ]
+    },
+    {
+      "name": "Repair & Scrubbing",
+      "summary": "Detect lost or corrupt shards quickly and rebuild them in parallel, prioritising the stripes closest to data loss.",
+      "points": [
+        "Failure detection via heartbeats and I/O errors; a drive is marked failed after a short grace period to avoid rebuilding during brief reboots.",
+        "Prioritised repair queue: stripes missing 3 shards before stripes missing 1, so risk drops fastest.",
+        "Parallel rebuild across all drives in the affected placement groups, throttled so foreground latency SLOs hold.",
+        "Continuous scrubbing reads every shard every few weeks and verifies checksums to catch latent sector errors and bit rot before a second failure exposes them.",
+        "Track the real durability model in dashboards: expected repair time, number of stripes at each redundancy level, correlated-failure events."
+      ],
+      "deepDive": [
+        "Repair speed is the biggest lever on durability: halving repair time halves the vulnerability window and improves the loss probability by roughly 2ᵐ for an m-parity code, because after the first failure m more must land inside the window. That is why large clusters prefer wide declustered placement (many drives share the repair) and strong networks; a 24 TB drive rebuilt from a handful of peers would take days, but spread across a thousand drives it finishes in about an hour.",
+        "Silent data corruption is the other enemy. Checksums are verified at every hop (client → front end → storage node → disk and back), memory uses ECC, and scrubbers re-verify cold data periodically. Amazon has discussed using formal methods and lightweight verification (e.g. on ShardStore) precisely because software bugs that corrupt or lose data at scale are a bigger durability risk than random drive failures."
+      ]
+    },
+    {
+      "name": "Lifecycle, Deletion & Scaling",
+      "summary": "Make deletion safe, reclaim space efficiently, and grow from petabytes to exabytes without re-architecting.",
+      "points": [
+        "Deletes are logical first (metadata tombstone), with physical reclamation by background compaction of extents once live data falls below a threshold.",
+        "Delayed physical deletion and object lock protect against accidental or malicious mass deletes and software bugs.",
+        "Lifecycle engine transitions cold objects to denser codes or archive media (high-capacity HDD racks powered down, or tape) by rewriting stripes.",
+        "Capacity is added as whole racks or cells; the cell architecture bounds blast radius and lets each cell's metadata and placement scale independently.",
+        "Garbage collection reconciles storage-node inventories against metadata to find orphaned shards from failed uploads."
+      ],
+      "deepDive": [
+        "Compaction is the hidden I/O tax of append-only extents: as objects are deleted, extents become fragmented, and reclaiming space means reading live shards and rewriting them. Scheduling compaction for extents with the most garbage, and in off-peak hours, keeps write amplification acceptable. The same machinery performs storage-class transitions and drive decommissioning."
+      ]
+    }
+  ],
+  "tradeoffs": [
+    { "choice": "Erasure coding vs 3× replication", "pro": "1.4× overhead with better durability; huge cost saving at exabyte scale.", "con": "Higher CPU, more network on repair and degraded reads, poor fit for tiny objects." },
+    { "choice": "Wide stripes (e.g. 20+6) vs narrow (6+3)", "pro": "Lower overhead for cold data.", "con": "More shards to fetch per read, more repair traffic, larger blast radius per stripe." },
+    { "choice": "Random scatter vs constrained placement groups", "pro": "Random scatter repairs fastest using all drives.", "con": "Correlated multi-drive failures almost always lose some stripe; constrained groups lose data far less often." },
+    { "choice": "Strong consistency in metadata", "pro": "Read-after-write and correct LIST; simpler client logic.", "con": "Consensus latency per write and careful hot-partition handling needed." },
+    { "choice": "Multi-zone stripes vs single-zone", "pro": "Survives an entire zone loss.", "con": "Cross-zone network traffic on every write and repair; higher latency and cost." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Correlated hardware failure", "description": "A bad drive batch, firmware bug or rack power event fails many drives at once. Mitigate with mixed drive vintages per stripe, failure-domain spreading and staged firmware rollouts." },
+      { "name": "Software bug deleting data", "description": "A GC or compaction bug removes live shards across many stripes simultaneously, defeating parity. Defend with delayed physical deletes, independent reconciliation, canaried deployments and formal verification of critical code." },
+      { "name": "Repair storm", "description": "A zone outage marks millions of shards missing and repair floods the network, hurting foreground traffic. Distinguish temporary unavailability from loss, wait before repairing, and throttle by priority." },
+      { "name": "Hot metadata partition", "description": "Sequential key prefixes concentrate requests on one partition, causing throttling. Automatic splitting, load-aware partition placement and client guidance on key design." },
+      { "name": "Silent corruption", "description": "Bit rot or a buggy controller returns wrong bytes without errors. End-to-end checksums on every read plus periodic scrubbing catch it and trigger reconstruction from parity." }
+    ],
+    "realSystems": [
+      { "name": "Amazon S3", "note": "Hundreds of trillions of objects, strong read-after-write consistency since 2020, erasure coding across AZs, and ShardStore storage nodes verified with lightweight formal methods." },
+      { "name": "Azure Blob Storage", "note": "Built on Windows Azure Storage with stream layer extents and Local Reconstruction Codes to reduce repair cost." },
+      { "name": "Google Colossus / GCS", "note": "Colossus file system with a scalable metadata layer (on Bigtable/Spanner-class storage) and Reed-Solomon encoded chunks underneath Cloud Storage." },
+      { "name": "Ceph RADOS / MinIO", "note": "Open-source object stores: Ceph uses CRUSH for placement and supports EC pools; MinIO uses per-object Reed-Solomon erasure sets." }
+    ],
+    "questions": [
+      { "q": "How do you actually justify eleven nines?", "a": "Build a Markov or simulation model from measured AFR, repair time distribution, code parameters and failure-domain correlation, then compute the probability that more than m shards of a stripe are lost within a repair window. Independent random failures give far more than eleven nines; the budget goes to correlated events and software bugs, so the model must include them." },
+      { "q": "How do you store billions of 1 KB objects efficiently?", "a": "Pack them into larger extents or stripes so erasure coding operates on big blocks, keep per-object metadata compact, and optionally replicate tiny hot objects on SSD. Physical deletion then happens through compaction." },
+      { "q": "How is LIST kept strongly consistent?", "a": "Because metadata partitions are range-ordered and each is a linearizable consensus group, a LIST after a committed PUT scans the partition leaders (or reads at a timestamp) and must include the new key." },
+      { "q": "What happens when a whole AZ goes offline for an hour?", "a": "Stripes spread across zones still have ≥ k shards, so reads decode from the remaining zones and writes go to the surviving zones with a temporary placement. We do not start rebuilding immediately; after the zone returns, a reconciliation pass fills in missed shards." },
+      { "q": "Why separate metadata from data at all?", "a": "They have opposite profiles: metadata is small, random-access, latency-critical and needs consensus; data is huge, sequential and cost-critical. Separating them lets each use the right hardware, replication scheme and scaling unit." }
+    ]
+  },
+
+  "related": [ "object-storage", "erasure-coding", "consensus", "partitioning", "storage-devices", "lsm-btree" ]
+}

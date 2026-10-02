@@ -1,0 +1,454 @@
+{
+  "id": "ml-training",
+  "name": "ML Training",
+  "symbol": "brain",
+  "summary": "How neural networks are actually trained at scale: the optimizer loop, splitting work across thousands of GPUs, squeezing models into memory, feeding them data, and surviving the hardware failures that happen every few hours.",
+  "topics": [
+    {
+      "id": "training-loop",
+      "title": "The Training Loop & Optimizers",
+      "gist": "Training repeats one small cycle billions of times: guess, measure how wrong the guess was, and nudge every weight slightly in the direction that would have been less wrong.",
+      "overview": [
+        "A neural network is a giant function with billions of adjustable knobs called **weights** or **parameters**. Training means finding knob settings that make the function's outputs match real data. Nobody sets the knobs by hand; an algorithm tunes them, a little at a time.",
+        "Think of hiking down a foggy mountain to find the valley. You can't see the bottom, but you can feel which way the ground slopes under your feet. Each step you look at a small handful of examples (a **batch**), measure how wrong the model is (the **loss**), work out which direction is downhill for every knob at once (the **gradient**, computed by *backpropagation*), and take a small step. The size of that step is the **learning rate**.",
+        "The **optimizer** decides exactly how to step. Plain gradient descent just follows the slope. Modern optimizers like **AdamW** also remember recent slopes (momentum, like a ball rolling downhill) and adapt the step size per knob, so steep noisy directions get small careful steps and flat ones get bigger steps.",
+        "For a large language model, one pass of this loop processes a few million words of text, and the loop runs hundreds of thousands of times. The whole recipe (model size, data amount, learning rate schedule) is planned in advance because a single run can cost tens of millions of dollars."
+      ],
+      "diagram": {
+        "caption": "One training step, repeated hundreds of thousands of times.",
+        "steps": [
+          { "label": "Load batch", "detail": "Millions of tokens per step" },
+          { "label": "Forward pass", "detail": "Compute predictions and loss" },
+          { "label": "Backward pass", "detail": "Backprop gradients, ~2x forward cost" },
+          { "label": "Sync gradients", "detail": "All-reduce across data-parallel GPUs" },
+          { "label": "Optimizer step", "detail": "AdamW updates weights and moments" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Model (forward graph)", "role": "Stack of layers (embeddings, attention, MLPs, norms) that maps inputs to predictions; activations are saved for the backward pass." },
+          { "name": "Loss function", "role": "Scalar measure of error, e.g. next-token cross-entropy for LLMs; everything downstream optimizes this number." },
+          { "name": "Autograd / backward pass", "role": "Reverse-mode differentiation through the saved graph; produces one gradient per parameter at roughly 2x the forward FLOPs." },
+          { "name": "Optimizer (AdamW)", "role": "Maintains first and second moment estimates per parameter and applies a bias-corrected, per-parameter scaled update plus decoupled weight decay." },
+          { "name": "Learning-rate scheduler", "role": "Warmup then decay (cosine, linear, or warmup-stable-decay) so early steps don't blow up and late steps settle into a minimum." },
+          { "name": "Gradient clipping", "role": "Rescales the global gradient norm to a cap (commonly 1.0) to stop rare spikes from wrecking the weights." }
+        ],
+        "flow": [
+          "The data loader hands each GPU a micro-batch of token sequences, typically 4K-8K tokens long, packed to avoid padding.",
+          "The forward pass runs every layer, storing activations needed later, and computes the mean cross-entropy loss.",
+          "loss.backward() walks the graph in reverse, producing a gradient for every parameter; with gradient accumulation this repeats over several micro-batches before stepping.",
+          "Gradients are averaged across data-parallel replicas (all-reduce or reduce-scatter), overlapped with the remaining backward compute.",
+          "The global gradient norm is computed and clipped, then AdamW updates its two moment buffers and applies the update in fp32 master weights.",
+          "The scheduler advances the learning rate, metrics (loss, grad norm, throughput, MFU) are logged, and every N steps a checkpoint is written.",
+          "The loop repeats until the token budget is exhausted, often followed by an annealing phase on high-quality data with a decaying learning rate."
+        ],
+        "tradeoffs": [
+          { "choice": "Larger global batch size", "pro": "Better hardware utilization and fewer optimizer steps; scales to more GPUs", "con": "Past the critical batch size, extra tokens per step buy little loss improvement and need retuned learning rates" },
+          { "choice": "AdamW vs SGD with momentum", "pro": "AdamW is robust for transformers with far less tuning", "con": "Stores two extra fp32 states per parameter (8 bytes/param), doubling-plus optimizer memory" },
+          { "choice": "Cosine vs warmup-stable-decay (WSD) schedule", "pro": "WSD lets you branch off checkpoints and anneal at any point, convenient for continued training", "con": "Cosine needs the total step count fixed up front; WSD adds a tunable decay phase" },
+          { "choice": "Newer optimizers (Muon, Shampoo/SOAP)", "pro": "Reported ~1.3-2x token efficiency on some LLM runs (Muon used for Moonshot's Kimi K2)", "con": "Extra compute and distributed-implementation complexity; less battle-tested at frontier scale" }
+        ],
+        "numbers": [
+          { "metric": "Training compute rule of thumb", "value": "~6 x params x tokens FLOPs" },
+          { "metric": "Llama 3.1 405B training compute", "value": "~3.8e25 FLOPs on ~15.6T tokens" },
+          { "metric": "Chinchilla-optimal data", "value": "~20 tokens per parameter (modern models train far past this)" },
+          { "metric": "Typical LLM global batch", "value": "~4M-16M tokens per step" },
+          { "metric": "Typical peak learning rate (AdamW, large LLM)", "value": "~1e-4 to 3e-4, with ~2K steps warmup" },
+          { "metric": "Good model FLOPs utilization (MFU) on H100", "value": "~35-50% of peak BF16" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The 6ND rule comes from 2ND FLOPs for the forward pass (one multiply-add per parameter per token) and 4ND for backward (gradients with respect to both activations and weights). It ignores attention's quadratic term, which matters at long context: at 128K tokens attention FLOPs can rival the MLPs, which is why long-context phases are budgeted separately and usually come late in training.",
+          "AdamW's epsilon, beta2 and weight decay are not cosmetic. With beta2 = 0.999 the second-moment estimate reacts slowly, so a sudden gradient regime change produces outsized updates; many LLM recipes use beta2 = 0.95 for stability. Decoupled weight decay (the W in AdamW) applies decay outside the adaptive scaling, which is why it generalizes better than L2 regularization folded into Adam. Recent work on muP (maximal update parametrization) makes optimal learning rates transfer from small proxy models to large ones, letting teams tune at 100M parameters and launch at 100B.",
+          "Loss spikes are the defining pathology of large runs. Typical causes are attention logit growth, bad data batches, and Adam's second-moment estimates lagging behind rare large gradients. Mitigations include QK-norm, z-loss on the output logits, lower beta2, gradient clipping, and, operationally, rolling back to a checkpoint a few hundred steps earlier and skipping the offending data. OPT-175B's logbook documented dozens of such manual restarts; modern teams automate spike detection and rollback."
+        ],
+        "failureModes": [
+          { "name": "Loss spike / divergence", "description": "Loss jumps by orders of magnitude or goes NaN. Symptom: grad norm explodes first. Fix: roll back to an earlier checkpoint, skip the batch window, lower LR, add QK-norm or z-loss." },
+          { "name": "Silent learning-rate misconfiguration", "description": "Wrong warmup or scheduler resets on resume cause slow convergence that looks like a bad dataset. Fix: log LR every step and checkpoint scheduler state alongside optimizer state." },
+          { "name": "Gradient accumulation bugs", "description": "Averaging loss per micro-batch instead of per token over-weights short sequences; Hugging Face fixed exactly this in late 2024. Fix: normalize by total non-padding tokens across all accumulated micro-batches." },
+          { "name": "Low MFU", "description": "GPUs mostly idle waiting on communication, data loading, or small kernels. Fix: profile with the PyTorch profiler or Nsight Systems, overlap comms, fuse kernels, use torch.compile." }
+        ],
+        "realSystems": [
+          { "name": "Meta Llama 3 (2024)", "note": "405B dense model trained on ~16K H100s at ~38-43% BF16 MFU, with a three-stage recipe: pretraining, long-context extension to 128K, then annealing on curated data." },
+          { "name": "DeepSeek-V3 (Dec 2024)", "note": "671B-parameter MoE (37B active) trained on 14.8T tokens in ~2.8M H800 GPU-hours, notable for FP8 training and very few loss spikes or rollbacks." },
+          { "name": "PyTorch + TorchTitan", "note": "Reference PyTorch-native pretraining stack combining FSDP2, tensor/pipeline parallelism, torch.compile and float8 training for Llama-style models." }
+        ],
+        "questions": [
+          { "q": "Estimate how long it takes to train a 70B model on 15T tokens with 4,096 H100s.", "a": "Compute is ~6 x 70e9 x 15e12 = ~6.3e24 FLOPs. Each H100 delivers ~989 TFLOPS BF16 peak; at 40% MFU that's ~400 TFLOPS, so the cluster does ~1.6e18 FLOP/s. 6.3e24 / 1.6e18 is ~3.9e6 seconds, about 45 days, before adding time lost to failures and restarts." },
+          { "q": "Your loss spiked at step 120K and recovered on its own, but the next spike didn't recover. What do you do?", "a": "Roll back to the last checkpoint well before the spike, inspect the gradient norm and per-layer stats to localize it (often attention logits or embeddings), and check the data in that window. Resume with the problematic batches skipped and consider a lower LR, lower beta2, or adding QK-norm. Automate this pattern with spike detection so it doesn't need a human at 3am." },
+          { "q": "Why can't you just keep increasing batch size to use more GPUs?", "a": "Each step's gradient is an average; beyond the critical batch size the noise reduction from more samples stops paying off, so you need roughly the same number of tokens but gain little from fewer steps. You'd be spending compute without proportional loss improvement. Past that point you scale with model parallelism or longer training instead." }
+        ]
+      },
+      "related": ["data-parallelism", "mixed-precision", "checkpointing", "tensor-cores", "kernel-optimization", "batch-processing"]
+    },
+    {
+      "id": "data-parallelism",
+      "title": "Data-Parallel Training",
+      "gist": "Give every GPU a copy of the model and a different slice of the data, then average what they all learned before taking each step together.",
+      "overview": [
+        "One GPU would take years to train a modern model, so we split the work. The simplest split is **data parallelism**: every GPU holds the same model, each reads different examples, and after each step they compare notes so all copies stay identical.",
+        "Picture a class of students each grading a different stack of exam papers to figure out how to improve a rubric. Each student writes down their suggested changes, then the whole class averages the suggestions and everyone updates their copy of the rubric the same way. The averaging step is called an **all-reduce**, and it's done with clever patterns (rings and trees) so no single machine becomes a bottleneck.",
+        "The catch is memory: if every GPU stores a full copy of the model *and* the optimizer's bookkeeping, a 70-billion-parameter model needs over a terabyte per copy, far more than one GPU's 80-192 GB. **Sharded data parallelism** (ZeRO, FSDP) fixes this by splitting the bookkeeping across GPUs and fetching pieces only when needed, like students sharing one textbook by passing chapters around."
+      ],
+      "diagram": {
+        "caption": "Sharded data parallelism (FSDP / ZeRO-3) for one layer.",
+        "steps": [
+          { "label": "Shard parameters", "detail": "Each GPU owns 1/N of weights" },
+          { "label": "All-gather", "detail": "Rebuild full layer just in time" },
+          { "label": "Forward + backward", "detail": "Each GPU uses its own data" },
+          { "label": "Reduce-scatter", "detail": "Each GPU gets its gradient shard" },
+          { "label": "Local optimizer step", "detail": "Update only the owned shard" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "DDP (DistributedDataParallel)", "role": "PyTorch's classic replicated data parallelism; buckets gradients (~25 MB default) and all-reduces each bucket as soon as backward finishes it." },
+          { "name": "ZeRO stages 1/2/3", "role": "DeepSpeed's progressive sharding of optimizer states (1), gradients (2), and parameters (3) across data-parallel ranks." },
+          { "name": "FSDP2 (fully_shard)", "role": "PyTorch's per-parameter sharded data parallelism built on DTensor; all-gathers parameters per module and reduce-scatters gradients." },
+          { "name": "NCCL collectives", "role": "NVIDIA's library implementing all-reduce, all-gather and reduce-scatter with ring and tree algorithms over NVLink and InfiniBand (RCCL on AMD)." },
+          { "name": "HSDP (hybrid sharding)", "role": "Shards within a node or pod and replicates across them, trading memory for cheaper cross-node traffic." }
+        ],
+        "flow": [
+          "Every rank starts with identical weights (or an identical shard layout) and a distinct, deterministic slice of each global batch.",
+          "With FSDP, before running a layer the rank all-gathers that layer's parameter shards from its peers, prefetching the next layer while computing the current one.",
+          "After the forward, the gathered full parameters are freed (reshard_after_forward) to keep peak memory low.",
+          "During backward, parameters are gathered again, gradients are computed, then reduce-scattered so each rank receives the averaged gradient for only its own shard.",
+          "Each rank runs the optimizer on its shard; there is no separate broadcast because the next step's all-gather distributes the new weights.",
+          "Communication is overlapped with compute on separate CUDA streams, so with enough work per GPU the network cost is mostly hidden."
+        ],
+        "tradeoffs": [
+          { "choice": "Replicated DDP vs fully sharded FSDP/ZeRO-3", "pro": "DDP has the least communication (one all-reduce of gradients)", "con": "DDP needs the full model plus optimizer state on every GPU, ~16 bytes/param with AdamW mixed precision" },
+          { "choice": "Full sharding vs hybrid sharding (HSDP)", "pro": "HSDP keeps parameter all-gathers inside fast NVLink/scale-up domains", "con": "Memory saving is limited to the shard group size, not the whole cluster" },
+          { "choice": "Bigger gradient buckets", "pro": "Fewer, more bandwidth-efficient collectives", "con": "Communication starts later, reducing overlap with backward compute" },
+          { "choice": "Local SGD / DiLoCo style infrequent sync", "pro": "Cuts cross-datacenter bandwidth by ~100-500x, enabling multi-site training", "con": "Some loss in sample efficiency and more hyperparameters to tune" }
+        ],
+        "numbers": [
+          { "metric": "Ring all-reduce bytes sent per GPU", "value": "~2(N-1)/N x gradient size" },
+          { "metric": "AdamW mixed-precision state", "value": "~16 bytes/param (bf16 weights + grads, fp32 master + 2 moments)" },
+          { "metric": "70B model full state", "value": "~1.1 TB, so it must be sharded across 14+ 80 GB GPUs" },
+          { "metric": "DDP default bucket size (PyTorch)", "value": "~25 MB" },
+          { "metric": "Per-GPU network in a modern H100/B200 cluster", "value": "~400-800 Gb/s (one ConnectX-7/8 NIC per GPU)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Ring all-reduce is bandwidth-optimal but its latency grows linearly with ring size, so at thousands of ranks NCCL switches to tree or hierarchical algorithms for small messages, and to NVLS (NVLink SHARP) and CollNet / InfiniBand SHARP in-network reduction when available. In practice the effective bus bandwidth (busbw in nccl-tests) is what to measure; a healthy 8x H100 node reaches ~350-450 GB/s busbw intra-node, and well-tuned cross-node all-reduce sits near NIC line rate.",
+          "FSDP's critical subtlety is the size of the unit you wrap. Wrap too coarsely (the whole model) and peak memory equals the full model; too finely (every Linear) and you issue thousands of small, latency-bound collectives. The standard choice is one unit per transformer block. FSDP2 moved from FSDP1's flat-parameter design to per-parameter DTensor sharding, which composes cleanly with tensor parallelism, float8 all-gathers, and selective freezing, and is the default in TorchTitan.",
+          "Data parallelism changes the math as well as the plumbing: global batch = micro-batch x accumulation steps x DP degree. Scaling DP degree without retuning learning rate and warmup changes the optimization trajectory, and making results reproducible across different GPU counts requires deterministic data sharding plus care with non-associative floating-point reductions (all-reduce order changes the low bits)."
+        ],
+        "failureModes": [
+          { "name": "Straggler rank", "description": "One slow GPU (thermal throttling, bad NIC, noisy neighbor) stalls every collective, dropping cluster throughput by the slowest member. Detect via per-rank step-time telemetry; cordon the node." },
+          { "name": "NCCL hang", "description": "A rank crashes or diverges in control flow so peers wait forever in a collective. Symptom: GPUs at 100% util with no progress. Fix: NCCL timeouts, TORCH_NCCL watchdog, flight recorder traces to find the missing rank." },
+          { "name": "OOM from all-gather spikes", "description": "Prefetching too many FSDP units or not resharding after forward pushes peak memory past capacity. Fix: limit prefetch, reshard_after_forward=True, activation checkpointing." }
+        ],
+        "realSystems": [
+          { "name": "DeepSpeed ZeRO", "note": "Microsoft's library that introduced optimizer/gradient/parameter sharding and offload to CPU/NVMe (ZeRO-Infinity); still widely used in fine-tuning stacks." },
+          { "name": "PyTorch FSDP2", "note": "Native sharded data parallelism used by TorchTitan and Llama-family training; composes with TP and PP as the outermost dimension of 3D/4D parallelism." },
+          { "name": "Google DiLoCo / Prime Intellect INTELLECT-1", "note": "Low-communication training that syncs only every few hundred steps, used to train a 10B model across continents over ordinary internet links." }
+        ],
+        "questions": [
+          { "q": "You have 1,024 H100s and a 30B model. Would you use DDP, ZeRO-1, or FSDP, and why?", "a": "Full state is ~480 GB at 16 bytes/param, which doesn't fit on one 80 GB GPU, so plain DDP is out. ZeRO-1/2 still replicates bf16 weights (~60 GB) which leaves little room for activations. FSDP (or HSDP sharded within 8-64 GPUs) fits comfortably; add activation checkpointing if needed. Tensor parallelism is optional at this size." },
+          { "q": "Why does reduce-scatter plus all-gather equal an all-reduce, and why does that matter for ZeRO?", "a": "A ring all-reduce is literally a reduce-scatter phase followed by an all-gather phase, each moving (N-1)/N of the data. ZeRO-3 performs the reduce-scatter in backward and defers the all-gather to the next forward, so total traffic is about the same as DDP (~1.5x with the extra backward gather) while memory drops by N." },
+          { "q": "How would you train one model across two datacenters 1,000 km apart?", "a": "Cross-site bandwidth is maybe 1-10% of intra-cluster, so you can't all-reduce every step. Keep tensor/pipeline/FSDP inside each site and synchronize across sites infrequently, e.g. DiLoCo-style outer steps every few hundred inner steps, or hierarchical all-reduce with compressed gradients. Expect a small quality cost and tune the outer learning rate." }
+        ]
+      },
+      "related": ["model-parallelism", "training-loop", "interconnects", "datacenter-networking", "checkpointing", "consensus"]
+    },
+    {
+      "id": "model-parallelism",
+      "title": "Tensor, Pipeline & Expert Parallelism",
+      "gist": "When a model is too big or slow for one GPU, cut the model itself into pieces: split each layer, split the stack of layers, or split the experts.",
+      "overview": [
+        "Data parallelism copies the model. **Model parallelism** cuts it up. There are three main ways to slice it, and big training runs use all of them at once.",
+        "Imagine an assembly line building cars. **Pipeline parallelism** gives each station a different group of layers: station 1 does layers 1-10, station 2 does 11-20, and partly built work flows down the line. **Tensor parallelism** puts several workers on the *same* station, each bolting on part of every car at once, so they must talk constantly. **Expert parallelism** is a building with many specialist workshops; each piece of work is routed to the two or three specialists best suited to it.",
+        "Each slicing has a cost. Tensor parallelism needs very fast links because GPUs exchange data inside every layer, so it stays inside one server or rack. Pipelines leave stations idle while the line fills and drains (the **bubble**). Expert routing sends traffic all over the cluster. Designing a training run is largely about combining these so the slow links carry the least traffic."
+      ],
+      "diagram": {
+        "caption": "How 4D parallelism maps onto a cluster, fastest link first.",
+        "steps": [
+          { "label": "Tensor parallel", "detail": "Split matmuls within NVLink domain" },
+          { "label": "Expert / context parallel", "detail": "Route tokens, split long sequences" },
+          { "label": "Pipeline parallel", "detail": "Layer stages across nodes" },
+          { "label": "Data parallel (FSDP)", "detail": "Replicas across the whole cluster" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Tensor parallelism (Megatron-style)", "role": "Splits attention heads and MLP weight matrices column- then row-wise across GPUs, requiring an all-reduce (or reduce-scatter/all-gather with sequence parallelism) twice per layer." },
+          { "name": "Pipeline parallelism", "role": "Assigns contiguous layers to stages and streams micro-batches through them with schedules like 1F1B, interleaved 1F1B, or zero-bubble." },
+          { "name": "Expert parallelism (MoE)", "role": "Places different experts on different GPUs; a router sends each token to its top-k experts via all-to-all dispatch and combine." },
+          { "name": "Context / sequence parallelism", "role": "Splits a long sequence across GPUs and exchanges keys/values (ring attention or all-gather) so attention over 128K+ tokens fits." },
+          { "name": "Device mesh", "role": "An N-dimensional logical grid (e.g. PyTorch DeviceMesh) mapping each parallel dimension onto physical GPUs so the chattiest dimension gets the fastest links." }
+        ],
+        "flow": [
+          "The planner picks degrees, e.g. TP=8, CP=2, PP=16, DP=64, whose product equals the GPU count, and lays out the mesh so TP ranks share NVLink.",
+          "A global batch is split into micro-batches; the first pipeline stage starts the forward on micro-batch 1 while the others wait.",
+          "Inside each stage, every transformer layer runs as tensor-parallel shards, all-reducing partial outputs over NVLink after attention and after the MLP.",
+          "In MoE layers, the router scores tokens, an all-to-all ships them to the GPUs holding their chosen experts, and a second all-to-all brings results back.",
+          "Activations pass point-to-point to the next stage; once warm, each stage alternates one forward and one backward (1F1B) to bound activation memory.",
+          "After the last micro-batch's backward, gradients are reduced across the data-parallel dimension and the optimizer steps."
+        ],
+        "tradeoffs": [
+          { "choice": "Higher tensor-parallel degree", "pro": "Less memory per GPU and lower per-layer latency", "con": "Communication grows with each layer; beyond the NVLink domain (8 GPUs on HGX, 72 on GB200 NVL72) efficiency collapses" },
+          { "choice": "More pipeline stages", "pro": "Only point-to-point traffic, works over slower inter-node links", "con": "Bubble fraction ~(p-1)/(m+p-1) wastes compute unless micro-batch count m is large" },
+          { "choice": "Mixture-of-Experts with many experts", "pro": "Huge parameter count at a fraction of the FLOPs per token (DeepSeek-V3 activates 37B of 671B)", "con": "All-to-all traffic, load imbalance, and expert memory make it much harder to run efficiently" },
+          { "choice": "Context parallelism for long sequences", "pro": "Makes 128K-1M token training feasible", "con": "Extra KV exchange each layer; causal masking creates load imbalance unless sequences are reordered" }
+        ],
+        "numbers": [
+          { "metric": "Llama 3 405B parallelism", "value": "TP=8, CP up to 16 (long context), PP=16, DP=FSDP on ~16K H100s" },
+          { "metric": "1F1B bubble with p=8 stages, m=32 micro-batches", "value": "~18% of step time" },
+          { "metric": "DeepSeek-V3 MoE layout", "value": "256 routed experts + 1 shared, 8 active per token" },
+          { "metric": "H100 NVLink bandwidth per GPU", "value": "~900 GB/s vs ~50 GB/s per 400G NIC" },
+          { "metric": "GB200 NVL72 scale-up domain", "value": "72 GPUs on one NVLink fabric, ~130 TB/s aggregate" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Megatron's sequence parallelism is not a separate dimension so much as a refinement of TP: the LayerNorm and dropout regions are sharded along the sequence instead of replicated, turning each all-reduce into a reduce-scatter plus all-gather and cutting activation memory by the TP degree. Communication volume is the same, but activations that were duplicated 8x now aren't, which often matters more than FLOPs at large sequence lengths.",
+          "Pipeline scheduling has improved a lot since GPipe. Interleaved 1F1B assigns v non-contiguous chunks per stage, reducing the bubble by v at the cost of v-times more point-to-point messages. Zero-bubble schedules (ZB-H1/H2, 2024) split backward into input-gradient and weight-gradient pieces and fill bubbles with the deferrable weight-gradient work. DeepSeek's DualPipe overlaps forward and backward compute with the MoE all-to-all of the opposite micro-batch so that cross-node expert traffic is almost fully hidden.",
+          "MoE load balancing is the main headache. A naive router collapses onto a few experts; the classic fix is an auxiliary load-balancing loss, but it competes with the language-modeling objective. DeepSeek-V3 instead adds a per-expert bias to routing scores that is nudged up or down based on observed load (auxiliary-loss-free balancing) and restricts each token to experts on at most 4 nodes to cap all-to-all fan-out. Capacity factors that drop overflow tokens trade quality for predictable memory."
+        ],
+        "failureModes": [
+          { "name": "TP spanning slow links", "description": "Placing tensor-parallel ranks across nodes puts per-layer all-reduces on InfiniBand; throughput can fall 2-5x. Fix: map TP to the innermost mesh dimension within the NVLink domain." },
+          { "name": "Pipeline stage imbalance", "description": "First and last stages also hold embeddings and the LM head (huge with 128K+ vocabularies), so they run slower and everyone waits. Fix: give them fewer transformer layers or split the head." },
+          { "name": "Expert collapse / hot experts", "description": "Router sends most tokens to a few experts, overflowing capacity and starving others. Symptom: skewed expert-load histograms, OOM on one rank. Fix: balancing loss or bias, capacity limits, router z-loss." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA Megatron-LM / Megatron Core", "note": "Reference implementation of TP, sequence parallelism, interleaved pipelines, context and expert parallelism; underpins NeMo and many frontier runs." },
+          { "name": "DeepSeek-V3", "note": "Trained with 16-way pipeline (DualPipe), 64-way expert parallelism across 8 nodes and ZeRO-1 data parallelism, notably without tensor parallelism." },
+          { "name": "Google Pathways / JAX GSPMD", "note": "Expresses all parallelism as sharding annotations on arrays; the XLA compiler inserts collectives, used for Gemini on TPU pods." }
+        ],
+        "questions": [
+          { "q": "Pick a parallelism layout for a 400B dense model on 8,192 H100s (8 per node).", "a": "Use TP=8 inside each node to keep per-layer collectives on NVLink. 400B x 16 bytes is 6.4 TB of state, so add PP (e.g. 8-16 stages) to split layers across nodes, then FSDP/ZeRO-1 over the remaining 64-128-way DP dimension. Choose enough micro-batches (m >= 4p) to keep the bubble under ~15%, and add context parallelism only for the long-context phase." },
+          { "q": "Why is MoE cheap in FLOPs but expensive in systems terms?", "a": "Each token only runs through k experts, so FLOPs scale with active parameters, but all experts must live in memory and tokens must be shuffled to wherever their experts are via two all-to-alls per MoE layer. All-to-all stresses bisection bandwidth, suffers from load imbalance, and is hard to overlap. That's why MoE pushes toward larger scale-up domains like NVL72." },
+          { "q": "How do you reduce the pipeline bubble without adding memory?", "a": "Increase micro-batches per step (bubble ~(p-1)/(m+p-1)), use interleaved stages so each GPU holds several smaller chunks, or use zero-bubble schedules that fill idle time with deferred weight-gradient computation. Each has costs: more micro-batches means smaller ones (less efficient matmuls), interleaving means more messages." }
+        ]
+      },
+      "related": ["data-parallelism", "interconnects", "gpu-architecture", "mixed-precision", "datacenter-networking", "partitioning"]
+    },
+    {
+      "id": "mixed-precision",
+      "title": "Mixed Precision & Memory Budgets",
+      "gist": "Store and compute most numbers with fewer bits to go faster and fit bigger models, while keeping a few critical numbers precise so training stays stable.",
+      "overview": [
+        "Computers store numbers with a fixed number of bits. Standard 32-bit floats are precise but bulky. Training a model with them would use twice the memory and run several times slower than needed, because modern GPUs have special hardware that is far faster on 16-bit and 8-bit numbers.",
+        "It's like doing arithmetic with a pocket calculator that shows only 3-4 significant digits: fast and good enough for most steps, but if you keep a running total of millions of tiny additions on it, the small ones get rounded away. **Mixed precision** does the heavy multiplication in low precision but keeps the running totals (the master weights and optimizer statistics) in full 32-bit precision.",
+        "Memory is the other half of the story. A GPU's memory has to hold the weights, their gradients, the optimizer's bookkeeping, and the **activations**: intermediate results saved during the forward pass so the backward pass can use them. Activations often dominate. Tricks like **activation checkpointing** throw some away and recompute them later, trading about a third more compute for much less memory."
+      ],
+      "diagram": {
+        "caption": "Where memory goes per parameter in BF16 mixed-precision AdamW training.",
+        "steps": [
+          { "label": "BF16 weights", "detail": "2 bytes, used in matmuls" },
+          { "label": "BF16 gradients", "detail": "2 bytes, from backward pass" },
+          { "label": "FP32 master weights", "detail": "4 bytes, accumulate tiny updates" },
+          { "label": "Adam moments", "detail": "8 bytes, two FP32 buffers" },
+          { "label": "Activations", "detail": "Scales with batch x sequence x layers" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "BF16 (bfloat16)", "role": "16-bit format with 8 exponent bits (same range as FP32) and 7 mantissa bits; the default training precision since A100 because it rarely overflows." },
+          { "name": "FP16 with loss scaling", "role": "16-bit format with only 5 exponent bits; small gradients underflow to zero, so the loss is multiplied by a dynamic scale factor before backward." },
+          { "name": "FP8 (E4M3 / E5M2)", "role": "8-bit formats on Hopper and later; E4M3 for forward activations/weights, E5M2's wider range sometimes for gradients, each needing a scale factor." },
+          { "name": "Microscaling (MXFP8, MXFP4, NVFP4)", "role": "Blackwell-era formats where each block of 16-32 values shares its own scale, preserving accuracy at 8 or even 4 bits." },
+          { "name": "Activation checkpointing", "role": "Saves only selected activations (e.g. at block boundaries) and recomputes the rest during backward." },
+          { "name": "Master weights in FP32", "role": "High-precision copy that receives optimizer updates so updates of ~1e-4 relative size aren't rounded away." }
+        ],
+        "flow": [
+          "The optimizer holds FP32 master weights; a BF16 (or FP8-quantized) copy is used for compute.",
+          "In the forward pass, matmul inputs are cast to the low-precision format, tensor cores multiply them, and products are accumulated in FP32 before writing BF16 outputs.",
+          "Numerically sensitive ops (softmax, layer norm, loss, reductions) are kept in FP32 by autocast.",
+          "Activations are stored for backward, unless checkpointing discards them, in which case the block's forward is re-run during backward.",
+          "Gradients flow back in BF16 (or FP8 E5M2 for some recipes) and are reduced across GPUs, often in FP32 or BF16 depending on the framework setting.",
+          "The optimizer applies updates to the FP32 master weights, then refreshes the low-precision copy for the next step."
+        ],
+        "tradeoffs": [
+          { "choice": "BF16 vs FP16", "pro": "BF16 needs no loss scaling and almost never overflows", "con": "Fewer mantissa bits means coarser values; FP16 is slightly more precise where range allows" },
+          { "choice": "FP8 training", "pro": "~2x tensor-core throughput over BF16 on H100/B200 and smaller activations", "con": "Needs per-tensor or per-block scaling, careful recipes, and validation that loss curves match BF16" },
+          { "choice": "Full vs selective activation checkpointing", "pro": "Full recompute minimizes activation memory", "con": "Full adds ~33% compute; selective (recompute only attention internals) gets most of the saving for a few percent" },
+          { "choice": "CPU/NVMe offload of optimizer state", "pro": "Fine-tune very large models on few GPUs", "con": "PCIe at ~64 GB/s makes each step much slower; rarely used for pretraining" }
+        ],
+        "numbers": [
+          { "metric": "AdamW mixed-precision state", "value": "~16 bytes/param, so 7B params is ~112 GB before activations" },
+          { "metric": "H100 SXM dense throughput", "value": "~989 TFLOPS BF16, ~1,979 TFLOPS FP8" },
+          { "metric": "B200 dense throughput", "value": "~2.25 PFLOPS BF16, ~4.5 PFLOPS FP8, ~9 PFLOPS FP4" },
+          { "metric": "Activation checkpointing compute overhead", "value": "~20-33% extra (one extra forward per block)" },
+          { "metric": "BF16 precision", "value": "~3 significant decimal digits (7-bit mantissa)" },
+          { "metric": "FP8 training speedup in practice", "value": "~1.3-1.5x end-to-end over BF16 on H100" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Activation memory for a transformer layer is roughly s x b x h x (34 + 5 a s / h) bytes in mixed precision (from the Megatron paper), where s is sequence length, b batch, h hidden size and a attention heads. FlashAttention eliminates the quadratic 5as/h term by never materializing the attention matrix, which is why long-context training became practical. With FlashAttention, sequence parallelism and selective recompute, activations for a 70B model at 8K context fit in tens of GB per GPU.",
+          "FP8 recipes differ mainly in scaling granularity. Transformer Engine's original delayed scaling used per-tensor scales from an amax history window, which is fragile when outliers appear. DeepSeek-V3 used fine-grained scaling (1x128 tiles for activations, 128x128 blocks for weights) and promoted partial sums to FP32 every 128 elements, because Hopper's FP8 tensor cores accumulate with only ~14 bits of precision. Blackwell's MXFP8 bakes block scaling (32 elements, E8M0 scale) into hardware, and NVFP4 pairs 16-element blocks with FP8 scales plus a per-tensor FP32 scale, which NVIDIA has demonstrated for pretraining.",
+          "Stochastic rounding and Kahan summation matter if you drop FP32 master weights. A pure-BF16 optimizer suffers from stagnation: an update smaller than half a unit in the last place is rounded to zero, so weights stop moving late in training when the LR is small. Some recipes keep BF16 weights but use stochastic rounding or a compensation buffer to recover the lost bits at 2 bytes instead of 4."
+        ],
+        "failureModes": [
+          { "name": "FP16 gradient underflow / overflow", "description": "Without loss scaling, tiny gradients flush to zero; with too high a scale, values overflow to inf. Dynamic loss scalers skip steps on inf and halve the scale; frequent skips signal trouble." },
+          { "name": "FP8 outlier saturation", "description": "A few huge activations (common in attention outputs and SwiGLU) blow the per-tensor scale, crushing everything else to zero. Fix: finer-grained or block scaling, keep sensitive layers in BF16." },
+          { "name": "Memory fragmentation OOM", "description": "Reported free memory is high but allocation fails because the caching allocator's blocks are fragmented. Fix: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, consistent shapes, fewer dynamic sizes." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA Transformer Engine", "note": "Library providing FP8, MXFP8 and NVFP4 layers with automatic scaling for Hopper and Blackwell, used by Megatron Core and NeMo." },
+          { "name": "DeepSeek-V3", "note": "First widely documented frontier-scale FP8 training run, using tile-wise scaling and FP32 promotion to keep loss within ~0.25% of BF16." },
+          { "name": "torchao float8", "note": "PyTorch-native FP8 training with tensorwise and rowwise scaling, integrated with FSDP2 so even all-gathers move FP8 weights." }
+        ],
+        "questions": [
+          { "q": "How much GPU memory do you need to full-fine-tune an 8B model with AdamW, and how would you reduce it?", "a": "Weights, grads and optimizer states at ~16 bytes/param is ~128 GB, plus activations. Shard with FSDP across several GPUs, use activation checkpointing, or switch to an 8-bit optimizer. If you only need adaptation, LoRA freezes the base weights and trains tiny adapters, dropping optimizer memory to well under 1 GB." },
+          { "q": "Why did the industry move from FP16 to BF16 for training?", "a": "FP16's 5-bit exponent covers only about 6e-8 to 65504, so gradients underflow and activations overflow without careful dynamic loss scaling. BF16 keeps FP32's 8-bit exponent and range, sacrificing mantissa bits that deep learning tolerates well. Since A100 supports BF16 at full tensor-core speed, it removed a whole class of instabilities for free." },
+          { "q": "Your FP8 run's loss drifts above the BF16 baseline after 200B tokens. How do you debug?", "a": "Compare per-layer amax histories and look for layers with saturating scales, often attention projections or the first/last layers. Move those to BF16, switch to finer-grained (block or rowwise) scaling, and ensure accumulation is in FP32. Run short A/B ablations at small scale to confirm before relaunching." }
+        ]
+      },
+      "related": ["tensor-cores", "gpu-memory-hierarchy", "quantization", "training-loop", "model-parallelism", "virtual-memory"]
+    },
+    {
+      "id": "training-data-pipeline",
+      "title": "Training Data Pipelines",
+      "gist": "Before a model learns anything, trillions of words must be collected, cleaned, deduplicated, mixed, tokenized and streamed to thousands of GPUs without ever making them wait.",
+      "overview": [
+        "A model is only as good as what it reads. For a large language model that means tens of trillions of **tokens** (word pieces) drawn from the web, books, code, and synthetic data. Most raw web text is junk: spam, boilerplate, duplicates. Most of the real work happens before training starts.",
+        "Think of it like a water treatment plant feeding a city. Raw water (crawled web pages) passes through filters (language detection, quality classifiers), removes contaminants (duplicates, toxic or private content), gets blended from several reservoirs in carefully chosen proportions (the **data mix**), and is finally piped at steady pressure to every tap (GPU). If the pressure drops, expensive GPUs sit idle.",
+        "During training, the pipeline must also be **deterministic and resumable**: after a crash at step 200,000, the job must pick up exactly where it left off, with the same shuffle order, without re-reading or skipping data. Getting this wrong silently changes what the model learns."
+      ],
+      "diagram": {
+        "caption": "From raw crawl to tokens on the GPU.",
+        "steps": [
+          { "label": "Crawl and extract", "detail": "Common Crawl WARC to text" },
+          { "label": "Filter and dedupe", "detail": "Quality classifiers, MinHash near-dupes" },
+          { "label": "Mix and tokenize", "detail": "Weighted sources, BPE token IDs" },
+          { "label": "Shard and shuffle", "detail": "Packed sequences in object storage" },
+          { "label": "Stream to GPUs", "detail": "Prefetching loaders, resumable state" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Text extraction", "role": "Turns HTML/WARC files into clean text (e.g. trafilatura, resiliparse), stripping navigation, ads and boilerplate." },
+          { "name": "Filters and classifiers", "role": "Language ID (fastText), heuristic rules (Gopher/C4-style), and model-based quality scorers like FineWeb-Edu's educational classifier." },
+          { "name": "Deduplication", "role": "Exact (hashing) and fuzzy (MinHash LSH over n-gram shingles) dedup, run at billions-of-documents scale on Spark, Ray or Datatrove." },
+          { "name": "Tokenizer", "role": "Byte-level BPE (e.g. tiktoken-style, 128K-200K vocab) mapping text to integer IDs; run once offline and stored as compact uint32 arrays." },
+          { "name": "Sharded storage format", "role": "Large shards (e.g. Mosaic MDS, WebDataset tar, ArrayRecord, Parquet) on object storage so loaders do big sequential reads." },
+          { "name": "Streaming data loader", "role": "Per-rank workers that fetch, shuffle within a buffer, pack sequences, pin memory and prefetch to GPU, and checkpoint their exact position." }
+        ],
+        "flow": [
+          "Crawl snapshots (Common Crawl publishes ~2-3 billion pages per monthly snapshot) are extracted to text and language-identified.",
+          "Heuristic and model-based filters drop low-quality pages; PII scrubbing and safety filters remove sensitive content.",
+          "Fuzzy deduplication clusters near-identical documents with MinHash and keeps one per cluster, often removing a large fraction of raw text.",
+          "Sources (web, code, math, books, multilingual, synthetic) are weighted into a mix, frequently changing across training phases, then tokenized.",
+          "Token streams are packed into fixed-length sequences (with document-boundary masks) and written as shards with a global shuffle seed.",
+          "At train time each data-parallel rank deterministically claims its shards, streams and caches them locally, and prefetches several batches ahead of the GPU.",
+          "Loader state (shard, offset, RNG) is saved with every model checkpoint so resumption is exact, even onto a different number of GPUs."
+        ],
+        "tradeoffs": [
+          { "choice": "Aggressive quality filtering", "pro": "Better models per token; FineWeb-Edu style filtering reached given benchmarks with ~10x fewer tokens", "con": "Shrinks unique data, risks overfitting via repetition, and can remove diversity or dialects" },
+          { "choice": "Pre-tokenize offline vs tokenize on the fly", "pro": "Offline is cheap at train time and reproducible", "con": "Changing the tokenizer or mix requires reprocessing petabytes" },
+          { "choice": "Sequence packing", "pro": "No padding waste, near 100% useful tokens", "con": "Cross-document attention leaks unless you use document masking, which needs varlen attention kernels" },
+          { "choice": "Synthetic data", "pro": "Targets weak skills (math, code, reasoning) and supplies more tokens", "con": "Can reduce diversity and inherit the generator model's errors" }
+        ],
+        "numbers": [
+          { "metric": "FineWeb dataset (Hugging Face, 2024)", "value": "~15T tokens from 96 Common Crawl snapshots" },
+          { "metric": "Llama 3 pretraining data", "value": "~15T tokens; Llama 4 reported ~30T+" },
+          { "metric": "Bytes per token (English, BPE)", "value": "~4 bytes of text per token" },
+          { "metric": "Loader throughput needed", "value": "~1-5 MB/s of tokens per GPU, trivial in bytes but unforgiving on latency" },
+          { "metric": "Tokenized 15T-token corpus on disk", "value": "~60 TB at 4 bytes per token ID" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Raw bandwidth is rarely the problem for text LLMs; tail latency and determinism are. A 16K-GPU job reads only a few GB/s of tokens in total, but if one rank's loader stalls on an object-store hiccup, the synchronous collective makes everyone wait. Production loaders keep several batches prefetched, cache shards on local NVMe, and use separate processes so Python GIL contention doesn't steal time from the training loop. Multimodal training (images, video) flips this: decoding video can need more CPU than the host has, so teams pre-encode frames or move decoding to GPUs with NVDEC/DALI.",
+          "Data mixing is now treated as an optimization problem. Methods like DoReMi and RegMix train small proxy models on candidate mixes and predict the best weights for the big run; most frontier recipes also use curriculum phases, ending with an annealing stage that upsamples high-quality math, code and instruction-like data while the learning rate decays. That last few percent of tokens has a disproportionate effect on benchmark scores, which is also why benchmark contamination checks (n-gram overlap against eval sets) belong in the pipeline.",
+          "Exact resumability across a change in world size is subtle. If shards are assigned to ranks by index modulo world size, restarting on 15,872 GPUs instead of 16,384 changes every rank's stream. Robust designs define a global, world-size-independent sample order (e.g. a seeded permutation over sample indices) and derive each rank's view from it, as Mosaic StreamingDataset and Grain do, so elastic restarts consume exactly the same tokens."
+        ],
+        "failureModes": [
+          { "name": "Data loader stalls", "description": "GPU utilization shows periodic dips to zero aligned with shard boundaries or object-store latency spikes. Fix: deeper prefetch, local NVMe caching, more worker processes, larger shards." },
+          { "name": "Repeated or skipped data on resume", "description": "Loader state wasn't checkpointed, so restarts replay the same early shards; the model overfits them and loss looks suspiciously low. Fix: checkpoint loader state, use world-size-independent ordering." },
+          { "name": "Benchmark contamination", "description": "Eval questions leak into training data via the web, inflating scores. Fix: n-gram/embedding overlap detection against eval sets and removal before tokenization." }
+        ],
+        "realSystems": [
+          { "name": "Hugging Face FineWeb / Datatrove", "note": "Open 15T-token web dataset and the processing library used to build it, with documented filtering and MinHash dedup ablations." },
+          { "name": "Mosaic StreamingDataset (Databricks)", "note": "Streams MDS shards from object storage with deterministic, elastic resumption and local caching; widely used outside Databricks." },
+          { "name": "Google Grain + ArrayRecord", "note": "JAX data loading library with random access storage, giving deterministic global shuffles and checkpointable iterator state for TPU training." }
+        ],
+        "questions": [
+          { "q": "Design the data loader for a 10K-GPU LLM pretraining job reading from S3.", "a": "Pre-tokenize into ~100 MB-1 GB packed shards with a global seeded permutation. Each rank derives its sample list from the permutation, streams shards with several in flight, caches to local NVMe, and prefetches a few batches to pinned memory. Loader state goes into every checkpoint. Monitor per-rank data-wait time so stragglers are visible." },
+          { "q": "How would you deduplicate 100 billion web documents?", "a": "Exact-dedup with content hashes first (cheap). For near-duplicates, compute MinHash signatures over word 5-gram shingles, bucket with LSH bands, then build connected components of candidate pairs and keep one document per cluster. Run it as a distributed job (Spark, Ray, or Datatrove on Slurm) with the signature step embarrassingly parallel and the clustering step as a union-find over edges." },
+          { "q": "Why might deduplicating too aggressively hurt?", "a": "Highly duplicated text is sometimes high quality (popular documentation, legal texts) and dedup across snapshots can remove a lot of good data, leaving you fewer unique tokens than your budget, which forces repetition later. FineWeb's ablations found per-snapshot dedup worked better than global dedup. Measure with small-model ablations instead of assuming more dedup is better." }
+        ]
+      },
+      "related": ["batch-processing", "object-storage", "checkpointing", "training-loop", "storage-devices", "stream-processing"]
+    },
+    {
+      "id": "checkpointing",
+      "title": "Checkpointing & Fault Tolerance",
+      "gist": "With thousands of GPUs, something breaks every few hours, so training periodically saves its complete state and is built to restart quickly from the last save.",
+      "overview": [
+        "Each GPU is quite reliable on its own. But put 16,000 of them together with their memory chips, network cards, cables and power supplies, and something fails roughly every few hours. Since a training run is a single synchronized computation, one failure normally stops everything.",
+        "The defense is a **checkpoint**: a full snapshot of the model's weights, optimizer state, data position and random seeds, saved regularly. It's like saving a video game before a hard level. If you die, you lose only the progress since the last save. Save too rarely and failures cost hours of work; save too often and you spend all your time saving.",
+        "Modern systems make saving nearly free by copying state to CPU memory first and writing it to storage in the background (**asynchronous checkpointing**), and they make restarting fast by keeping spare machines warm and copies of the state in other machines' memory. The goal is to keep **goodput**, the fraction of time doing useful training, above ~90%."
+      ],
+      "diagram": {
+        "caption": "The fail-detect-restart cycle of a large training job.",
+        "steps": [
+          { "label": "Async snapshot", "detail": "GPU to host memory, seconds" },
+          { "label": "Background upload", "detail": "Sharded files to object storage" },
+          { "label": "Failure detected", "detail": "Health checks, NCCL timeouts, Xid errors" },
+          { "label": "Swap bad node", "detail": "Hot spare replaces failed host" },
+          { "label": "Reload and resume", "detail": "Load shards, restore data position" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Distributed checkpoint format", "role": "Each rank writes only its own shards plus metadata describing the global layout (PyTorch DCP, Megatron dist-ckpt, Orbax), so saves are parallel and reloads can reshard." },
+          { "name": "Async checkpointing", "role": "Copies GPU state to pinned host memory in a short pause, then a background thread serializes and uploads while training continues." },
+          { "name": "In-memory / peer replication", "role": "Keeps recent checkpoints in CPU RAM of peer nodes so recovery from a single node failure doesn't touch remote storage." },
+          { "name": "Health monitoring", "role": "Watches GPU Xid errors, ECC counts, NVLink/IB link flaps, thermals and per-rank step times; preemptively drains suspect nodes." },
+          { "name": "Job orchestrator", "role": "Slurm, Kubernetes (with JobSet/Kueue) or a custom controller that restarts the job, swaps in hot spares and replays from the latest valid checkpoint." }
+        ],
+        "flow": [
+          "Every N steps (often every 10-60 minutes), training pauses briefly while each rank copies its parameter and optimizer shards to host memory.",
+          "Training resumes immediately; background threads write the shards in parallel to object storage or a parallel file system, then commit a metadata file atomically.",
+          "When a GPU, NIC or host fails, peers hang in a collective until the NCCL watchdog times out, or the health agent reports the fault directly.",
+          "The orchestrator tears down the job, cordons the bad node, and replaces it with a pre-validated spare.",
+          "All ranks load the latest committed checkpoint, preferring in-memory peer copies, resharding if the world size changed.",
+          "Data loader position, RNG and scheduler state are restored so training continues on exactly the next batch."
+        ],
+        "tradeoffs": [
+          { "choice": "Frequent checkpoints", "pro": "Less lost work per failure", "con": "More storage bandwidth and pause time; optimal interval is ~sqrt(2 x save cost x MTBF) (Young/Daly)" },
+          { "choice": "Remote storage vs in-memory peer copies", "pro": "Remote is durable against whole-cluster failure", "con": "Reload of TBs from object storage can take many minutes; in-memory restores in seconds but is lost if many nodes fail" },
+          { "choice": "Full restart vs elastic training", "pro": "Full restarts are simple and well understood", "con": "Elastic/fault-tolerant DP (e.g. torchft) avoids global restarts but complicates determinism and batch semantics" },
+          { "choice": "Saving optimizer state", "pro": "Required for exact resumption", "con": "Triples checkpoint size versus weights-only; often kept only for recent checkpoints" }
+        ],
+        "numbers": [
+          { "metric": "Llama 3 405B pretraining interruptions", "value": "~466 in 54 days (~1 every 3 hours), ~78% hardware-related" },
+          { "metric": "Largest failure category (Llama 3)", "value": "~30% faulty GPUs, ~17% HBM3 memory" },
+          { "metric": "405B checkpoint with AdamW state", "value": "~6.5 TB (16 bytes/param); ~0.8 TB weights only in BF16" },
+          { "metric": "Effective training time achieved", "value": ">90% goodput reported by Meta for Llama 3" },
+          { "metric": "Async checkpoint training pause", "value": "~seconds vs minutes for synchronous saves" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Failure rate scales linearly with component count while the cost of each failure scales with the size of the synchronous blast radius, so at 100K-GPU scale (xAI Colossus, Meta's and OpenAI's newest clusters) mean time between interruptions approaches tens of minutes. That changes architecture: checkpoints must be near-instant, restarts must avoid re-initializing NCCL communicators across 100K ranks (which alone can take minutes), and teams are moving toward fault-tolerant data parallelism where a failed replica group drops out and rejoins without stopping the others.",
+          "Silent data corruption (SDC) is the scariest failure because nothing crashes. A GPU with a marginal ALU or HBM can produce wrong numbers occasionally, poisoning gradients that are then averaged into every replica. Meta and Google both report SDC at scale; defenses include periodic deterministic recompute checks on spare capacity, tracking per-rank gradient norm outliers, and comparing loss across replicas. Checkpoint retention policies must keep checkpoints far enough back to roll past an SDC that went undetected for a while.",
+          "Checkpoint write bandwidth is a real design input. Writing 6.5 TB in 5 minutes needs ~22 GB/s sustained, spread across thousands of writers; small-file metadata storms can melt a parallel file system or trigger object-store request throttling. Good formats write few large files per rank, use multipart uploads, and dedupe replicated state (only one DP replica writes each shard). Reload is often the slower path because every rank reads simultaneously, so caching the latest checkpoint on local NVMe or peer RAM pays off."
+        ],
+        "failureModes": [
+          { "name": "Corrupt or partial checkpoint", "description": "A crash mid-write leaves a checkpoint that looks complete but has missing shards; resuming fails or loads garbage. Fix: write to a temp path, verify, then commit metadata atomically; keep the previous checkpoint." },
+          { "name": "Silent data corruption", "description": "Faulty hardware computes wrong values without errors, causing loss anomalies or subtle quality degradation. Fix: cross-replica checks, burn-in tests, and fleet-wide screening tools (e.g. NVIDIA DCGM diagnostics)." },
+          { "name": "Slow restart dominates", "description": "Even with frequent checkpoints, 20-40 minutes to reschedule, re-init NCCL and reload state destroys goodput. Fix: hot spares, in-memory checkpoints, cached container images, faster communicator init." }
+        ],
+        "realSystems": [
+          { "name": "PyTorch Distributed Checkpoint (DCP)", "note": "Sharded, resharding-capable checkpoint API with async_save, used by TorchTitan and FSDP2-based training." },
+          { "name": "Google Gemini / Pathways", "note": "Gemini's report describes keeping redundant in-memory copies of model state for fast recovery, raising goodput on very large TPU deployments." },
+          { "name": "ByteDance ByteCheckpoint / MegaScale", "note": "MegaScale training on >10K GPUs reported ~55% MFU with automated fault diagnosis, and ByteCheckpoint provides parallel, resharding checkpoints across frameworks." }
+        ],
+        "questions": [
+          { "q": "Your cluster's MTBF is 3 hours and a checkpoint takes 2 minutes of pause. How often should you checkpoint?", "a": "Young/Daly gives interval ~ sqrt(2 x 2 min x 180 min) = sqrt(720) ~ 27 minutes. Then expected loss per failure is ~half the interval plus restart time. If async saving cuts the pause to 10 seconds, the optimal interval drops to ~8 minutes, so making saves cheap is worth more than tuning the interval." },
+          { "q": "Design fault tolerance for a 100K-GPU training run.", "a": "Async sharded checkpoints every few minutes to peer host RAM, with less frequent durable copies to object storage. Aggressive health checks and preemptive draining, a pool of hot spares, and fast communicator re-init. Ideally fault-tolerant DP so losing one replica group shrinks the batch temporarily instead of stopping 100K GPUs. Plus SDC detection and checkpoint retention long enough to roll back past undetected corruption." },
+          { "q": "Why can't you just write a checkpoint from rank 0?", "a": "Rank 0 doesn't hold the full state under FSDP/TP/PP, and gathering terabytes to one host would OOM and take forever over one NIC. Instead every rank writes its own shards in parallel with a global metadata index, and replicated shards are written once. This also enables loading onto a different parallel layout." }
+        ]
+      },
+      "related": ["data-parallelism", "object-storage", "replication", "file-systems", "training-data-pipeline", "erasure-coding"]
+    }
+  ]
+}

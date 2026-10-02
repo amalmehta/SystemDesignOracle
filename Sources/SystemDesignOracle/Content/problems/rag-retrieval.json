@@ -1,0 +1,189 @@
+{
+  "id": "rag-retrieval",
+  "title": "RAG Retrieval over 1B Live Documents",
+  "domain": "data",
+  "prompt": "Design the retrieval system behind a RAG assistant over 1 billion documents that are updated continuously. Cover ingestion, chunking, embeddings, indexing, hybrid search, freshness, and evaluation.",
+
+  "gist": "Stream document changes through chunking and embedding into sharded hybrid indexes (compressed ANN vectors plus BM25), fuse and rerank candidates per query with permission filters, and measure recall continuously.",
+
+  "overview": [
+    "A RAG (retrieval-augmented generation) assistant answers questions by first finding the handful of passages most relevant to the question, then letting a language model write an answer grounded in them. The model is only as good as what retrieval hands it, so this system's job is to find the right 10–20 passages out of billions, in well under a second, from documents that keep changing.",
+    "Documents are split into **chunks** of a few hundred words, and each chunk is turned into an **embedding**, a list of numbers that captures meaning, so similar ideas land near each other. A **vector index** finds the nearest chunks to the question's embedding quickly. Because embeddings can miss exact names, codes and rare words, we run a classic **keyword (BM25) search** alongside it and merge the two result lists: this is **hybrid search**.",
+    "The top candidates then go to a **reranker**, a slower but more accurate model that reads the question and each passage together and reorders them. Permission filters make sure users only ever see chunks they are allowed to read.",
+    "Freshness comes from treating ingestion as a stream: every document change flows through chunking and embedding into small, fast-updating index segments that are searched alongside the big main index and merged in later. Evaluation runs constantly, using labelled question sets and production signals, because retrieval quality silently drifts as content, models and queries change."
+  ],
+  "diagram": {
+    "caption": "Change stream → chunk & embed → hybrid index → fuse, filter, rerank → LLM.",
+    "steps": [
+      { "label": "Change stream", "detail": "CDC/webhooks from sources" },
+      { "label": "Parse & chunk", "detail": "structure-aware, ~300–500 tokens" },
+      { "label": "Embed", "detail": "GPU batch encoders, versioned" },
+      { "label": "Hybrid index", "detail": "ANN + BM25 shards, fresh tier" },
+      { "label": "Query & fuse", "detail": "rewrite, ACL filter, RRF" },
+      { "label": "Rerank → LLM", "detail": "cross-encoder top 200 → top 10" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Ingest documents from many sources (wikis, tickets, files, web, databases) with create, update and delete events, at continuous rates.",
+      "Return the top-k most relevant chunks with citations (doc ID, URL, offsets) for a natural-language query plus conversation context.",
+      "Enforce per-user and per-tenant access control on every result, with document-level permissions that change over time.",
+      "Support metadata filters (source, date range, language, tenant) and recency boosting.",
+      "Allow re-embedding the corpus with a new model without downtime."
+    ],
+    "nonFunctional": [
+      "Retrieval latency p95 < 300 ms end-to-end including reranking; p99 < 600 ms.",
+      "Freshness: updates searchable within ~1 minute p95; deletes and permission revocations within seconds to a minute.",
+      "Recall@50 > 0.9 against a labelled set; reranked nDCG@10 tracked per release with no regressions.",
+      "Throughput ~2–5K queries/s peak with headroom; 99.9% availability.",
+      "Cost: index memory dominated by vectors, so compression is a first-class requirement."
+    ],
+    "estimates": [
+      { "metric": "Chunks", "value": "1B docs × ~10 chunks ≈ 10B chunks" },
+      { "metric": "Raw vector size", "value": "10B × 1,024 dims × 4 B (fp32) ≈ 41 TB; as int8 ≈ 10 TB" },
+      { "metric": "Compressed in RAM", "value": "PQ at 64–128 B/vector → 10B × 96 B ≈ 1 TB in memory, full vectors on SSD for rescoring" },
+      { "metric": "Update rate", "value": "1% of docs change per day ≈ 10M docs ≈ 100M chunks/day ≈ 1.2K chunk embeds/s avg, bursts 10×" },
+      { "metric": "Embedding compute", "value": "100M chunks/day × ~400 tokens ≈ 40B tokens/day; a GPU at ~50K tokens/s → ~10 GPUs steady, more for bursts and re-embeds" },
+      { "metric": "Full re-embed", "value": "10B chunks × 400 tokens = 4T tokens ÷ (200 GPUs × 50K tok/s) ≈ 4.6 days" },
+      { "metric": "Query load", "value": "5K QPS × ~30 shards fanned out ≈ 150K shard searches/s; rerank 5K × 200 pairs ≈ 1M pairs/s" }
+    ]
+  },
+  "stages": [
+    {
+      "name": "Ingestion",
+      "summary": "Turn continuous source changes into an ordered, replayable stream of document versions, with deletes and permission changes as first-class events.",
+      "points": [
+        "Connectors per source emit change events (CDC from databases, webhooks, crawl diffs) into a partitioned log (Kafka) keyed by document ID so updates to one document stay ordered.",
+        "Store canonical raw documents and extracted text in an object store, versioned by content hash; skip downstream work when the hash is unchanged.",
+        "Parse with format-specific extractors (HTML, PDF with layout/OCR, Office, code, tables) and keep structure: headings, sections, tables, lists.",
+        "Capture ACLs and metadata (owner, groups, tenant, timestamps) with each version; permission-only changes take a fast path that skips re-embedding.",
+        "Backpressure and priority lanes: deletes and ACL revocations jump the queue; bulk backfills run in a low-priority lane."
+      ],
+      "deepDive": [
+        "Content hashing at chunk granularity is the biggest cost saver in continuous ingestion. Most edits touch a small part of a document; if chunk boundaries are stable (anchored on headings and paragraph boundaries rather than fixed offsets), only the changed chunks need new embeddings, often cutting embedding work by 5–10× compared to re-embedding whole documents.",
+        "Deletes are the correctness-critical path: a deleted or revoked document appearing in an answer is a security incident, not a relevance bug. They are applied as tombstones to every index tier immediately and also enforced at query time by checking a fast document-status and ACL store, so even a lagging index cannot leak them."
+      ]
+    },
+    {
+      "name": "Chunking",
+      "summary": "Split documents into retrieval units that are small enough to be precise yet carry enough context to be understood alone.",
+      "points": [
+        "Structure-aware chunking on headings and paragraphs, targeting ~300–500 tokens with ~10–15% overlap, rather than blind fixed-size windows.",
+        "Prepend context to each chunk (document title, section path, and optionally an LLM-written one-line summary of the document) before embedding: 'contextual retrieval'.",
+        "Treat tables, code blocks and lists as atomic units where possible; keep table headers with rows.",
+        "Store parent pointers so the system can retrieve a small chunk but hand the LLM its larger enclosing section (small-to-big retrieval).",
+        "Version chunking policy; a change in policy triggers a controlled reindex like a model change."
+      ],
+      "deepDive": [
+        "Chunk size trades precision against context. Small chunks embed a single idea cleanly and score sharply, but lose antecedents ('it', 'this policy'); large chunks dilute the embedding with unrelated content. Adding a short contextual header (title plus section path plus a document summary) recovers most of the lost context; Anthropic reported that contextual embeddings plus contextual BM25 reduced retrieval failures by about half, and with reranking by about two thirds, in their 2024 study.",
+        "Late-interaction models (ColBERT-style, one vector per token) sidestep some chunking sensitivity and give better recall on long or technical text, but multiply storage by the number of tokens. At 10B chunks that is usually reserved for reranking or a smaller high-value subset rather than first-stage retrieval."
+      ]
+    },
+    {
+      "name": "Embeddings",
+      "summary": "Encode chunks and queries with a versioned embedding model served on batched GPUs, and plan for model upgrades from day one.",
+      "points": [
+        "Use a strong retrieval embedding model (~1,024 dims) fine-tuned or adapted on in-domain query-passage pairs; query and document encoders may use different instructions/prefixes.",
+        "Batch embedding on GPUs with dynamic batching; embedding throughput, not ANN, is usually the ingestion bottleneck.",
+        "Matryoshka-style embeddings allow truncation (e.g. 1,024 → 256 dims) for a cheap first-pass index while keeping full dims for rescoring.",
+        "Every vector carries a model version; indexes are built per version, and a re-embed runs as a shadow index before cutover.",
+        "Query embedding is on the latency path (~10–20 ms on GPU); cache embeddings for repeated queries."
+      ],
+      "deepDive": [
+        "A model upgrade means re-embedding 10B chunks, around 4T tokens, which is days of a large GPU pool. Plan it as a blue/green migration: build the new index in parallel from the raw chunk store, dual-write fresh updates to both, evaluate on the offline set and via interleaving online, then shift traffic. Vectors from two different models are not comparable, so mixing them in one index is never an option.",
+        "Fine-tuning the embedder on in-domain data (mined from click logs, or synthetic queries generated by an LLM for each chunk and filtered for quality) typically gives larger recall gains than switching between top general-purpose models, especially for enterprise jargon, product names and code."
+      ]
+    },
+    {
+      "name": "Indexing",
+      "summary": "Build sharded, compressed ANN and inverted indexes with a fast-mutating fresh tier and a large, periodically rebuilt main tier.",
+      "points": [
+        "Shard by document ID hash (~30–100 shards of 100–300M chunks), each with replicas; for multi-tenant data, co-locate small tenants and give large tenants dedicated shards.",
+        "ANN per shard: IVF-PQ or graph indexes (HNSW in RAM for hot sets, DiskANN-style SSD graphs with PQ codes in RAM for the bulk) to fit 10B vectors in ~1 TB of RAM.",
+        "BM25 inverted index (Lucene/Tantivy-style) over the same chunks, with title and section fields boosted.",
+        "LSM-like tiers: a small in-memory fresh segment absorbs inserts in seconds; background merges fold it into the main segments, and deletes are bitmaps until compaction.",
+        "Filterable metadata (tenant, ACL group IDs, dates) stored alongside vectors to support filtered search without post-filter collapse."
+      ],
+      "deepDive": [
+        "Graph indexes like HNSW give excellent recall/latency but hold the full graph and vectors in memory and degrade with heavy deletes; at 10B chunks that would be tens of TB of RAM. DiskANN/Vamana-style indexes keep PQ-compressed vectors in RAM for navigation and full-precision vectors on NVMe for final rescoring, reaching > 95% recall@10 with a few milliseconds and a handful of SSD reads per query, at roughly a tenth of the memory cost.",
+        "Filtered search is the classic trap: if a user can see 0.1% of the corpus, searching the global ANN graph for top-100 and then filtering by ACL returns almost nothing. Solutions include partitioning indexes by tenant, filter-aware graph traversal (as in Filtered-DiskANN or Qdrant's payload-aware HNSW), or falling back to exact search over the small permitted set when the filter is very selective."
+      ]
+    },
+    {
+      "name": "Hybrid Search & Reranking",
+      "summary": "Rewrite the query, retrieve from both dense and sparse indexes in parallel, fuse the lists, and rerank a few hundred candidates with a cross-encoder.",
+      "points": [
+        "Query understanding: rewrite conversational follow-ups into standalone queries with a small LLM, and optionally generate 2–3 sub-queries for multi-part questions.",
+        "Fan out to dense (top ~200) and BM25 (top ~200) across shards in parallel, with ACL and metadata filters pushed down to each shard.",
+        "Fuse with reciprocal rank fusion (score = Σ 1/(60 + rank)), which needs no score calibration between systems; optionally a learned fusion later.",
+        "Rerank the fused top ~100–200 with a cross-encoder (batched on GPU, ~50–100 ms), then apply recency boosts and diversity (limit chunks per document).",
+        "Return top ~10–20 chunks, expanded to parent sections within a token budget, with citations."
+      ],
+      "deepDive": [
+        "Dense and sparse retrieval fail on different queries: embeddings handle paraphrase and concept matches; BM25 wins on exact identifiers, error codes, names and rare terms. Hybrid retrieval with RRF reliably beats either alone across benchmarks like BEIR, and the reranker then recovers precision. The latency budget is roughly: rewrite 30–80 ms (skippable), embed 15 ms, shard fan-out 30–60 ms with hedged requests, rerank 50–100 ms.",
+        "The cross-encoder is the most expensive per-candidate component, so the candidate count is the knob: reranking 200 instead of 50 often adds a few points of nDCG for 4× the GPU cost. At 5K QPS × 200 pairs, that is ~1M pairs/s, a meaningful GPU fleet, so distilled small rerankers and early-exit on confident queries matter."
+      ]
+    },
+    {
+      "name": "Freshness & Consistency",
+      "summary": "Keep the index within about a minute of the sources and make deletes and permission changes effectively immediate.",
+      "points": [
+        "Measure freshness end-to-end: source change timestamp to searchable timestamp, alerted at p95 > 60 s.",
+        "Fresh tier is searched on every query and merged into main segments every few minutes to hours.",
+        "Query-time ACL check against a low-latency permission service (or cached group memberships) as defence in depth over indexed ACLs.",
+        "Recency signals: store document modified time; boost recent content for time-sensitive queries detected by the query rewriter.",
+        "Idempotent, versioned upserts: an older event arriving late never overwrites a newer chunk version."
+      ],
+      "deepDive": [
+        "ACL changes are harder than content changes because one group membership change can affect millions of documents. Indexing principal IDs (users and groups) per chunk and resolving the user's groups at query time means a membership change touches only the identity store, not the index. Only document-level ACL edits need index updates, and those take the fast path."
+      ]
+    },
+    {
+      "name": "Evaluation",
+      "summary": "Measure retrieval quality separately from generation, offline before every change and online continuously.",
+      "points": [
+        "Golden set: thousands of real queries with graded relevant chunks, labelled by experts and LLM judges calibrated against humans.",
+        "Offline metrics per component: ANN recall@k versus exact search, retrieval recall@50, reranked nDCG@10 and MRR, sliced by source, language and query type.",
+        "End-to-end RAG metrics: answer faithfulness/groundedness and citation correctness with LLM-as-judge, spot-checked by humans.",
+        "Online signals: citation click-through, thumbs up/down, follow-up rephrasing rate, and A/B or interleaving tests for ranking changes.",
+        "Regression gates in CI for chunking, embedding, index and reranker changes."
+      ],
+      "deepDive": [
+        "Separate the failures: if the right chunk was never retrieved, no prompt fix helps; if it was retrieved but the answer is wrong, it is a generation issue. Logging retrieved candidates with each answer and periodically judging them lets you attribute errors, and a growing set of production failures becomes the next round of golden queries and fine-tuning data for the embedder and reranker."
+      ]
+    }
+  ],
+  "tradeoffs": [
+    { "choice": "Hybrid dense + BM25 vs dense only", "pro": "Catches exact terms and identifiers that embeddings miss; consistently higher recall.", "con": "Two indexes to build, shard and keep fresh; fusion adds tuning." },
+    { "choice": "DiskANN/IVF-PQ vs in-memory HNSW", "pro": "~10× less RAM at 10B scale.", "con": "Slightly lower recall and higher latency; more complex updates and compaction." },
+    { "choice": "Small chunks vs large chunks", "pro": "Small chunks give precise matches and tight context.", "con": "Lose surrounding context; need contextual headers or parent expansion." },
+    { "choice": "Cross-encoder reranking", "pro": "Large precision gains on the final top-10.", "con": "GPU cost and 50–100 ms latency per query, scaling with candidate count." },
+    { "choice": "Query-time ACL check vs index-only ACLs", "pro": "Revocations take effect immediately; defence in depth.", "con": "Extra latency and a hard dependency on the permission service." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Permission leak", "description": "A revoked or deleted document appears in an answer because the index lags. Prioritise tombstones, enforce ACLs at query time, and test with canary documents whose access is revoked." },
+      { "name": "Filtered search collapse", "description": "Highly selective tenant or ACL filters leave too few results after ANN post-filtering, so recall silently drops for small tenants. Use per-tenant partitions or filter-aware traversal and exact fallback." },
+      { "name": "Embedding drift on model change", "description": "Mixing vectors from two model versions or rolling out a new model without evaluation degrades retrieval invisibly. Version vectors, build shadow indexes and gate cutover on offline and online metrics." },
+      { "name": "Ingestion backlog", "description": "A bulk import floods the embedding queue and normal updates go stale for hours. Separate priority lanes, autoscale GPU workers, and alert on freshness lag." },
+      { "name": "Prompt injection via documents", "description": "Retrieved content contains instructions that hijack the assistant. Mark retrieved text as untrusted data in prompts, filter known patterns at ingestion and limit what tools the assistant can call." }
+    ],
+    "realSystems": [
+      { "name": "Microsoft Bing / DiskANN", "note": "DiskANN SSD-resident graph indexes developed for billion-scale web vector search, now available in Azure Cosmos DB and open source." },
+      { "name": "Vespa / Elasticsearch / OpenSearch", "note": "Search engines combining BM25 and ANN in one query with filters, used for hybrid RAG retrieval at scale." },
+      { "name": "Glean and enterprise search platforms", "note": "Connector-based ingestion with permission-aware indexing and hybrid ranking behind workplace assistants." },
+      { "name": "Turbopuffer / Pinecone serverless", "note": "Object-storage-backed vector indexes with caching tiers, trading some latency for much lower cost at billions of vectors." }
+    ],
+    "questions": [
+      { "q": "How do you know whether a quality drop is retrieval or generation?", "a": "Log retrieved chunks per answer and judge them separately. If relevant chunks are absent from the top-k, it is retrieval (check recall@k by stage: ANN, fusion, rerank); if present but misused, it is generation or prompt construction." },
+      { "q": "How would you migrate to a new embedding model?", "a": "Re-embed from the stored chunk text into a new index in parallel, dual-write live updates to both, compare on the golden set and with online interleaving, then cut traffic over and retire the old index. Budget days of GPU time at 10B chunks." },
+      { "q": "Why reciprocal rank fusion instead of adding scores?", "a": "BM25 scores and cosine similarities live on different, query-dependent scales, so linear combinations need calibration. RRF uses only ranks, is robust out of the box, and can later be replaced by a learned fusion once enough labelled data exists." },
+      { "q": "How do you serve a tenant with 10 documents and one with 100M on the same system?", "a": "Small tenants share pooled shards with tenant ID as a filter (often brute-force search over their few vectors), while large tenants get dedicated shards and indexes. This avoids filter collapse and noisy neighbours." },
+      { "q": "How do you keep latency under 300 ms with 30-shard fan-out?", "a": "Search shards in parallel with hedged requests to replicas, set per-shard timeouts and return partial results, cache query embeddings and popular results, and cap rerank candidates. Tail latency of the slowest shard is the thing to engineer against." }
+    ]
+  },
+
+  "related": [ "vector-search", "change-data-capture", "stream-processing", "partitioning", "lsm-btree", "batching" ]
+}

@@ -1,0 +1,453 @@
+{
+  "id": "inference",
+  "name": "Inference Serving",
+  "symbol": "bolt.horizontal",
+  "summary": "How trained models, especially large language models, are actually run for millions of users: the memory, batching, precision and fleet-level tricks that decide latency and cost per token.",
+  "topics": [
+    {
+      "id": "llm-inference-basics",
+      "title": "Prefill & Decode",
+      "gist": "An LLM answers in two phases: it reads your whole prompt at once, then writes the reply one word-piece at a time, each phase stressing different hardware limits.",
+      "overview": [
+        "A large language model never writes a whole answer in one go. It produces one **token** (a word or word-fragment, roughly three-quarters of an English word) at a time, and every new token depends on all the tokens before it. Serving an LLM is therefore a loop, not a single calculation.",
+        "The loop has two very different phases. In **prefill**, the model reads your entire prompt in one big parallel pass, like a speed-reader taking in a whole page at a glance. In **decode**, it writes the answer one token per step, like a typist who must re-check their notes before every keystroke. Prefill decides how long you wait before the first word appears; decode decides how fast the words then stream out.",
+        "The surprise for newcomers is that the two phases are limited by different things. Prefill does a huge amount of arithmetic and keeps the chip's math units busy. Decode does very little arithmetic per step but must haul all of the model's billions of weights out of memory every single step, so it is limited by memory speed, not math speed. Almost every serving trick in this domain exists to fix decode's inefficiency."
+      ],
+      "diagram": {
+        "caption": "One request flowing through an LLM server.",
+        "steps": [
+          { "label": "Tokenize prompt", "detail": "Text becomes integer token ids" },
+          { "label": "Prefill", "detail": "All prompt tokens in one pass" },
+          { "label": "First token", "detail": "Time-to-first-token (TTFT) measured here" },
+          { "label": "Decode loop", "detail": "One token per forward pass" },
+          { "label": "Stop & detokenize", "detail": "EOS or max length reached" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Tokenizer", "role": "Converts text to integer ids with a BPE-style vocabulary (~128K entries for Llama 3, ~200K for GPT-4o-era models) and back again on output." },
+          { "name": "Transformer forward pass", "role": "Runs every layer: attention over prior tokens plus a feed-forward (or mixture-of-experts) block. Prefill runs it over N prompt tokens at once; decode runs it over one new token per sequence." },
+          { "name": "KV cache", "role": "Stores the attention keys and values of every token already processed so decode never recomputes the prompt. It is the main consumer of GPU memory after the weights." },
+          { "name": "Sampler", "role": "Turns the final logits into the next token using temperature, top-p/top-k, repetition penalties or constrained grammars (JSON schemas)." },
+          { "name": "Scheduler", "role": "Decides which requests run in each forward pass, mixing prefills and decodes to balance latency and throughput." }
+        ],
+        "flow": [
+          "The request arrives at the server and the tokenizer turns the prompt into, say, 2,000 token ids.",
+          "Prefill runs all 2,000 tokens through every layer in one batched pass; this is matrix-matrix work that keeps tensor cores near peak utilization.",
+          "Each layer writes the keys and values for all 2,000 tokens into the KV cache.",
+          "The logits of the last position are sampled to produce the first output token; the time until now is TTFT.",
+          "Decode feeds just that one new token back in; attention reads the whole KV cache, but the matrix multiplies are now matrix-vector work per sequence.",
+          "Each decode step appends one entry per layer to the KV cache and emits one token; the gap between tokens is TPOT (time per output token) or ITL (inter-token latency).",
+          "The loop stops on an end-of-sequence token, a stop string, or max_tokens, and the text is detokenized and streamed back."
+        ],
+        "tradeoffs": [
+          { "choice": "Bigger decode batch", "pro": "Weights are read once per step for many users, so throughput and cost per token improve almost linearly at first.", "con": "Each user's TPOT rises and KV cache memory fills up, limiting context length." },
+          { "choice": "Long prompts / big prefill chunks", "pro": "Prefill is compute-efficient; processing big chunks maximizes FLOP utilization.", "con": "A long prefill stalls every decode in the same batch, causing visible stutter for other users." },
+          { "choice": "More tensor-parallel GPUs per replica", "pro": "Lower latency per token because each GPU reads only a slice of the weights.", "con": "All-reduce communication every layer, and fewer independent replicas for the same hardware." }
+        ],
+        "numbers": [
+          { "metric": "Llama 3.1 70B weights in BF16", "value": "~140 GB (needs 2+ H100 80 GB)" },
+          { "metric": "H100 SXM HBM3 bandwidth", "value": "~3.35 TB/s" },
+          { "metric": "B200 HBM3e bandwidth", "value": "~8 TB/s" },
+          { "metric": "Decode arithmetic intensity at batch 1", "value": "~1-2 FLOPs/byte (H100 ridge ~300)" },
+          { "metric": "Typical interactive SLO", "value": "TTFT < ~500 ms, TPOT < ~50 ms" },
+          { "metric": "Lower bound per decode step, 70B BF16 on 4x H100", "value": "~10 ms (140 GB / ~13 TB/s)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The roofline makes the phase split precise. A dense model does ~2 FLOPs per parameter per token. In prefill with N tokens, each weight byte loaded is reused N times, so arithmetic intensity grows with N and you hit the compute roof after a few hundred tokens. In decode at batch size B, intensity is roughly B FLOPs per weight byte in BF16 (2B FLOPs per 2 bytes), so on an H100 (~989 dense BF16 TFLOPS / 3.35 TB/s, ridge ~295) you need batches in the hundreds before decode becomes compute-bound. The practical consequence: decode cost per token is dominated by bytes moved (weights plus KV cache), which is why quantization and batching help so much more than faster math.",
+          "Attention breaks the clean picture. Weight reads are shared across a batch, but KV cache reads are per-sequence, so at long context the KV reads dominate and batching stops helping: a batch of 64 users each at 32K context reads 64 separate caches every step. Architecture choices like grouped-query attention (Llama 3: 8 KV heads vs 64 query heads), multi-head latent attention (DeepSeek-V3 compresses KV into a ~512-dim latent), and sliding-window layers (Gemma 3, gpt-oss) exist largely to shrink this per-sequence traffic.",
+          "Mixture-of-experts models change the arithmetic again. DeepSeek-V3 has 671B total parameters but ~37B active per token, so FLOPs per token look like a 37B dense model while memory capacity looks like a 671B one. At small batch each token touches different experts and you read many expert weights for little reuse; at large batch every expert gets a healthy sub-batch. This is why MoE serving favors very large batches spread with expert parallelism across many GPUs (DeepSeek's production decode uses EP across ~144 GPUs per instance) rather than one small node."
+        ],
+        "failureModes": [
+          { "name": "Prefill-induced decode stalls", "description": "A 100K-token prompt lands and its prefill monopolizes the GPU for seconds, freezing token streams for every other user in the batch. Symptom: p99 inter-token latency spikes correlated with long-prompt arrivals. Fix: chunked prefill (cap tokens per step) or disaggregate prefill onto separate GPUs." },
+          { "name": "Memory-bound misdiagnosis", "description": "Teams buy GPUs with more FLOPS to speed up chat latency and see little gain because decode is bandwidth-bound. Fix: profile achieved memory bandwidth versus peak; optimize bytes (quantize weights and KV, raise batch) before chasing FLOPS." },
+          { "name": "Tokenizer mismatch", "description": "Client-side token counting uses a different tokenizer or chat template than the server, so prompts are silently truncated or exceed context limits, and stop sequences fail to match across token boundaries. Fix: count tokens and apply chat templates server-side with the model's exact tokenizer." }
+        ],
+        "realSystems": [
+          { "name": "vLLM", "note": "The most widely used open-source engine; its V1 engine (default since 2025) runs a unified scheduler that treats prefill and decode tokens as one token budget per step." },
+          { "name": "NVIDIA TensorRT-LLM", "note": "Compiles models into fused CUDA kernels with in-flight batching and FP8/FP4 paths; the reference for peak throughput on Hopper and Blackwell." },
+          { "name": "SGLang", "note": "Serving engine from LMSYS used in production by xAI and others; strong on structured outputs and prefix reuse, and a common DeepSeek-V3 deployment target." }
+        ],
+        "questions": [
+          { "q": "Why does doubling the batch size in decode nearly double throughput, while doing the same in prefill barely helps?", "a": "Decode at small batch is memory-bandwidth-bound: the step time is dominated by streaming the weights, and adding sequences reuses those same bytes, so throughput rises almost for free until KV reads or compute become the limit. Prefill already processes thousands of tokens per pass, so it is compute-bound; doubling the work roughly doubles the time." },
+          { "q": "A customer complains their 50K-token RAG prompts have a 6-second TTFT. What levers do you have?", "a": "TTFT for long prompts is prefill compute, so options are: prefix caching if documents repeat (skip recomputation entirely), more tensor parallelism or faster GPUs for that pool, FP8 prefill to roughly double FLOPS, and a dedicated prefill pool so these requests don't queue behind others. Also check whether the retrieval could send fewer, better chunks." },
+          { "q": "Estimate the minimum per-token decode latency for a 70B dense model in FP8 on one H200.", "a": "FP8 weights are ~70 GB, and H200 HBM3e delivers ~4.8 TB/s, so just reading weights takes ~15 ms per step. Real kernels hit ~70-80% of peak and KV reads add more, so ~20 ms per token (~50 tokens/s per stream) is a realistic floor at small batch." }
+        ]
+      },
+      "related": ["kv-cache", "batching", "quantization", "gpu-memory-hierarchy", "kernel-optimization", "tensor-cores"]
+    },
+    {
+      "id": "kv-cache",
+      "title": "The KV Cache & PagedAttention",
+      "gist": "The model keeps notes on every word it has already read so it never re-reads them; managing those notes efficiently decides how many users one GPU can serve.",
+      "overview": [
+        "When a transformer generates a new token, it needs to look back at every earlier token. Recomputing everything about those earlier tokens at every step would be absurdly wasteful, so the model saves two small vectors per token per layer, called the **key** and **value**. This saved memory is the **KV cache**: the model's running notes on the conversation so far.",
+        "The notes are big. For a 70B-parameter model, every token of context costs about a third of a megabyte. A 100,000-token conversation needs tens of gigabytes just for notes, often more than the space left on the GPU after loading the model. So the KV cache, not math speed, usually decides how many people a GPU can serve at once.",
+        "Early servers reserved one big contiguous block of memory per request sized for the longest possible answer, like a restaurant holding an entire 12-seat table for every party in case friends show up. **PagedAttention** borrowed the idea of virtual memory from operating systems: chop the cache into small fixed-size pages and hand them out only as the conversation actually grows. Waste dropped from most of the memory to a few percent, and throughput jumped several-fold."
+      ],
+      "diagram": {
+        "caption": "How PagedAttention maps a sequence to physical KV blocks.",
+        "steps": [
+          { "label": "Logical tokens", "detail": "Sequence positions 0 to N" },
+          { "label": "Block table", "detail": "Per-sequence list of block ids" },
+          { "label": "Physical KV blocks", "detail": "16 tokens each, anywhere in HBM" },
+          { "label": "Shared prefix blocks", "detail": "Ref-counted, copy-on-write" },
+          { "label": "Attention kernel", "detail": "Gathers blocks via the table" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "KV block pool", "role": "GPU memory left after weights and activations, pre-carved into fixed-size blocks (vLLM default 16 tokens per block) holding K and V for every layer." },
+          { "name": "Block table", "role": "Per-sequence array mapping logical block index to physical block id, exactly like a page table maps virtual pages to frames." },
+          { "name": "Block manager / allocator", "role": "Hands out free blocks as sequences grow, reference-counts shared ones, and frees them when requests finish or are preempted." },
+          { "name": "Prefix cache", "role": "Hashes full blocks by their token content (and all preceding tokens) so a new request with the same system prompt or document reuses existing blocks instead of recomputing prefill." },
+          { "name": "Offload tier", "role": "Optional CPU DRAM or SSD tier (vLLM CPU offload, LMCache, NVIDIA Dynamo KVBM) that holds evicted blocks so they can be reloaded faster than recomputed." }
+        ],
+        "flow": [
+          "A request arrives; its prompt tokens are hashed block by block and looked up in the prefix cache.",
+          "Matching blocks are reused (ref-count incremented); only the unmatched suffix needs prefill compute.",
+          "The allocator assigns fresh physical blocks for the remaining prompt tokens and records them in the sequence's block table.",
+          "During prefill and each decode step, the attention kernel reads K/V by walking the block table, gathering non-contiguous blocks.",
+          "When the last block fills, one new block is allocated; at most one partially filled block per sequence is ever wasted.",
+          "If the pool runs dry, the scheduler preempts a sequence: swapping its blocks to CPU memory or dropping them to recompute later.",
+          "On completion, blocks are released to the pool, but full blocks stay in the prefix cache under LRU until their memory is needed."
+        ],
+        "tradeoffs": [
+          { "choice": "Small block size (e.g. 16 tokens)", "pro": "Minimal internal fragmentation and finer-grained prefix sharing.", "con": "More block-table indirection and smaller memory transactions in the attention kernel." },
+          { "choice": "Recompute vs swap on preemption", "pro": "Recompute needs no PCIe bandwidth and is fast for short sequences.", "con": "For long contexts, recomputing prefill costs far more than copying blocks back from CPU DRAM." },
+          { "choice": "Quantized KV cache (FP8)", "pro": "Halves KV memory versus BF16, roughly doubling concurrent sequences or context length.", "con": "Small quality loss on some long-context tasks; requires kernels with per-tensor or per-head scales." },
+          { "choice": "Aggressive prefix caching", "pro": "Repeated system prompts and multi-turn chats skip most prefill; TTFT can drop 5-10x.", "con": "Cached blocks occupy memory that could serve more active decodes; also creates cross-tenant timing side channels if shared naively." }
+        ],
+        "numbers": [
+          { "metric": "KV per token, Llama 3.1 70B (80 layers, 8 KV heads, d=128, BF16)", "value": "~320 KB" },
+          { "metric": "KV per token, Llama 3.1 8B (BF16)", "value": "~128 KB" },
+          { "metric": "128K-token context, Llama 3.1 70B BF16", "value": "~40 GB of KV" },
+          { "metric": "Memory wasted by pre-PagedAttention systems (vLLM paper, SOSP 2023)", "value": "~60-80%" },
+          { "metric": "Waste with PagedAttention", "value": "< ~4%" },
+          { "metric": "Throughput gain reported by vLLM over HF Transformers", "value": "up to ~24x" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "KV size per token is 2 x layers x kv_heads x head_dim x bytes. Architectural choices dominate: full multi-head attention on Llama 2 70B-style dims with 64 KV heads would cost ~2.5 MB/token, grouped-query attention with 8 KV heads cuts that 8x, and DeepSeek-V3's multi-head latent attention stores a compressed ~512-dim latent plus a 64-dim RoPE key per layer (~70 KB/token in BF16 across 61 layers, versus ~4 MB for equivalent full multi-head attention), letting it run 128K context at large batch. Hybrid designs (Gemma 3's 5:1 local-to-global layers, gpt-oss's alternating 128-token sliding windows, Jamba/Nemotron-H Mamba layers) cap KV growth for most layers entirely.",
+          "Prefix caching turns serving into a cache-hit-rate problem. vLLM's automatic prefix caching hashes each full block together with its parent hash, forming an implicit tree; SGLang's RadixAttention keeps an explicit radix tree of token sequences with LRU eviction at the leaves. Hit rates for agentic and multi-turn chat workloads routinely exceed 50-80%, which is why providers price cached input tokens at ~10% of normal (Anthropic cache reads, OpenAI/Gemini cached input discounts). The catch: the cache only helps if the next turn lands on the same replica, which pushes KV-awareness up into the router.",
+          "KV now moves between machines. Disaggregated serving (DistServe, Splitwise, Mooncake from Moonshot AI, NVIDIA Dynamo, llm-d) computes prefill on one GPU pool and ships the KV cache over NVLink or RDMA (via NIXL or Mooncake's transfer engine) to a decode pool. A 32K-token Llama 70B context is ~10 GB, which at ~50 GB/s of effective 400 Gb/s RDMA takes ~200 ms, so layer-wise pipelined transfer and KV compression matter. Multi-tier KV stores spanning HBM, DRAM, local NVMe and shared storage (Mooncake Store, LMCache, WEKA/VAST integrations) are the 2025-2026 frontier."
+        ],
+        "failureModes": [
+          { "name": "Preemption thrash", "description": "Under memory pressure the scheduler evicts and recomputes the same long sequences repeatedly, collapsing throughput. Symptom: high preemption counters and rising latency with flat GPU utilization. Fix: admission control by KV budget, lower max concurrent sequences, FP8 KV, or CPU offload." },
+          { "name": "Prefix cache misses from tiny prompt changes", "description": "A timestamp or request id at the top of the system prompt changes the first block's hash and invalidates every downstream block, so the cache never hits. Fix: put volatile content at the end of the prompt and keep stable prefixes byte-identical." },
+          { "name": "Cross-tenant cache side channel", "description": "Shared prefix caches let an attacker infer whether another tenant's prompt began with given text by measuring TTFT. Fix: salt cache keys per tenant (vLLM supports a cache_salt) or disable sharing across trust boundaries." }
+        ],
+        "realSystems": [
+          { "name": "vLLM PagedAttention", "note": "Introduced block-table KV management (Kwon et al., SOSP 2023); now standard across engines including TensorRT-LLM, SGLang and TGI." },
+          { "name": "SGLang RadixAttention", "note": "Keeps a radix tree of cached prefixes for automatic reuse across requests and branches, a big win for agents and tree-of-thought style workloads." },
+          { "name": "Mooncake (Kimi)", "note": "Moonshot AI's KV-cache-centric disaggregated architecture that pools CPU DRAM and SSD across the cluster as a global KV store; open-sourced and integrated with vLLM and SGLang." }
+        ],
+        "questions": [
+          { "q": "You serve Llama 3.1 70B in BF16 on 8x H100 80 GB with TP=8. Roughly how many concurrent 8K-token conversations fit?", "a": "Total HBM is 640 GB; weights take ~140 GB and activations/overhead perhaps ~50 GB, leaving ~450 GB for KV. Each 8K conversation needs ~8,192 x 320 KB ≈ 2.6 GB, so ~170 sequences. FP8 KV would roughly double that, and FP8 weights free another ~70 GB." },
+          { "q": "How would you design multi-turn chat so follow-up turns get fast TTFT?", "a": "Keep the conversation's KV blocks in a prefix cache, and route follow-ups to the replica that holds them using session affinity or a KV-aware router. Back HBM with a CPU DRAM or SSD tier so blocks survive eviction, and keep the prompt template stable so prefix hashes match. Measure cache hit rate as a first-class SLI." },
+          { "q": "Why did PagedAttention borrow from operating-system virtual memory, and where does the analogy break?", "a": "Both solve fragmentation by mapping contiguous logical addresses onto scattered fixed-size physical pages, with sharing and copy-on-write for forks (parallel sampling, beam search). The analogy breaks because there is no hardware MMU: the attention kernel walks the block table itself, so block size is a kernel-performance knob, and eviction can choose to recompute instead of swapping, which an OS cannot do." }
+        ]
+      },
+      "related": ["llm-inference-basics", "batching", "serving-fleet", "virtual-memory", "caching", "gpu-memory-hierarchy", "datacenter-networking"]
+    },
+    {
+      "id": "batching",
+      "title": "Continuous Batching & Scheduling",
+      "gist": "Instead of waiting for a whole group of requests to finish, modern servers swap finished requests out and new ones in at every single step, keeping the GPU constantly busy.",
+      "overview": [
+        "A GPU is most efficient when it works on many requests at once, because it reads the model's weights once and uses them for everyone. Grouping requests like this is called **batching**. The old way was **static batching**: collect a group, run them all to completion, then take the next group.",
+        "The problem is that answers have wildly different lengths. Picture a bus that won't let anyone off until the passenger going furthest reaches their stop: people who wanted to get off after two blocks ride the whole route, and the queue at the depot grows. **Continuous batching** (also called in-flight or iteration-level batching) lets passengers hop on and off at every stop. After each token, finished requests leave and waiting ones join.",
+        "The scheduler running this bus has to juggle competing goals: start new requests quickly so their first word appears soon, keep existing streams flowing smoothly, and never run out of KV cache memory mid-answer. Modern engines also split long prompts into chunks so one giant prompt cannot freeze everyone else."
+      ],
+      "diagram": {
+        "caption": "One scheduler iteration under continuous batching.",
+        "steps": [
+          { "label": "Waiting queue", "detail": "New requests, priority-ordered" },
+          { "label": "Admission check", "detail": "Enough free KV blocks?" },
+          { "label": "Build token batch", "detail": "Decodes plus prefill chunk" },
+          { "label": "Forward pass", "detail": "One step, all sequences" },
+          { "label": "Retire & stream", "detail": "Finished leave, tokens sent" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Request queue", "role": "Holds waiting requests ordered by FCFS, priority class or SLO deadline." },
+          { "name": "Iteration-level scheduler", "role": "Every forward pass, chooses which running sequences decode and which waiting ones get (part of) their prefill, within a token budget." },
+          { "name": "Token budget / max_num_batched_tokens", "role": "Caps tokens processed per step (often ~2K-8K) so step latency stays bounded; decodes cost 1 token each, prefill chunks fill the rest." },
+          { "name": "KV memory manager", "role": "Tells the scheduler how many blocks are free so it admits only what can complete, and triggers preemption if memory runs out." },
+          { "name": "Ragged batch kernels", "role": "Attention and GEMM kernels (FlashAttention, FlashInfer) that handle sequences of different lengths in one launch without padding." }
+        ],
+        "flow": [
+          "Each iteration begins by reserving one token of budget for every running decode sequence.",
+          "Remaining budget is filled with prefill work from the waiting queue, splitting a long prompt into chunks if needed (chunked prefill).",
+          "The scheduler checks KV block availability before admitting any new sequence; if memory is short, it waits or preempts the lowest-priority sequence.",
+          "All selected tokens are flattened into one ragged batch and run through a single forward pass, often replayed from a captured CUDA graph.",
+          "Sampled tokens are appended to each sequence and streamed to clients.",
+          "Sequences that hit EOS or max_tokens are retired and their KV blocks freed, opening slots for the next iteration.",
+          "The loop repeats every ~10-50 ms, so membership of the batch changes continuously."
+        ],
+        "tradeoffs": [
+          { "choice": "Large token budget per step", "pro": "Higher throughput and faster prefill completion.", "con": "Longer step time raises inter-token latency for every decoding user." },
+          { "choice": "Prefill-priority scheduling", "pro": "Lower TTFT; new users see output quickly.", "con": "Running streams stutter while prefills run, hurting TPOT." },
+          { "choice": "Decode-priority / chunked prefill", "pro": "Smooth, predictable token streaming.", "con": "Long prompts take longer to start; TTFT rises under load." },
+          { "choice": "Co-located vs disaggregated prefill/decode", "pro": "Co-location is simple and uses all GPUs for both phases.", "con": "The phases interfere; disaggregation removes interference but adds KV transfer cost and pool-sizing complexity." }
+        ],
+        "numbers": [
+          { "metric": "Throughput gain of iteration-level scheduling (Orca, OSDI 2022)", "value": "~37x vs FasterTransformer at same latency" },
+          { "metric": "Typical vLLM max_num_seqs default", "value": "~256 sequences (V1: 1024 on large GPUs)" },
+          { "metric": "Sarathi-Serve chunked prefill capacity gain (OSDI 2024)", "value": "~2.6x for Mistral-7B on A100" },
+          { "metric": "CUDA graph launch savings per decode step", "value": "~ms of CPU overhead removed" },
+          { "metric": "DistServe goodput gain from disaggregation (OSDI 2024)", "value": "up to ~7x more requests within SLO" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The right objective is goodput, not throughput: requests per second that meet both a TTFT and a TPOT SLO. Prefill and decode have different latency sensitivities, so mixing them in one step creates interference: a 4K-token prefill chunk on an H100 adds roughly tens of milliseconds to that step, which every co-scheduled decode experiences as inter-token jitter. Chunked prefill bounds the damage; disaggregation eliminates it at the cost of a second pool, a KV transfer and a harder capacity-planning problem (the prefill:decode GPU ratio depends on input/output length mix and drifts with traffic).",
+          "CPU overhead is a real bottleneck at small per-step work. Python scheduling, sampling, detokenization and kernel launches can take several milliseconds, comparable to a whole decode step for an 8B model on an H100. vLLM V1 moved to a multiprocess architecture with the engine core in a busy loop, overlapping CPU scheduling of step N+1 with GPU execution of step N; SGLang does similar zero-overhead overlap scheduling. CUDA graphs are captured for a set of padded batch sizes, so batch sizes between capture points pay a padding cost.",
+          "Scheduling interacts with memory policy. Admitting a request is a promise to hold its growing KV cache until it finishes, but output length is unknown. Engines either reserve optimistically and preempt on overflow (vLLM) or estimate output lengths. Fairness also matters in multi-tenant APIs: plain FCFS lets one tenant's burst starve others, so production systems add per-tenant token-rate limits, priority classes, and virtual-time fair queuing on tokens (e.g. VTC, OSDI 2024) rather than requests."
+        ],
+        "failureModes": [
+          { "name": "Head-of-line blocking from long prompts", "description": "Without chunked prefill, one huge prompt occupies a full step and every decode stalls; p99 ITL spikes into seconds. Fix: enable chunked prefill with a bounded token budget, or route long-context requests to a separate pool." },
+          { "name": "Output-length explosion", "description": "A misbehaving client sets max_tokens to 32K and the model loops, holding KV blocks for minutes and forcing preemption of others. Fix: per-tenant max_tokens caps, repetition detection, and KV-aware admission control." },
+          { "name": "CPU-bound engine", "description": "GPU utilization sits at 40% while the Python scheduler and detokenizer saturate a core, especially for small models at high request rates. Fix: async/overlapped scheduling, CUDA graphs, more API-server processes, faster tokenizers." }
+        ],
+        "realSystems": [
+          { "name": "Orca", "note": "The OSDI 2022 paper that introduced iteration-level scheduling and selective batching; the idea now underpins every major engine." },
+          { "name": "TensorRT-LLM in-flight batching", "note": "NVIDIA's production implementation with paged KV, chunked context and priority scheduling, used under Triton and NVIDIA NIM." },
+          { "name": "NVIDIA Dynamo", "note": "Open-source (GTC 2025) distributed serving layer that runs disaggregated prefill/decode on top of vLLM, SGLang or TensorRT-LLM with a planner that resizes the pools." }
+        ],
+        "questions": [
+          { "q": "Your chat product has good median TPOT but terrible p99 TPOT. What do you investigate?", "a": "p99 ITL spikes usually come from prefill interference, preemption, or garbage-collection-like CPU stalls. Check whether spikes correlate with long-prompt arrivals (enable or shrink chunked prefill), with KV exhaustion (preemption counters, lower concurrency, FP8 KV), or with scheduler CPU time. If interference persists, disaggregate prefill." },
+          { "q": "When would you choose disaggregated prefill/decode over chunked prefill?", "a": "When TTFT and TPOT SLOs are both tight and prompts are long, interference can't be tuned away, and you have enough scale to size two pools and a fast interconnect for KV transfer. For small deployments or short prompts, chunked prefill on co-located GPUs is simpler and nearly as good." },
+          { "q": "Design fair scheduling for a multi-tenant LLM API.", "a": "Track service in tokens (weighting input and output differently since they cost differently), and pick the next request from the tenant with the least virtual service, as in VTC. Combine with per-tenant rate limits and priority tiers, and make admission KV-aware so a fair choice never causes preemption storms." }
+        ]
+      },
+      "related": ["llm-inference-basics", "kv-cache", "serving-fleet", "cpu-scheduling", "load-balancing", "message-queues"]
+    },
+    {
+      "id": "quantization",
+      "title": "Quantization",
+      "gist": "Storing a model's numbers with fewer bits, like 8 or 4 instead of 16, makes it smaller and faster with surprisingly little loss in quality.",
+      "overview": [
+        "A model is billions of numbers, usually stored with 16 bits each. **Quantization** stores them with fewer bits, say 8 or 4. It is like saving a photo as a compressed JPEG instead of a raw file: much smaller, and for most purposes you can't tell the difference.",
+        "Fewer bits pays off twice. The model takes less memory, so it fits on fewer or cheaper GPUs and leaves more room for the KV cache. And because generating each token mostly means reading weights from memory, reading half as many bytes makes generation nearly twice as fast. Newer chips also have math units that compute directly in 8-bit or 4-bit formats at double or quadruple speed.",
+        "The art is choosing *what* to squeeze and *how*. A few unusually large numbers (outliers) carry important information, so naive rounding can damage quality. Good methods group numbers into small blocks that share a scale factor, protect sensitive channels, or train the model to expect low precision. Done well, 8-bit is essentially lossless and 4-bit costs only a little accuracy."
+      ],
+      "diagram": {
+        "caption": "From a full-precision weight to a block-scaled 4-bit weight.",
+        "steps": [
+          { "label": "BF16 weights", "detail": "16 bits each, full range" },
+          { "label": "Group into blocks", "detail": "e.g. 16 or 32 values" },
+          { "label": "Compute block scale", "detail": "Max magnitude sets the scale" },
+          { "label": "Round to 4 bits", "detail": "FP4 E2M1 or INT4 codes" },
+          { "label": "Dequant in kernel", "detail": "Scale applied inside matmul" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Number format", "role": "INT8/INT4 integers, or floating formats FP8 (E4M3/E5M2), MXFP4 (OCP microscaling) and NVFP4; each trades range against precision." },
+          { "name": "Scaling granularity", "role": "Per-tensor, per-channel, per-group (e.g. 128 weights) or per-block (16-32 values) scale factors; finer scales track outliers better at a small storage cost." },
+          { "name": "Calibration / algorithm", "role": "Post-training methods like GPTQ (error-compensating rounding), AWQ (activation-aware scaling of salient channels) and SmoothQuant (migrating activation outliers into weights)." },
+          { "name": "Quantization-aware training (QAT)", "role": "Simulates low precision during training or fine-tuning so the model learns to tolerate it; used for gpt-oss MXFP4 and Gemma 3 QAT checkpoints." },
+          { "name": "Low-precision kernels", "role": "GEMM kernels (CUTLASS, Marlin, Machete, TensorRT-LLM) that either dequantize on the fly (weight-only) or run native FP8/FP4 tensor-core math (weight-and-activation)." }
+        ],
+        "flow": [
+          "Choose a scheme: weight-only (e.g. W4A16, good for memory-bound decode) or weight-and-activation (e.g. W8A8 FP8 or W4A4 NVFP4, which also speeds compute-bound prefill).",
+          "Run a calibration set (a few hundred representative prompts) through the model to collect activation statistics.",
+          "Compute scales per block or channel, and apply the algorithm (GPTQ, AWQ, SmoothQuant) to choose quantized values that minimize output error.",
+          "Pack the low-bit values and scales into the engine's layout and save the checkpoint (safetensors with compressed-tensors, ModelOpt, or GGUF).",
+          "At inference, kernels load packed weights, apply scales in registers, and accumulate in FP32 or FP16 to preserve accuracy.",
+          "Evaluate on task benchmarks and long-context tests, not just perplexity, before shipping."
+        ],
+        "tradeoffs": [
+          { "choice": "Weight-only 4-bit (W4A16)", "pro": "~4x smaller weights and big decode speedups at small batch; works on any GPU.", "con": "Dequantization overhead makes it slower than FP16 for compute-bound large-batch prefill." },
+          { "choice": "FP8 weights and activations", "pro": "Near-lossless on Hopper/Blackwell, ~2x tensor-core throughput and half the memory.", "con": "Needs FP8 hardware (H100/H200/B200, MI300) and careful scaling of activation outliers." },
+          { "choice": "NVFP4 / MXFP4", "pro": "~4x memory saving with native FP4 tensor cores on Blackwell (~2x FP8 throughput).", "con": "More sensitive to quality loss; often needs QAT or careful calibration, and Hopper lacks native FP4." },
+          { "choice": "Quantizing the KV cache", "pro": "Halves (FP8) or quarters (INT4) per-token memory, enabling longer context and more users.", "con": "Errors accumulate over long contexts; retrieval-style tasks degrade first." }
+        ],
+        "numbers": [
+          { "metric": "B200 dense tensor throughput, FP8 vs FP4", "value": "~4.5 vs ~9 PFLOPS" },
+          { "metric": "H100 SXM dense FP8 throughput", "value": "~1,979 TFLOPS" },
+          { "metric": "NVFP4 block size and scale", "value": "16 values per FP8 (E4M3) scale" },
+          { "metric": "MXFP4 block size and scale", "value": "32 values per 8-bit (E8M0) scale" },
+          { "metric": "gpt-oss-120b in MXFP4", "value": "~63 GB, fits one 80 GB GPU" },
+          { "metric": "llama.cpp Q4_K_M effective size", "value": "~4.8 bits per weight" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Outliers are the core difficulty. LLM activations develop a handful of channels with magnitudes 100x the rest (documented in LLM.int8(), 2022), so a single per-tensor INT8 scale wastes most of the code space on the outliers. Remedies differ: LLM.int8() keeps outlier channels in FP16, SmoothQuant scales activations down and weights up per channel, rotation methods (QuaRot, SpinQuant) multiply by Hadamard matrices to spread outliers evenly, and microscaling formats shrink the block so each outlier only distorts 16-32 neighbors. NVFP4's two-level scheme (FP8 E4M3 per 16 values plus an FP32 per-tensor scale) gives finer scale resolution than MXFP4's power-of-two E8M0 scale per 32, which is why it usually loses less accuracy.",
+          "Whether quantization speeds things up depends on the roofline regime. In decode at small batch the GEMMs are memory-bound, so W4A16 can be ~3x faster than BF16 even though the math still happens in 16-bit after dequantization. At large batch or in prefill the GEMMs are compute-bound, so only formats the tensor cores execute natively (FP8 on Hopper, FP8/FP6/FP4 on Blackwell) speed things up, and weight-only dequant can be a net slowdown. Mixed schemes like W4A8 (Machete, QServe) try to get both.",
+          "Training in low precision is now mainstream, which blurs the line between quantization and the native format. DeepSeek-V3 was trained in FP8 with fine-grained 1x128 activation and 128x128 weight scaling, and OpenAI released gpt-oss with MoE weights post-trained in MXFP4. When a model is trained or QAT-ed at a precision, serving at that precision is effectively lossless, while post-training quantization of models trained in BF16 to 4 bits typically costs ~1-3 points on reasoning and coding benchmarks, more on small models and long chains of thought."
+        ],
+        "failureModes": [
+          { "name": "Benchmark-invisible degradation", "description": "Perplexity and MMLU barely move, but long-context retrieval, math reasoning or non-English quality drops noticeably. Fix: evaluate on task-specific and long-context suites, and A/B with real traffic before rollout." },
+          { "name": "Calibration set mismatch", "description": "Calibrating on generic web text then serving code or another language mis-estimates activation ranges, causing clipping. Fix: calibrate with data resembling production prompts and include chat templates." },
+          { "name": "Slower than expected", "description": "A W4A16 model is slower than FP16 at high batch because dequantization adds work to compute-bound GEMMs, or the engine lacks an optimized kernel for that layout. Fix: use native FP8/FP4 on supported hardware, or a W4A8 kernel, and benchmark at the real batch size." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA TensorRT Model Optimizer", "note": "Produces FP8, NVFP4 and INT4-AWQ checkpoints for TensorRT-LLM, vLLM and SGLang; NVIDIA publishes NVFP4 versions of DeepSeek-R1 and Llama models built with it." },
+          { "name": "llama.cpp / GGUF", "note": "Popular local-inference format with k-quant schemes (Q4_K_M, Q5_K_M, IQ formats) running on CPUs, Apple Silicon Metal and consumer GPUs." },
+          { "name": "DeepSeek-V3 FP8 training", "note": "Demonstrated stable FP8 training at 671B parameters with fine-grained block scaling and FP32 accumulation promotion, cutting training and serving cost." }
+        ],
+        "questions": [
+          { "q": "You must serve a 70B model at the lowest cost per token on H100s. Which quantization do you choose?", "a": "FP8 W8A8 is the default: near-lossless, native on Hopper tensor cores, halves memory and speeds both prefill and decode. Add FP8 KV cache for more concurrency. Consider INT4 weight-only only if memory capacity forces it, and validate quality on your tasks since H100 lacks native FP4." },
+          { "q": "Why do block-scaled formats like MXFP4 and NVFP4 work better than per-tensor INT4?", "a": "A single scale must cover the largest outlier in the whole tensor, so most values get crushed into a few codes. With a scale per 16-32 values, each block uses the full code range locally and an outlier only hurts its own block. The scale overhead is small: about 0.25-0.5 bits per value." },
+          { "q": "How would you decide whether to quantize the KV cache?", "a": "Estimate whether KV memory is the binding constraint: if concurrency or context length is limited by free HBM, FP8 KV roughly doubles capacity. Then test long-context retrieval (needle-in-haystack, RULER) and multi-turn tasks, which are most sensitive. If quality holds, ship FP8 KV; INT4 KV is riskier and usually reserved for extreme context lengths." }
+        ]
+      },
+      "related": ["llm-inference-basics", "tensor-cores", "mixed-precision", "kv-cache", "kernel-optimization", "accelerator-landscape"]
+    },
+    {
+      "id": "speculative-decoding",
+      "title": "Speculative Decoding",
+      "gist": "A small, fast helper guesses the next few words and the big model checks them all at once, producing several words per step without changing the answer.",
+      "overview": [
+        "Generating text one token at a time leaves a big GPU mostly idle, because each step does little math but must read the whole model from memory. **Speculative decoding** exploits that spare capacity. A cheap **draft** guesses several upcoming tokens, and the big **target** model checks all of the guesses in a single step.",
+        "Think of a senior editor and a fast junior writer. The junior drafts the next five words; the editor reads all five at once and keeps every word up to the first one they would have written differently, then supplies the correct word there. If the junior is usually right, the editor approves several words per glance instead of one.",
+        "The clever part is that, with the right acceptance rule, the output is mathematically identical in distribution to what the big model would have produced alone. You get typically 2-3x faster generation for free in quality; the only costs are extra compute and engineering complexity."
+      ],
+      "diagram": {
+        "caption": "One draft-and-verify round.",
+        "steps": [
+          { "label": "Draft k tokens", "detail": "Small model or extra heads" },
+          { "label": "Verify in parallel", "detail": "Target scores all k at once" },
+          { "label": "Accept prefix", "detail": "Keep tokens until first rejection" },
+          { "label": "Correct one token", "detail": "Resample from adjusted distribution" },
+          { "label": "Roll back KV", "detail": "Discard rejected positions, repeat" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Drafter", "role": "Proposes k candidate tokens: a separate small model (Llama 3.2 1B for Llama 3.1 70B), extra prediction heads (Medusa), a lightweight feature-level head (EAGLE-3), MTP modules (DeepSeek-V3), or n-gram lookup from the prompt." },
+          { "name": "Target model", "role": "The production model; scores the context plus all k drafted tokens in one forward pass, producing k+1 next-token distributions." },
+          { "name": "Acceptance rule", "role": "Rejection sampling: accept draft token x with probability min(1, p_target(x)/p_draft(x)); on rejection sample from the normalized residual max(0, p_target - p_draft). Greedy decoding simply checks exact match." },
+          { "name": "KV cache rollback", "role": "Drops cache entries for rejected positions in both target and draft so the next round starts from the accepted prefix." },
+          { "name": "Tree attention (optional)", "role": "Verifies a tree of alternative drafts in one pass using a tree-shaped attention mask, raising expected accepted length." }
+        ],
+        "flow": [
+          "Given the accepted context, the drafter autoregressively proposes k tokens (k is often 3-7), which is cheap because the drafter is tiny.",
+          "The target runs one forward pass over the k draft tokens, which costs about the same as a single decode step because decode is memory-bound.",
+          "Starting from the first draft token, each is accepted or rejected using the target and draft probabilities.",
+          "At the first rejection, a corrected token is sampled from the residual distribution and the remaining drafts are discarded.",
+          "If all k are accepted, the target's (k+1)th distribution yields one bonus token, so each round emits between 1 and k+1 tokens.",
+          "KV entries for rejected positions are discarded, and the loop repeats from the new context."
+        ],
+        "tradeoffs": [
+          { "choice": "Longer drafts (bigger k)", "pro": "More tokens per round when acceptance is high.", "con": "Wasted draft and verify compute when early tokens are rejected; expected gain saturates quickly." },
+          { "choice": "Separate draft model", "pro": "No change to the target; any compatible small model with the same tokenizer works.", "con": "Extra memory and a second KV cache; acceptance often lower than trained heads." },
+          { "choice": "Trained heads (EAGLE-3, Medusa, MTP)", "pro": "Higher acceptance (~3-4 tokens per round for EAGLE-3) and tiny overhead.", "con": "Must be trained per target model and retrained after every target fine-tune." },
+          { "choice": "Speculation at high batch", "pro": "Still lowers latency per user.", "con": "At large batch the GPU is no longer idle; verification FLOPs compete with real work and throughput can drop." }
+        ],
+        "numbers": [
+          { "metric": "Typical end-to-end speedup", "value": "~2-3x at small batch" },
+          { "metric": "EAGLE-3 reported speedup (2025)", "value": "up to ~5-6x on chat benchmarks" },
+          { "metric": "DeepSeek-V3 MTP second-token acceptance", "value": "~85-90%, ~1.8x tokens/s" },
+          { "metric": "Expected tokens per round, acceptance a=0.8, k=4", "value": "~3.4" },
+          { "metric": "Draft model size vs target", "value": "~1-5% of target parameters" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "If each draft token is accepted independently with probability a, the expected number of tokens per round is (1 - a^(k+1)) / (1 - a). With a = 0.8 and k = 4 that is ~3.4; going to k = 8 only reaches ~4.3 while costing more draft time and verification compute. Real speedup is that number divided by (1 + draft cost relative to a target step), and acceptance is highly workload-dependent: code completion, summarization and editing tasks that copy from the prompt accept far more than creative writing at high temperature. Adaptive schemes vary k per request or per step based on draft confidence.",
+          "Speculation trades spare compute for latency, so it is most valuable when decode is badly memory-bound: small batches, latency-critical products, large dense models. At high batch the 'free' FLOPs disappear, and naive speculation can reduce throughput, which is why engines disable or shrink it under load (vLLM and TensorRT-LLM support dynamic speculation). Tree verification and batch speculation complicate kernels: attention needs custom masks, CUDA graphs need fixed shapes, and paged KV must support rollback cheaply.",
+          "The lossless guarantee holds for the sampling distribution, but systems details can quietly break it: a drafter with a different tokenizer or chat template, numerical nondeterminism between batched verify and single-step decode, or approximate acceptance rules (some 'typical acceptance' variants trade exactness for speed). Variants that need no drafter include prompt-lookup/n-gram drafting (great for RAG and code edits), lookahead decoding (Jacobi iteration), and self-speculation via layer skipping. Multi-token prediction heads trained jointly with the base model, as in DeepSeek-V3 and later open models, have made speculation a default rather than an add-on."
+        ],
+        "failureModes": [
+          { "name": "Draft-target drift", "description": "The target is fine-tuned (new persona, new domain) but the drafter or EAGLE head is not, so acceptance falls from ~0.8 to ~0.4 and speculation becomes a slowdown. Fix: monitor acceptance rate per model version and retrain or distill the drafter with each target release." },
+          { "name": "Throughput regression under load", "description": "Speculation helps at 3 a.m. but hurts at peak, when batch sizes are large and verification compute competes with real tokens. Fix: dynamic speculation that reduces k or disables drafting above a batch-size threshold." },
+          { "name": "Subtle distribution changes", "description": "An approximate acceptance rule, or mismatched sampling parameters between drafter and target, shifts outputs, breaking reproducibility and eval parity. Fix: use exact rejection sampling and test output-distribution equivalence on held-out prompts." }
+        ],
+        "realSystems": [
+          { "name": "EAGLE-3 in vLLM and SGLang", "note": "Feature-level draft heads that reuse the target's hidden states; widely deployed for Llama and Qwen families with 2-4x latency gains." },
+          { "name": "DeepSeek-V3 Multi-Token Prediction", "note": "MTP modules trained with the base model predict an extra token per step and are reused at inference as a built-in drafter." },
+          { "name": "Google Search AI Overviews", "note": "Google, whose researchers co-invented speculative decoding (Leviathan et al., 2023), has said it uses the technique in production products including AI Overviews to cut latency." }
+        ],
+        "questions": [
+          { "q": "Why is speculative decoding lossless, and when is it not?", "a": "Accepting each draft token with probability min(1, p/q) and resampling rejections from the normalized residual makes every emitted token distributed exactly as the target's p, which is a standard rejection-sampling argument. It stops being lossless if the acceptance rule is approximated, if drafter and target see different tokenization or templates, or if numerics differ between batched verification and normal decode." },
+          { "q": "Your coding assistant serves a 70B model at batch ~8. Design a speculation strategy.", "a": "At batch 8 decode is strongly memory-bound, so speculation pays. Combine prompt-lookup drafting (code edits copy heavily from context) with an EAGLE-3 head trained on code traffic, use tree verification with ~4-6 tokens, and track acceptance per language. Add dynamic fallback to plain decode if batch size grows during peaks." },
+          { "q": "Acceptance rate is 0.6 with k=5. Is it worth it?", "a": "Expected tokens per round is (1 - 0.6^6)/(0.4) ≈ 2.4. If drafting costs ~20% of a target step, net speedup is ~2.4/1.2 ≈ 2x, so yes, but a shorter k (3) would give ~2.2 tokens for less waste. The real answer is to measure and tune k per workload." }
+        ]
+      },
+      "related": ["llm-inference-basics", "batching", "kv-cache", "kernel-optimization", "training-loop"]
+    },
+    {
+      "id": "serving-fleet",
+      "title": "The Serving Fleet: Routing & Autoscaling",
+      "gist": "Running AI for millions means thousands of GPUs acting as one service: smart routers send each request to the best machine and the fleet grows and shrinks with demand.",
+      "overview": [
+        "A single GPU server can only handle so many conversations. A popular AI product runs on thousands of GPUs across many datacenters, and the hard problem becomes coordination: which machine should handle each request, and how many machines do you need right now?",
+        "LLM routing is different from ordinary web load balancing. Requests vary enormously in cost (a one-line question versus a 100-page document), and servers remember recent conversations in their KV cache. Sending a follow-up message to the machine that already holds that conversation's notes is like returning to the same doctor who has your file: much faster than starting over with a stranger.",
+        "Scaling is also harder than for web servers. GPUs are expensive and scarce, so idle ones burn money, yet a new replica must load tens to hundreds of gigabytes of weights before serving, taking minutes rather than seconds. Fleets therefore combine predictive scaling, warm spare capacity, priority tiers that let batch work soak up idle GPUs, and fast weight loading."
+      ],
+      "diagram": {
+        "caption": "Path of a request through an LLM serving fleet.",
+        "steps": [
+          { "label": "API gateway", "detail": "Auth, rate limits, tenant quotas" },
+          { "label": "Model router", "detail": "Pick model, region, priority" },
+          { "label": "KV-aware scheduler", "detail": "Prefix hits and load scored" },
+          { "label": "Replica pool", "detail": "Prefill and decode workers" },
+          { "label": "Autoscaler", "detail": "Resizes pools on queue signals" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Gateway", "role": "Terminates client connections (often streaming over SSE or WebSockets), authenticates, enforces per-tenant token rate limits and quotas, and handles retries." },
+          { "name": "Inference-aware router", "role": "Scores replicas by prefix-cache overlap, queue depth, KV memory utilization and LoRA adapters loaded, instead of round-robin; e.g. the Kubernetes Gateway API Inference Extension, llm-d scheduler or Dynamo router." },
+          { "name": "Replica / model server", "role": "One engine instance (vLLM, SGLang, TensorRT-LLM) spanning 1 to dozens of GPUs with tensor, pipeline or expert parallelism." },
+          { "name": "Autoscaler / planner", "role": "Adds or removes replicas and rebalances prefill vs decode pools based on queue length, KV usage, TTFT/TPOT SLO attainment and forecasts." },
+          { "name": "Weight distribution", "role": "Gets model weights onto new nodes quickly via local NVMe caches, peer-to-peer streaming, or parallel object-store readers (Run:ai Model Streamer, safetensors mmap)." },
+          { "name": "Observability", "role": "Tracks TTFT, TPOT, tokens/s per GPU, cache hit rate, goodput and cost per million tokens per model and tenant." }
+        ],
+        "flow": [
+          "The gateway authenticates the request, checks the tenant's tokens-per-minute budget, and assigns a priority class (interactive, batch, free tier).",
+          "The model router picks the deployment: model version, region with capacity, and possibly a smaller model for easy queries.",
+          "The KV-aware scheduler hashes the prompt prefix and scores replicas, preferring those holding matching cached blocks unless they are overloaded.",
+          "The chosen replica (or prefill worker, in a disaggregated setup) runs prefill and streams tokens back through the gateway.",
+          "Metrics flow to the autoscaler, which compares SLO attainment and queue depth against targets every few seconds.",
+          "When load rises, the autoscaler first preempts low-priority batch work, then provisions new replicas that stream weights from cache and warm up CUDA graphs.",
+          "When load falls, replicas drain in-flight streams before shutting down, and freed GPUs return to batch or training jobs."
+        ],
+        "tradeoffs": [
+          { "choice": "Prefix-affinity routing", "pro": "High KV cache hit rates, much lower TTFT and prefill cost for multi-turn and agent traffic.", "con": "Hot spots: popular prefixes overload a few replicas unless load is also scored." },
+          { "choice": "Over-provisioned warm capacity", "pro": "Absorbs spikes without minutes-long cold starts.", "con": "Idle GPUs at ~$2-10 per GPU-hour add up quickly." },
+          { "choice": "Many small replicas vs few large ones", "pro": "Small replicas (TP=1-2) scale finely and fail independently.", "con": "Large replicas (TP=8, wide EP) have lower latency and better MoE efficiency; huge models need them anyway." },
+          { "choice": "Multi-region active-active", "pro": "Resilience and access to more GPU capacity.", "con": "Cache locality is lost across regions, and data-residency rules constrain routing." }
+        ],
+        "numbers": [
+          { "metric": "Cold start: loading 140 GB from object storage at ~2 GB/s", "value": "~70 s, plus warmup" },
+          { "metric": "GB200 NVL72 NVLink domain", "value": "72 GPUs, ~130 TB/s aggregate" },
+          { "metric": "Cached input token price (Anthropic cache reads)", "value": "~10% of base input price" },
+          { "metric": "Prefix-aware vs round-robin routing (llm-d / Gateway API reports)", "value": "~2-3x lower p90 TTFT on shared-prefix loads" },
+          { "metric": "Typical H100 cloud on-demand price, 2026", "value": "~$2-4 per GPU-hour" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Load signals for LLMs must be in tokens and memory, not requests. Two replicas with equal request counts can differ 100x in work. Good schedulers combine a prefix-match score (fraction of prompt blocks already cached), KV utilization, pending prefill tokens, and running decode count into a cost estimate, and pick the minimum; consistent hashing on a session or prefix hash with bounded-load spillover is a simpler baseline. Because KV caches change constantly, routers either receive cache events from engines (Dynamo's KV event stream, llm-d's indexer) or approximate locality from their own routing history.",
+          "Autoscaling GPU fleets is a control problem with long actuation delay. Cold start includes node provisioning (minutes if a VM must be acquired), image pull (tens of GB of CUDA libraries), weight load, and CUDA graph capture plus torch.compile warmup. Mitigations: keep nodes warm and swap models onto them, snapshot GPU state (CUDA checkpoint/restore), stream weights directly into GPU memory with many parallel range reads, and prefetch from local NVMe. Scaling on SLO attainment (fraction of requests meeting TTFT/TPOT) with forecasts from diurnal patterns works better than CPU-style utilization targets, since GPU 'utilization' metrics are misleading for memory-bound decode.",
+          "At frontier scale the fleet is heterogeneous and multi-tenant: several model sizes and versions, LoRA adapters hot-swapped per tenant (S-LoRA, Punica-style batched adapter kernels), interactive and batch tiers with preemption, and multiple GPU generations (H100, H200, B200, GB200/GB300 racks, plus TPUs or Trainium for some providers). Capacity planning then becomes a bin-packing and pricing problem: batch APIs at ~50% discount exist precisely to soak up troughs, and rack-scale systems like NVL72 change replica shapes because a 72-GPU NVLink domain can host a whole wide-EP MoE instance."
+        ],
+        "failureModes": [
+          { "name": "Retry storms", "description": "A replica slows, clients time out and retry, the retries add load, and latency collapses fleet-wide. LLM requests are expensive, so duplicates are costly. Fix: retry budgets, idempotency keys, admission control that rejects early with 429 instead of queuing, and backpressure from engines to the router." },
+          { "name": "Cache-affinity hot spots", "description": "A viral system prompt or a single enterprise tenant pins traffic to a few replicas whose queues explode while others idle. Fix: bounded-load hashing, replicate hot prefixes across several replicas, and include queue depth in routing scores." },
+          { "name": "Slow-scaling outage", "description": "A launch spike arrives faster than replicas can cold start, so queues grow for ten minutes. Fix: pre-scale before known events, keep a warm buffer, preempt batch tiers, degrade gracefully (shorter max_tokens, smaller model for free users)." }
+        ],
+        "realSystems": [
+          { "name": "llm-d", "note": "Kubernetes-native distributed inference project (Red Hat, Google, IBM, NVIDIA and others, 2025) using vLLM, the Gateway API Inference Extension for prefix-aware routing, and disaggregated prefill/decode." },
+          { "name": "NVIDIA Dynamo", "note": "Datacenter-scale inference framework with a KV-aware router, a GPU planner that rebalances prefill and decode pools, and NIXL for fast KV transfer." },
+          { "name": "AIBrix and Ray Serve LLM", "note": "Open-source control planes (ByteDance's AIBrix; Anyscale's Ray Serve) providing LoRA management, LLM-specific autoscaling and prefix-aware routing on top of vLLM." }
+        ],
+        "questions": [
+          { "q": "Design the routing layer for a chat product with long system prompts and multi-turn conversations.", "a": "Hash the prompt in block-sized chunks and route to the replica with the longest cached prefix match, subject to a load bound so hot prefixes spill to other replicas. Add session affinity for follow-up turns, a KV offload tier so evicted conversations reload quickly, and fall back to least-pending-tokens routing on misses. Measure cache hit rate and TTFT by route decision." },
+          { "q": "How would you autoscale a fleet where a replica takes 5 minutes to become ready?", "a": "Use predictive scaling from daily and weekly traffic patterns and scale on leading indicators like queue depth and SLO attainment rather than lagging utilization. Keep a warm buffer sized to cover 5 minutes of the fastest plausible growth, and run preemptible batch work on it. Shrink cold start with node-local weight caches, streaming loaders and snapshotted warmup." },
+          { "q": "Why is GPU utilization a poor autoscaling metric for LLM serving?", "a": "nvidia-smi utilization only reports whether a kernel was running, not how much of the chip it used, so memory-bound decode can show ~100% while tensor cores sit mostly idle. It also says nothing about KV memory headroom or latency. Better signals are pending tokens, KV cache usage, and TTFT/TPOT SLO attainment." }
+        ]
+      },
+      "related": ["kv-cache", "batching", "load-balancing", "caching", "containers-vms", "interconnects", "object-storage"]
+    }
+  ]
+}

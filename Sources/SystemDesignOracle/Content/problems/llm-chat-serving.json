@@ -1,0 +1,183 @@
+{
+  "id": "llm-chat-serving",
+  "title": "Serving a Chat LLM to 10 Million Daily Users",
+  "domain": "inference",
+  "prompt": "Design the serving system for a chat LLM used by 10 million daily users. Cover latency targets, batching, KV-cache memory, routing, autoscaling, and cost.",
+
+  "gist": "Stream tokens from GPU pools running continuous batching over a paged KV cache, route conversations to replicas that already hold their prefix, split prefill from decode, and autoscale on token throughput.",
+
+  "overview": [
+    "A chat LLM produces its reply one token at a time. Each token requires reading all the model's weights from GPU memory, so a GPU serving one user at a time wastes almost all of its compute. The core trick of LLM serving is batching: run hundreds of conversations through the model together, so one pass over the weights produces one new token for each of them.",
+    "Each conversation also needs memory for its 'KV cache', the model's notes about every token so far. For a 70B-class model that is about 160 KB per token, so a 4,000-token chat takes about 640 MB. GPU memory, not compute, usually decides how many people one server can handle, so the cache is managed like virtual memory in pages, shared between requests with the same prefix, and moved to cheaper memory when a user goes idle.",
+    "Requests enter through an API gateway that authenticates, rate-limits and moderates, then a router picks a GPU replica, preferring one that already has this conversation's history cached so it does not recompute it. The first part of a request (reading the prompt, called prefill) and the token-by-token generation (decode) have very different needs, so large deployments run them on separate pools.",
+    "Traffic follows the sun, so the fleet scales up and down through the day based on tokens per second and queue depth. Cost is driven by GPU-hours, so the levers are bigger batches, FP8 weights, prefix caching, speculative decoding and routing easy requests to smaller models."
+  ],
+
+  "diagram": {
+    "caption": "Request path from chat client to GPU and back as a token stream.",
+    "steps": [
+      { "label": "Client", "detail": "SSE/WebSocket token stream" },
+      { "label": "API gateway", "detail": "auth, rate limit, moderation, quotas" },
+      { "label": "KV-aware router", "detail": "prefix-cache hit, load, SLO class" },
+      { "label": "Prefill pool", "detail": "compute-bound prompt processing" },
+      { "label": "Decode pool", "detail": "continuous batching, paged KV cache" },
+      { "label": "KV tiers", "detail": "HBM → CPU DRAM → NVMe for idle chats" },
+      { "label": "Autoscaler", "detail": "tokens/s, queue depth, SLO burn" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Multi-turn chat with streamed responses, system prompts, tool calls and attachments; context up to 128k tokens.",
+      "Multiple models (a flagship plus smaller, cheaper ones) and multiple SLO tiers (interactive, free tier, batch).",
+      "Per-user rate limits, quotas, and safety moderation of inputs and outputs.",
+      "Cancellation when a user stops generation or disconnects, freeing GPU work immediately."
+    ],
+    "nonFunctional": [
+      "Latency: time to first token (TTFT) p50 < 500 ms and p99 < 2 s for typical prompts; time per output token (TPOT) p99 < 40 ms (≥25 tokens/s, faster than reading speed).",
+      "Availability 99.9%+ across regions; a GPU node failure loses only in-flight requests, which retry transparently.",
+      "Cost: target well under ~$1 per million output tokens for the flagship tier at high utilization.",
+      "Scale: ~7k requests/s and ~3M output tokens/s at peak, growing 2–3× a year."
+    ],
+    "estimates": [
+      { "metric": "Request rate", "value": "10M users × ~20 messages/day = 2e8/day ÷ 86,400 ≈ 2.3k req/s average, ~7k req/s at a 3× peak" },
+      { "metric": "Token volume", "value": "~2,000 prompt tokens (incl. history) + ~400 output per message → output 2e8 × 400 ÷ 86,400 ≈ 0.9M tok/s avg, ~2.8M tok/s peak" },
+      { "metric": "KV cache per token (70B, GQA, FP8)", "value": "80 layers × 8 KV heads × 128 dim × 2 (K,V) × 1 byte ≈ 160 KB; a 4k-token chat ≈ 640 MB" },
+      { "metric": "Concurrency per 8×H100 node", "value": "640 GB HBM − 70 GB FP8 weights − activations ≈ 500 GB KV → ~3M tokens ≈ 750 chats at 4k context" },
+      { "metric": "Fleet size", "value": "decode ~15k tok/s per node → 2.8M ÷ 15k ≈ 190 nodes; prefill (70% prefix hit) ~80 nodes → ~270 nodes ≈ 2,200 GPUs at peak" },
+      { "metric": "Daily cost", "value": "~2,200 GPUs × ~60% average utilization × 24 h × ~$2.5/h ≈ $80k/day ≈ $1 per million output tokens (8e10 output tokens/day)" }
+    ]
+  },
+
+  "stages": [
+    {
+      "name": "API and request flow",
+      "summary": "A thin, stateless front door that authenticates, rate-limits, moderates and streams, keeping all heavy state in the GPU tier.",
+      "points": [
+        "**Streaming protocol**: Server-Sent Events or WebSockets over HTTP/2 or HTTP/3; the first byte goes out as soon as the first token exists, which is what users perceive as latency.",
+        "**Gateway duties**: auth, per-user and per-org token-bucket rate limits counted in tokens (not requests), quota checks, and request shaping (truncating or summarizing over-long histories).",
+        "**Conversation state**: messages stored in a durable store (e.g. a sharded key-value DB); the client sends a conversation id and the server assembles the prompt, so the system controls prefix layout for caching.",
+        "**Moderation**: a small classifier on input before prefill and on the output stream in chunks, run in parallel so it adds little latency.",
+        "**Cancellation**: a client disconnect or stop button propagates to the engine within one step, freeing its batch slot and KV pages."
+      ],
+      "deepDive": [
+        "Prompt assembly is a performance feature: put stable content first (system prompt, tool definitions, earlier turns) and new content last, with deterministic formatting, so successive turns share the longest possible prefix and hit the KV cache. A single changed timestamp at the top of the system prompt can destroy cache hit rates across the whole fleet."
+      ]
+    },
+    {
+      "name": "Model and hardware plan",
+      "summary": "Pick precision, parallelism and GPU type so one replica fits the model with plenty of KV memory and meets TPOT at a large batch.",
+      "points": [
+        "**Flagship**: a 70B-class dense model (or an MoE with similar active parameters) in FP8 weights on 8×H100/H200 or B200 with tensor parallelism of 8 within the NVLink domain.",
+        "**Why FP8**: halves weight memory and bandwidth versus BF16 with negligible quality loss when calibrated; FP4 (NVFP4) on Blackwell is viable for many models after evaluation.",
+        "**KV cache precision**: FP8 KV halves cache size again, doubling concurrent users per node.",
+        "**Decode is memory-bound**: each step reads 70 GB of weights ÷ 8 GPUs ≈ 8.75 GB per GPU at 3.35 TB/s ≈ 2.6 ms, plus KV reads; batching hundreds of sequences amortizes that read.",
+        "**Smaller models**: an 8B-class model on single GPUs for simple queries, titling and summarization, at ~10× lower cost per token."
+      ],
+      "deepDive": [
+        "MoE changes the math: a model with ~40B active out of ~400B total parameters needs much more memory for weights but similar per-token compute, so it is served with expert parallelism across many GPUs (e.g. wide-EP across 32–72 GPUs in an NVL72 rack) and needs very large batches so each expert sees enough tokens. That is why frontier MoE serving (DeepSeek-V3/R1 style) uses large disaggregated deployments, while dense 70B fits neatly on one 8-GPU node."
+      ]
+    },
+    {
+      "name": "Batching and scheduling",
+      "summary": "Continuous (iteration-level) batching with chunked prefill keeps GPUs full while protecting token latency for everyone already streaming.",
+      "points": [
+        "**Continuous batching**: the scheduler re-forms the batch every decode step; finished sequences leave and waiting ones join, instead of waiting for a whole static batch to finish.",
+        "**Chunked prefill**: split long prompts into chunks (e.g. 512–2,048 tokens) and mix them with decode tokens in each step, under a per-step token budget, so a 100k-token prompt cannot stall everyone's stream.",
+        "**Batch size vs TPOT**: larger batches raise throughput until KV memory or the TPOT SLO limits it; the scheduler caps tokens per step to keep step time under ~30–40 ms.",
+        "**Priorities**: paid and interactive requests ahead of free and batch; preemption by swapping or recomputing KV for the lowest priority when memory runs out.",
+        "**Speculative decoding**: a small draft model or extra heads (EAGLE/MTP) propose 3–5 tokens verified in one pass, giving ~2–3× faster decode at low batch sizes; disable or shrink it when batches are large and compute-bound."
+      ],
+      "deepDive": [
+        "Prefill and decode interfere: prefill is compute-bound (thousands of tokens in one pass), decode is bandwidth-bound (one token per sequence). Running them together causes TPOT spikes for streaming users whenever a big prompt arrives. Chunked prefill smooths this on a single pool; at large scale **disaggregation** (separate prefill and decode GPUs, KV transferred over NVLink or RDMA, as in DistServe, Mooncake and NVIDIA Dynamo) lets each pool be sized and tuned for its phase and typically improves goodput under strict SLOs by 1.5–2×+."
+      ]
+    },
+    {
+      "name": "KV-cache memory",
+      "summary": "Treat KV cache as the scarce resource: page it, share prefixes, quantize it, and tier it across HBM, host memory and SSD.",
+      "points": [
+        "**Paged allocation** (PagedAttention): fixed-size blocks of e.g. 16 tokens with a per-sequence block table; near-zero fragmentation versus ~60–80% waste from reserving max length up front.",
+        "**Prefix sharing**: identical prefixes (system prompt, earlier turns) map to the same physical blocks with reference counts and copy-on-write; a radix tree (SGLang RadixAttention) finds the longest cached match.",
+        "**Tiering**: when a user pauses, evict their KV from HBM to CPU DRAM (~2 TB per node) or NVMe; restoring 640 MB over PCIe Gen5 (~50 GB/s) takes ~13 ms, far cheaper than re-prefilling 4k tokens.",
+        "**Eviction**: LRU by conversation with priority weighting; expected re-use (a chat turn usually comes within minutes) decides what to keep.",
+        "**Long context**: 128k-token chats need ~20 GB of KV each in FP8; cap concurrency per replica for long-context tiers or route them to dedicated pools."
+      ],
+      "deepDive": [
+        "Prefix caching is the biggest single cost lever in chat: by turn 10 a conversation's prompt is mostly history, so with a high hit rate prefill compute drops by 70–90%. That only works if the router sends the next turn to a replica (or KV store) that still holds the history, which is why modern stacks add a cluster-wide KV index (e.g. LMCache, Dynamo's KV-aware router, Mooncake's distributed KV store) so KV blocks can be found and fetched across nodes over RDMA rather than recomputed."
+      ]
+    },
+    {
+      "name": "Routing",
+      "summary": "Route each request to the replica that minimizes expected latency: cache affinity first, then load, within the right model and SLO pool.",
+      "points": [
+        "**Model routing**: a lightweight classifier or rules choose between flagship and smaller models (and reasoning modes) based on request complexity, user tier and load.",
+        "**Cache-aware load balancing**: score replicas by (prefix tokens already cached) minus (queue depth and KV pressure); consistent hashing on conversation id is a simpler approximation.",
+        "**Avoid hot spots**: a popular shared prefix (a big system prompt) should be replicated across many replicas rather than pinned to one.",
+        "**Regional routing**: GeoDNS/anycast to the nearest region with capacity; spill to another region when local queues exceed the SLO, accepting ~50–100 ms more network latency.",
+        "**Health**: route away from replicas with rising step time or errors; retry idempotent requests that failed before the first token."
+      ],
+      "deepDive": [
+        "Pure round-robin is a bad fit for LLMs because request costs differ by 1,000× (a 50-token question vs a 100k-token document) and because cache locality matters. The router needs live state from each engine (queued prefill tokens, active decode batch, free KV blocks, cached prefixes) and should predict TTFT per candidate. Systems like llm-d, Dynamo and SGLang's router implement this; the gain over random routing is often 2× in TTFT at the same fleet size."
+      ]
+    },
+    {
+      "name": "Autoscaling and capacity",
+      "summary": "Scale on token-level signals with headroom for slow GPU startup, and keep a base fleet plus burst and preemptible capacity.",
+      "points": [
+        "**Signals**: queued prefill tokens, decode batch occupancy, KV utilization and SLO burn rate (TTFT/TPOT percentiles), not CPU or request count.",
+        "**Cold start**: loading 70 GB of weights and warming CUDA graphs takes 1–5 minutes; mitigate with weight streaming from local NVMe or peer GPUs, pre-built engines and a warm pool of idle replicas.",
+        "**Diurnal planning**: provision for a predicted curve and scale reactively on top; peak-to-trough is often 2–3×.",
+        "**Mixed capacity**: reserved GPUs for the base load, on-demand for peaks, and spot or idle-training capacity for batch and free-tier traffic.",
+        "**Load shedding**: under overload, degrade gracefully (smaller model for free users, shorter max output, queue with a visible wait) rather than letting all latencies collapse."
+      ],
+      "deepDive": [
+        "Because GPUs take minutes to add, the autoscaler must act on predicted demand and keep headroom sized to the startup time: if traffic can rise 20% in 5 minutes and startup takes 5 minutes, keep ~20% spare. Separate scaling loops for prefill and decode pools matter in disaggregated setups since their demand curves differ (long-document uploads spike prefill; long reasoning outputs spike decode)."
+      ]
+    },
+    {
+      "name": "Cost and efficiency",
+      "summary": "Cost per token is GPU-hours divided by tokens served; raise the denominator with batching, caching and smaller models.",
+      "points": [
+        "**Unit economics**: track $/million input and output tokens per model and tier; at ~$2.5 per H100-hour and ~1,900 output tokens/s per GPU, output costs ~$0.37/M tokens before overhead and idle time.",
+        "**Utilization**: the biggest waste is idle capacity in troughs; fill it with batch jobs, evals or offline inference.",
+        "**Quantization**: FP8 weights and KV (or FP4 on Blackwell) roughly double throughput per GPU.",
+        "**Caching**: prefix hits avoid most prefill; exact-response caching helps only for repeated prompts.",
+        "**Model cascades**: sending ~50% of simple traffic to an 8B model can cut fleet cost by ~40% with negligible quality impact if routed well."
+      ],
+      "deepDive": [
+        "Throughput and latency trade off along a curve per configuration: larger batches lower cost per token but raise TPOT. Benchmark each (model, GPU, parallelism, precision) configuration to find the throughput at which p99 TPOT meets the SLO, and plan capacity at that point, not at maximum throughput. Different SLO tiers can then run at different points on the curve on separate pools."
+      ]
+    }
+  ],
+
+  "tradeoffs": [
+    { "choice": "Disaggregated prefill/decode vs colocated with chunked prefill", "pro": "Disaggregation removes interference, tunes each phase separately and improves goodput under strict SLOs.", "con": "Needs fast KV transfer (RDMA/NVLink), more complex scheduling and two pools to balance; overkill for small deployments." },
+    { "choice": "Larger batches vs lower TPOT", "pro": "Larger batches amortize weight reads and cut cost per token.", "con": "Each step takes longer and KV memory fills, so per-user streaming slows and TTFT queues grow." },
+    { "choice": "Cache-affinity routing vs pure load balancing", "pro": "Affinity avoids recomputing history, cutting prefill compute and TTFT dramatically.", "con": "Creates hot spots and uneven load; needs a scoring function that balances locality against queues." },
+    { "choice": "Small-model routing vs always using the flagship", "pro": "Large cost savings and lower latency for easy queries.", "con": "Misrouted hard queries get worse answers; the router itself needs evaluation and monitoring." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Prefill storms", "description": "A burst of very long prompts (document uploads) starves decode and spikes TPOT for everyone. Chunked prefill, per-step token budgets and a separate long-context pool contain it." },
+      { "name": "KV memory exhaustion", "description": "Many long conversations fill HBM, forcing preemption and recomputation that cascades into a latency collapse. Admission control on KV, tiering to host memory and per-tier context caps prevent it." },
+      { "name": "Cache hit collapse", "description": "A change in prompt templates or router hashing drops prefix hit rates from 80% to near 0, multiplying prefill load overnight. Monitor hit rate as a top-level SLO." },
+      { "name": "Cold-start lag during spikes", "description": "Traffic rises faster than replicas can load weights, so queues explode. Warm pools, predictive scaling and fast weight loading fix it; load shedding covers the gap." }
+    ],
+    "realSystems": [
+      { "name": "vLLM", "note": "Introduced PagedAttention; open-source engine with continuous batching, prefix caching, chunked prefill and speculative decoding." },
+      { "name": "SGLang", "note": "RadixAttention prefix tree for KV reuse, fast scheduler, cache-aware router, used for large MoE serving." },
+      { "name": "NVIDIA Dynamo / TensorRT-LLM", "note": "Disaggregated prefill/decode with KV-aware routing and KV transfer over NIXL; highly optimized kernels." },
+      { "name": "Mooncake (Moonshot AI, Kimi)", "note": "KV-cache-centric disaggregated architecture with a distributed KV store across DRAM and SSD." }
+    ],
+    "questions": [
+      { "q": "Why is decode memory-bound and what does that imply?", "a": "Each decode step reads all weights (and the KV cache) to produce one token per sequence, doing ~2 FLOPs per weight byte per sequence. With a batch of 1 the GPU uses ~1% of its compute. So batching many sequences, quantizing weights and KV, and speculative decoding (verifying several tokens per weight read) are the main levers." },
+      { "q": "TTFT p99 has doubled but GPU utilization looks fine. What is happening?", "a": "Probably queueing: prefix-cache hit rate dropped, long prompts are clogging prefill, or the router is sending to hot replicas. Check queued prefill tokens per replica, hit rate, and prompt length distribution. Fixes: cache-aware routing, chunked prefill limits, scaling the prefill pool." },
+      { "q": "How do you size KV cache for a 128k context option?", "a": "In FP8 a 70B GQA model uses ~160 KB per token, so 128k tokens ≈ 20 GB per conversation. A node with ~500 GB of KV holds ~25 such chats, versus ~750 at 4k. Price and route long-context traffic separately, use tiering, and consider context parallelism or KV compression for it." },
+      { "q": "How would you cut cost by 2× without hurting quality?", "a": "Combine: FP8 or FP4 weights and FP8 KV (~1.5–2×), better prefix caching and cache-aware routing (less prefill), speculative decoding at low load, routing simple traffic to a smaller model, and filling troughs with batch work. Validate each change with offline evals and A/B tests." },
+      { "q": "What happens when a GPU node dies mid-stream?", "a": "Its in-flight requests lose their KV cache. The gateway detects the broken stream and retries on another replica: before the first token it is transparent; mid-stream it resumes by re-prefilling the prompt plus tokens already sent, so the user sees a short pause rather than an error." }
+    ]
+  },
+
+  "related": [ "kv-cache", "batching", "serving-fleet", "llm-inference-basics", "quantization", "speculative-decoding", "load-balancing" ]
+}

@@ -1,0 +1,378 @@
+{
+  "id": "data",
+  "name": "Data Systems",
+  "symbol": "cylinder.split.1x2",
+  "summary": "How organizations move, transform, store and query data at scale: batch and streaming engines, warehouses and lakehouses, change data capture, and the vector indexes behind modern AI search.",
+  "topics": [
+    {
+      "id": "batch-processing",
+      "title": "Batch Processing: MapReduce & Spark",
+      "gist": "Batch processing splits a huge dataset into chunks, processes them in parallel on many machines, then combines the results, trading freshness for throughput.",
+      "overview": [
+        "Imagine counting every word in a library of a million books. One person would take years. Instead you hand each of a thousand volunteers a stack of books, each writes down word tallies, and then you sort the tallies by word and add them up. That is **batch processing**: take a big pile of data that already exists, split it up, work on the pieces in parallel, and merge the answers.",
+        "Google's **MapReduce** (2004) made this famous with two steps: *map* (each worker turns its chunk into key/value pairs, like `(word, 1)`) and *reduce* (all pairs with the same key are gathered and combined). The expensive part in between, moving every key to the machine responsible for it, is called the **shuffle**.",
+        "**Apache Spark** replaced most MapReduce use by keeping intermediate data in memory and planning a whole chain of steps at once, instead of writing to disk after every step. Today batch jobs power nightly reports, ML training-set builds and big backfills, typically running on Spark, Trino, or a cloud warehouse over files stored in object storage."
+      ],
+      "diagram": {
+        "caption": "A batch job flows from input splits through a shuffle to output files.",
+        "steps": [
+          { "label": "Input splits", "detail": "~128 MB file chunks in S3" },
+          { "label": "Map tasks", "detail": "Parse, filter, emit key/value pairs" },
+          { "label": "Shuffle", "detail": "Partition by key, sort, transfer" },
+          { "label": "Reduce tasks", "detail": "Aggregate all values per key" },
+          { "label": "Output files", "detail": "Parquet written, job committed" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Driver / planner", "role": "Turns the user's DataFrame or SQL into a logical plan, optimizes it (Spark's Catalyst), and splits it into stages separated at shuffle boundaries." },
+          { "name": "Executors", "role": "Worker processes (JVMs in Spark) that run tasks, one per data partition, using a fixed number of cores and memory each." },
+          { "name": "Shuffle service", "role": "Writes map outputs partitioned by key to local disk or a remote shuffle store and serves them to reducers; often the slowest and least reliable part of a job." },
+          { "name": "Cluster manager", "role": "Allocates containers for executors: YARN on legacy Hadoop, Kubernetes on most new deployments, or a managed service like Databricks or EMR." },
+          { "name": "Storage layer", "role": "Columnar files (Parquet, ORC) in object storage or HDFS, read in parallel with predicate and column pruning." }
+        ],
+        "flow": [
+          "The driver parses the query, applies optimizations such as predicate pushdown and join reordering, and builds a DAG of stages.",
+          "The scheduler launches one task per input split; each task reads only the needed columns and row groups from Parquet.",
+          "Narrow transformations (filter, map, project) are pipelined inside a task with no data movement.",
+          "At a wide transformation (groupBy, join), tasks hash-partition their output and write shuffle files.",
+          "Downstream tasks fetch their partition from every upstream task over the network, then sort or hash-aggregate it.",
+          "Failed tasks are re-run from lineage (the recipe that produced the data) rather than from replicas.",
+          "Final tasks write output files and a commit protocol (or table format like Iceberg/Delta) atomically publishes them."
+        ],
+        "tradeoffs": [
+          { "choice": "Batch instead of streaming", "pro": "Simple, cheap, easy to re-run and reason about; full-dataset views", "con": "Results are hours stale; not suitable for alerting or real-time features" },
+          { "choice": "More shuffle partitions", "pro": "Smaller tasks, less spill, better parallelism", "con": "More tiny files and scheduling overhead; the classic 'small files problem'" },
+          { "choice": "Broadcast join vs shuffle join", "pro": "Broadcasting a small table avoids shuffling the big one entirely", "con": "If the 'small' table grows past ~10s of MB to GBs, executors run out of memory" },
+          { "choice": "Spot/preemptible instances", "pro": "~60-90% cheaper compute", "con": "Lost executors lose shuffle data and force stage recomputation" }
+        ],
+        "numbers": [
+          { "metric": "Typical Spark partition / HDFS block size", "value": "~128 MB" },
+          { "metric": "Spark default spark.sql.shuffle.partitions", "value": "200 (AQE coalesces at runtime)" },
+          { "metric": "Spark autoBroadcastJoinThreshold default", "value": "~10 MB" },
+          { "metric": "Spark 4.0 (2025) default ANSI SQL mode", "value": "On by default" },
+          { "metric": "Single S3 prefix request rate", "value": "~5,500 GET/s, ~3,500 PUT/s" },
+          { "metric": "Sort benchmark scale (e.g. 100 TB GraySort)", "value": "Minutes on ~hundreds of nodes" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Data skew dominates real-world batch performance: one hot key (a null user id, a celebrity account) sends a disproportionate share of rows to one reducer, and the whole stage waits on that straggler. Spark 3+ Adaptive Query Execution (AQE) detects skewed shuffle partitions from runtime statistics and splits them, and also coalesces tiny partitions and switches sort-merge joins to broadcast joins when a side turns out small. Manual fixes remain salting keys and isolating hot keys into a separate broadcast path.",
+          "The shuffle is the reliability weak point. Map outputs live on executor local disk, so losing a node loses shuffle data and triggers a cascade of upstream recomputation. That is why large shops use external or remote shuffle services (Spark's external shuffle service, Uber's Zeus, Apache Celeborn, Magnet push-based shuffle at LinkedIn) that decouple shuffle data from compute lifetimes, which also enables dynamic allocation and spot instances.",
+          "Correct output is harder than it looks on object storage. Rename-based Hadoop committers are slow and non-atomic on S3, so partial outputs could appear. Modern pipelines write into open table formats (Iceberg, Delta Lake, Hudi) where a job writes new data files then atomically swaps a metadata pointer, giving idempotent, snapshot-isolated commits. Engines like Photon (Databricks), Velox (Meta) and Apache DataFusion/Comet replace the JVM row-at-a-time model with vectorized native execution, often 2-4x faster on the same hardware."
+        ],
+        "failureModes": [
+          { "name": "Skewed straggler", "description": "99% of tasks finish in a minute, one runs for an hour. Symptom: a single task with 100x the input bytes in the Spark UI. Fix: enable AQE skew join, salt the key, or filter and handle the hot key separately." },
+          { "name": "Executor OOM / spill storm", "description": "Partitions too large for executor memory cause heavy disk spill or container kills, then retries that fail the same way. Fix: increase partitions, reduce per-task data, avoid collect() and wide UDF state, right-size memory overhead." },
+          { "name": "Small files explosion", "description": "Too many output partitions produce millions of KB-sized files, which slows listing and downstream reads. Fix: coalesce before write, use table-format compaction (Iceberg rewrite_data_files, Delta OPTIMIZE)." }
+        ],
+        "realSystems": [
+          { "name": "Apache Spark 4.x", "note": "The dominant open-source batch engine; Spark Connect separates the client from the cluster, and AQE handles skew and join selection at runtime." },
+          { "name": "Google Dataflow / Apache Beam", "note": "Unified batch and streaming model; Dataflow Shuffle moves shuffle off workers into a managed service for reliability and autoscaling." },
+          { "name": "Trino / Presto at Meta and others", "note": "MPP SQL engines that pipeline data through memory for interactive batch queries over data lakes; Presto's C++ Velox worker (Prestissimo) replaced Java workers at Meta." }
+        ],
+        "questions": [
+          { "q": "A nightly Spark job that took 40 minutes now takes 6 hours, with no code change. How do you debug it?", "a": "Look at the Spark UI stage timeline: if one task is a huge outlier, input data grew skewed, so check the key distribution and enable AQE skew handling or salt the key. If all tasks are slower, check input size growth, small-file counts, spill metrics and GC time. Also check whether a broadcast join silently flipped to sort-merge because a dimension table crossed the threshold, or if spot instance loss is forcing stage recomputation." },
+          { "q": "Design a daily job that computes per-user aggregates for 2 billion users and loads them into a serving store.", "a": "Read the day's partitioned Parquet/Iceberg events, project only needed columns, aggregate by user_id with a hash-partitioned shuffle sized so partitions are ~128-256 MB. Write results to a new Iceberg snapshot so the commit is atomic and the job is idempotent on retry. Bulk-load into the serving store (e.g. generate SSTables or use a bulk import) and flip a version pointer, rather than doing 2 billion individual writes." },
+          { "q": "Why did Spark largely replace Hadoop MapReduce?", "a": "MapReduce materialized every stage to HDFS with replication, so multi-step pipelines and iterative algorithms paid massive disk I/O. Spark plans the entire DAG, pipelines narrow operations in memory, caches reused datasets, and recovers via lineage. It also offered higher-level APIs (SQL, DataFrames) with a cost-based optimizer instead of hand-written map and reduce functions." }
+        ]
+      },
+      "related": ["stream-processing", "warehouse-lakehouse", "object-storage", "partitioning", "training-data-pipeline"]
+    },
+    {
+      "id": "stream-processing",
+      "title": "Stream Processing",
+      "gist": "Stream processing handles data continuously as events arrive, keeping running state so answers update in seconds rather than waiting for a nightly batch job.",
+      "overview": [
+        "Batch processing is like counting a bank's transactions at the end of the day. **Stream processing** is like a cashier who updates the running total after every customer. Events (clicks, payments, sensor readings) flow in forever, and the system keeps answers up to date as they arrive.",
+        "The tricky part is that events arrive late and out of order: a phone in airplane mode may upload yesterday's taps this morning. Stream processors therefore distinguish **event time** (when it happened) from **processing time** (when we saw it), and use **watermarks**, a running guess of \"we have probably seen everything up to 10:05\", to decide when a time window like \"clicks per minute\" can be closed.",
+        "Because a stream job runs forever, it must survive crashes without double-counting. Engines like **Apache Flink** periodically take consistent snapshots of all their running state, so after a failure they rewind to the last snapshot and replay events from a durable log such as **Kafka**. Streams power fraud detection, live dashboards, real-time ML features and alerting."
+      ],
+      "diagram": {
+        "caption": "Events flow from a durable log through stateful operators to sinks.",
+        "steps": [
+          { "label": "Event log", "detail": "Kafka topic, partitioned and replayable" },
+          { "label": "Source operator", "detail": "Reads offsets, assigns watermarks" },
+          { "label": "Keyed state", "detail": "Per-key windows in RocksDB" },
+          { "label": "Checkpoint", "detail": "Snapshot state plus offsets to S3" },
+          { "label": "Sink", "detail": "Transactional write to DB/topic" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Durable log (source)", "role": "Kafka, Redpanda, Kinesis or Pulsar holds events in partitions with offsets, so a job can rewind and replay after failure." },
+          { "name": "Operators / tasks", "role": "Parallel instances of map, filter, keyBy, window and join steps, connected by network channels; keyBy hash-partitions so each key lives on one task." },
+          { "name": "State backend", "role": "Holds per-key state such as window aggregates and join buffers; in-heap for small state, RocksDB or Flink 2.0 disaggregated (ForSt) state for TB-scale." },
+          { "name": "Watermarks and timers", "role": "Watermarks track event-time progress; timers fire when a watermark passes a window end, emitting results and clearing state." },
+          { "name": "Checkpoint coordinator", "role": "Injects barriers into the stream and collects a globally consistent snapshot of all operator state plus source offsets." }
+        ],
+        "flow": [
+          "The source reads events from Kafka partitions and emits watermarks, typically max event time seen minus an allowed lateness bound.",
+          "Events are keyed (e.g. by user_id) and routed over the network to the task owning that key.",
+          "Each task updates keyed state, for example adding to a 5-minute tumbling window count in RocksDB.",
+          "When the watermark passes a window's end, a timer fires, the result is emitted downstream, and that window's state is dropped.",
+          "Periodically the coordinator injects checkpoint barriers; each operator snapshots state when barriers from all inputs arrive (Chandy-Lamport style).",
+          "Transactional sinks pre-commit output and only finalize it when the checkpoint completes, giving end-to-end exactly-once.",
+          "On failure the job restarts from the last completed checkpoint, restores state and rewinds source offsets."
+        ],
+        "tradeoffs": [
+          { "choice": "Exactly-once vs at-least-once", "pro": "No duplicates in results; needed for billing and counts", "con": "Transactional sinks add latency up to the checkpoint interval and more coordination" },
+          { "choice": "Larger allowed lateness", "pro": "More late events counted correctly", "con": "Results delayed and more state retained; still need a policy for very late data" },
+          { "choice": "Shorter checkpoint interval", "pro": "Less replay after failure, lower transactional sink latency", "con": "More I/O overhead and backpressure risk with large state" },
+          { "choice": "Micro-batch (Spark Structured Streaming) vs true streaming (Flink)", "pro": "Micro-batch reuses batch engine and is simpler to operate", "con": "Higher latency floor (~100 ms-seconds) and coarser windows of control" }
+        ],
+        "numbers": [
+          { "metric": "Typical end-to-end latency (Flink, Kafka)", "value": "~10-500 ms" },
+          { "metric": "Common checkpoint interval", "value": "~10 s - 3 min" },
+          { "metric": "Flink state sizes in production", "value": "Up to ~100s of TB per job" },
+          { "metric": "Kafka partition throughput (one broker)", "value": "~10s of MB/s per partition" },
+          { "metric": "Apache Flink 2.0 release", "value": "March 2025 (disaggregated state)" },
+          { "metric": "Kafka 4.0 (2025)", "value": "ZooKeeper removed, KRaft only" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Exactly-once in Flink means exactly-once *state*, not exactly-once *processing*: events may be processed twice after replay, but their effect on state is counted once because state is rolled back to the checkpoint. End-to-end exactly-once additionally requires either idempotent sinks (upserts keyed by a deterministic id) or two-phase-commit sinks such as Kafka transactions, whose output is only visible to read_committed consumers after the checkpoint commits. Any side effect outside that protocol, like calling an HTTP API from a map function, can still happen twice.",
+          "Aligned checkpoints block an input channel once its barrier arrives until barriers arrive on all channels; under backpressure this alignment can stall for minutes, making checkpoints time out exactly when the job is struggling. Unaligned checkpoints (Flink 1.11+) let barriers overtake buffered data and snapshot in-flight buffers too, trading larger checkpoints for bounded checkpoint time. Incremental RocksDB checkpoints upload only new SST files, which is what makes TB-scale state feasible; Flink 2.0's disaggregated state pushes the primary copy to object storage so rescaling does not require downloading all state.",
+          "Watermarks are heuristics, and a single idle partition with no events holds the minimum watermark back, stalling every window downstream. Idleness detection (withIdleness) excludes quiet sources. Joins are the other state hog: a stream-stream join must buffer both sides for the join interval, and unbounded regular joins in Flink SQL keep state forever unless a state TTL is set. Streaming databases like RisingWave and Materialize expose this as incrementally maintained materialized views, which is often a simpler mental model than hand-wired DAGs."
+        ],
+        "failureModes": [
+          { "name": "Backpressure spiral", "description": "A slow sink or hot key backs up buffers to the source, consumer lag grows, checkpoints time out, the job restarts and replays even more data. Fix: find the bottleneck operator via backpressure metrics, scale it, fix skew, use unaligned checkpoints." },
+          { "name": "Stalled watermark", "description": "An idle or lagging Kafka partition holds the global watermark back, so windows never fire and state grows unboundedly. Symptom: no output despite input. Fix: idleness timeouts, per-partition watermarking, alert on watermark lag." },
+          { "name": "Unbounded state growth", "description": "Regular joins, distinct counts or session windows with no TTL accumulate state until checkpoints take forever or disks fill. Fix: state TTL, interval joins instead of regular joins, approximate sketches (HyperLogLog)." }
+        ],
+        "realSystems": [
+          { "name": "Apache Flink (Alibaba, Uber, Netflix)", "note": "The reference true-streaming engine with keyed state and distributed snapshots; Alibaba ran Flink at hundreds of millions of events/s during Singles' Day." },
+          { "name": "Kafka Streams / ksqlDB", "note": "A library rather than a cluster: state lives in local RocksDB backed up to compacted changelog topics, and exactly-once uses Kafka transactions." },
+          { "name": "Google Dataflow (Apache Beam)", "note": "Descended from MillWheel and the Dataflow Model paper that defined watermarks, triggers and event-time windowing semantics." }
+        ],
+        "questions": [
+          { "q": "Design real-time fraud scoring for card payments with a 100 ms budget.", "a": "Payments go into a Kafka topic keyed by card id; a Flink job maintains per-card features (spend in last 1 min/1 h, distinct merchants, geo velocity) in keyed state, and writes them to a low-latency feature store. The authorization path synchronously reads features and calls the model, so the stream job is off the critical path. Use at-least-once with idempotent upserts for features, and exactly-once only where counts are billed." },
+          { "q": "How does Flink achieve exactly-once without stopping the world?", "a": "The coordinator injects barriers at the sources that flow with the data; each operator snapshots its state asynchronously when it has seen the barrier on all inputs, so the snapshot corresponds to a consistent cut of the stream. Source offsets are part of the snapshot, so on recovery state and offsets roll back together. Sinks use two-phase commit tied to checkpoint completion." },
+          { "q": "Late events can arrive days later. How do you keep counts correct?", "a": "Choose an allowed lateness that captures the vast majority (e.g. 99.9%) based on measured delay distribution, emit early and updated results with retractions or upserts, and route anything later to a side output. A periodic batch job over the full log then reconciles and corrects the final numbers (a lambda-style backstop), or the streaming store accepts upserts for old windows." }
+        ]
+      },
+      "related": ["message-queues", "batch-processing", "change-data-capture", "checkpointing", "io-models"]
+    },
+    {
+      "id": "warehouse-lakehouse",
+      "title": "Warehouses & Lakehouses",
+      "gist": "Data warehouses and lakehouses store a company's history in column-oriented form so analysts can scan billions of rows in seconds to answer business questions.",
+      "overview": [
+        "An app's main database is built for many tiny, fast actions: look up one order, update one balance. Analysts ask very different questions: \"what was revenue by country per week for three years?\" That reads billions of rows but only a few columns. A **data warehouse** is a database optimized for that second job.",
+        "The key trick is **columnar storage**. Picture a spreadsheet stored column by column instead of row by row: to sum revenue you only read the revenue column, and since a column holds similar values it compresses extremely well (often 5-10x). Warehouses also split work across many machines and separate storage from compute, so you can spin up more compute for a big query and shut it down after.",
+        "A **lakehouse** puts the same ideas on top of cheap open files in object storage (like S3). Instead of the data living inside one vendor's database, tables are Parquet files plus a metadata layer, **Apache Iceberg** or **Delta Lake**, that adds transactions, versioning and schema changes. Then Spark, Trino, Snowflake, DuckDB and others can all read the same tables."
+      ],
+      "diagram": {
+        "caption": "A lakehouse stacks open table metadata over columnar files in object storage.",
+        "steps": [
+          { "label": "Object storage", "detail": "S3/GCS/ADLS, cheap, ~11 nines durable" },
+          { "label": "Parquet files", "detail": "Columnar, compressed, row-group statistics" },
+          { "label": "Table format", "detail": "Iceberg/Delta snapshots and manifests" },
+          { "label": "Catalog", "detail": "Polaris, Unity, Glue: table pointers" },
+          { "label": "Query engines", "detail": "Spark, Trino, Snowflake, DuckDB" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Columnar file format", "role": "Parquet stores data in row groups (~128 MB) split into column chunks with dictionary/RLE encoding plus min/max statistics for skipping." },
+          { "name": "Table format metadata", "role": "Iceberg tracks a tree of metadata file → manifest list → manifests → data files per snapshot, enabling atomic commits, time travel and partition evolution." },
+          { "name": "Catalog", "role": "Maps table names to their current metadata pointer and performs the atomic compare-and-swap that commits a new snapshot; e.g. Iceberg REST catalogs like Apache Polaris, Unity Catalog, AWS Glue/S3 Tables." },
+          { "name": "MPP query engine", "role": "Plans SQL into distributed stages of vectorized operators that scan, filter, join and aggregate in parallel across many nodes." },
+          { "name": "Caching layer", "role": "Local SSD caches of hot files and result caches (Snowflake's warehouse cache, Databricks disk cache) that hide object-storage latency." }
+        ],
+        "flow": [
+          "A query arrives; the engine asks the catalog for the table's current snapshot metadata.",
+          "The planner prunes partitions and uses manifest-level column statistics to skip files that cannot match the filter.",
+          "Workers fetch only the needed column chunks from object storage with ranged GETs, using min/max and bloom filters to skip row groups.",
+          "Vectorized operators decode and filter batches of thousands of values at a time using SIMD.",
+          "Joins and aggregations shuffle intermediate data between workers, then results are merged and returned.",
+          "Writers add new Parquet files, write new manifests, then atomically swap the catalog pointer to commit a snapshot."
+        ],
+        "tradeoffs": [
+          { "choice": "Managed warehouse (Snowflake, BigQuery) vs open lakehouse", "pro": "Warehouse: zero-ops, excellent concurrency and optimization", "con": "Proprietary storage and per-query pricing; lakehouse avoids lock-in but needs more engineering" },
+          { "choice": "Copy-on-write vs merge-on-read updates", "pro": "CoW: fastest reads, files always clean", "con": "CoW rewrites whole files per update; MoR writes small delete files that slow reads until compaction" },
+          { "choice": "Fine partitioning", "pro": "Prunes more data per query", "con": "Too many small files and metadata bloat; prefer clustering/Z-order or liquid clustering" },
+          { "choice": "Storage-compute separation", "pro": "Elastic, scale-to-zero compute and cheap storage", "con": "Remote reads add latency; needs caching for interactive dashboards" }
+        ],
+        "numbers": [
+          { "metric": "Columnar compression ratio (typical)", "value": "~5-10x vs raw CSV/JSON" },
+          { "metric": "S3 Standard storage price", "value": "~$0.023 per GB-month" },
+          { "metric": "BigQuery on-demand price", "value": "~$6.25 per TiB scanned" },
+          { "metric": "Parquet row-group size (default writers)", "value": "~128 MB" },
+          { "metric": "Iceberg spec version with deletion vectors", "value": "v3 (2025)" },
+          { "metric": "S3 first-byte latency", "value": "~10-100 ms per GET" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Most lakehouse performance problems are metadata problems. Every streaming commit creates a snapshot and manifests; after a few days of minute-level commits a table can have hundreds of thousands of tiny files and manifests, making planning slower than scanning. Production tables need scheduled maintenance: compaction (rewrite small files to ~512 MB), manifest rewriting, snapshot expiration and orphan-file cleanup. Managed offerings (S3 Tables, Databricks predictive optimization, Snowflake-managed Iceberg) exist largely to automate this.",
+          "Concurrency control is optimistic. Writers read snapshot N, write files, then attempt a compare-and-swap from N to N+1 at the catalog; on conflict they re-validate against what changed and retry. Appends rarely conflict, but concurrent MERGE/UPDATE on overlapping partitions do, so high-rate upsert pipelines (CDC into the lake) should be serialized per table or partition. Deletes in merge-on-read use position deletes or Iceberg v3 / Delta deletion vectors (bitmaps per data file), which are cheap to write but must be compacted or reads degrade.",
+          "Warehouse speed comes from a stack of techniques: vectorized execution over compressed data without full decoding, late materialization (filter on one column, then fetch others only for surviving rows), zone maps, dynamic filtering where a join's build side pushes a runtime filter into the probe-side scan, and result caching. Data layout matters as much as the engine: clustering by common filter columns with Z-order or Hilbert curves can cut scanned bytes by 10-100x. Single-node engines like DuckDB now handle surprisingly large workloads (~100s of GB) on one laptop-class machine, shifting the threshold for when you truly need a distributed cluster."
+        ],
+        "failureModes": [
+          { "name": "Small files and metadata bloat", "description": "Frequent small commits create millions of files; query planning takes minutes and S3 request costs spike. Fix: batch commits, scheduled compaction, snapshot expiration, target file sizes of ~256 MB-1 GB." },
+          { "name": "Commit conflicts under concurrent writers", "description": "Multiple jobs MERGE into the same table and repeatedly fail optimistic commits, causing retries and stale data. Fix: serialize writers per partition, use row-level concurrency features, separate append and update paths." },
+          { "name": "Runaway query cost", "description": "An unfiltered SELECT * or cross join on a pay-per-scan warehouse bills thousands of dollars. Fix: require partition filters, per-user quotas and maximum bytes billed, cluster tables on common predicates." }
+        ],
+        "realSystems": [
+          { "name": "Snowflake", "note": "Pioneered fully separated storage and elastic virtual warehouses over immutable micro-partitions; now also reads and writes Iceberg tables." },
+          { "name": "Databricks (Delta Lake, Unity Catalog)", "note": "The commercial lakehouse built on Spark plus the Photon C++ engine; Delta UniForm exposes Delta tables as Iceberg metadata too." },
+          { "name": "Netflix / Apple / AWS on Apache Iceberg", "note": "Iceberg originated at Netflix to fix Hive table correctness; AWS S3 Tables (2024) offers managed Iceberg with automatic compaction." }
+        ],
+        "questions": [
+          { "q": "Why does a columnar store answer analytics queries so much faster than Postgres?", "a": "It reads only the columns referenced instead of whole rows, those columns compress 5-10x because values are similar, and vectorized operators process thousands of values per instruction loop. Min/max statistics let it skip whole blocks. Postgres's row layout and per-row executor are optimized for point lookups and transactional writes instead." },
+          { "q": "Design the analytics platform for a company with 5 PB of event data and many engines.", "a": "Store data as Parquet in object storage under Iceberg tables, with an Iceberg REST catalog providing governance and atomic commits. Ingest via streaming into raw tables, then batch or incremental jobs build cleaned and aggregated tables. Let Spark handle heavy ETL, Trino or a warehouse handle interactive SQL, and run automated compaction and snapshot expiry. Access control is centralized at the catalog with column masking." },
+          { "q": "What is the difference between partitioning and clustering in a lakehouse?", "a": "Partitioning physically separates files by a column value, so queries filtering on it skip whole directories, but high-cardinality partitions cause tiny files. Clustering (Z-order, liquid clustering) sorts data within files so min/max statistics become selective for several columns without exploding file counts. Typically partition coarsely (by day) and cluster on frequent filters." }
+        ]
+      },
+      "related": ["batch-processing", "object-storage", "lsm-btree", "change-data-capture", "file-systems"]
+    },
+    {
+      "id": "change-data-capture",
+      "title": "Change Data Capture",
+      "gist": "Change data capture watches a database's internal change log and streams every insert, update and delete to other systems, keeping them in sync without double writes.",
+      "overview": [
+        "Suppose your orders live in Postgres, but you also need them in a search index, a cache and the data warehouse. The naive fix is to have the app write to all four, but if one write fails they drift apart. **Change data capture (CDC)** instead treats the database as the single source of truth and copies every change it makes, in order, to everyone else.",
+        "Every serious database already keeps a diary of changes for crash recovery and replication: Postgres's *write-ahead log* (WAL), MySQL's *binlog*. CDC tools like **Debezium** read that diary, like a court stenographer transcribing everything said, and publish each change as an event (\"order 42 changed status from paid to shipped\") onto a stream such as Kafka.",
+        "Downstream systems subscribe to that stream and apply changes in the same order. Because the log is read rather than the tables being queried repeatedly, CDC adds little load to the database and delivers changes within seconds."
+      ],
+      "diagram": {
+        "caption": "Changes flow from the database log through a connector to consumers.",
+        "steps": [
+          { "label": "Source database", "detail": "Commits write to WAL/binlog" },
+          { "label": "Log reader", "detail": "Replication slot or binlog client" },
+          { "label": "CDC connector", "detail": "Debezium turns rows into events" },
+          { "label": "Event stream", "detail": "Kafka topic keyed by primary key" },
+          { "label": "Sinks", "detail": "Warehouse, search index, cache" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Transaction log", "role": "Postgres WAL (via logical decoding with pgoutput), MySQL row-based binlog, Oracle redo/LogMiner, SQL Server CDC tables or MongoDB change streams." },
+          { "name": "Replication slot / position", "role": "A durable cursor (Postgres LSN, MySQL GTID/binlog offset) recording how far the consumer has read, so the database retains log until it is acknowledged." },
+          { "name": "Connector", "role": "Debezium on Kafka Connect, Flink CDC, or a managed service (AWS DMS, Datastream) decodes changes into events with before/after images and metadata." },
+          { "name": "Schema registry", "role": "Stores Avro/Protobuf/JSON schemas for change events so consumers can handle column additions and type changes safely." },
+          { "name": "Sink connectors / consumers", "role": "Apply events as upserts and deletes into targets such as Iceberg tables, Elasticsearch, Redis or another database." }
+        ],
+        "flow": [
+          "On first start, the connector takes a consistent snapshot of existing tables while recording the log position at the snapshot point.",
+          "It then streams from that position: each committed transaction's row changes are decoded from the log in commit order.",
+          "Each change becomes an event with op type (c/u/d), before and after values, primary key, LSN and transaction id.",
+          "Events are published to Kafka keyed by primary key, so all changes to one row land on one partition in order.",
+          "The connector periodically commits its log position; the database can then recycle older WAL segments.",
+          "Consumers apply events idempotently, typically upserting by primary key and using the LSN to ignore stale replays."
+        ],
+        "tradeoffs": [
+          { "choice": "Log-based CDC vs query polling (updated_at)", "pro": "Log-based captures deletes and every intermediate change with low source load", "con": "Needs elevated database privileges, replication slots and per-database expertise" },
+          { "choice": "CDC vs dual writes from the app", "pro": "Single source of truth, no partial-failure drift", "con": "Downstream only sees table-level changes, not business intent, unless you use an outbox" },
+          { "choice": "Exposing raw table events vs outbox events", "pro": "Raw events require no app changes", "con": "Couples consumers to your internal schema; outbox decouples but needs app writes" }
+        ],
+        "numbers": [
+          { "metric": "Typical CDC end-to-end lag", "value": "~100 ms - few seconds" },
+          { "metric": "Debezium version (2025-2026)", "value": "3.x (Java 17+)" },
+          { "metric": "Postgres WAL segment size", "value": "16 MB default" },
+          { "metric": "Debezium single-connector throughput", "value": "~10k-100k events/s" },
+          { "metric": "Postgres max_slot_wal_keep_size", "value": "Unlimited by default (-1)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The most dangerous CDC failure is silent: an abandoned or stuck Postgres logical replication slot prevents WAL recycling, so the primary's disk fills until the database stops accepting writes. Always set max_slot_wal_keep_size, alert on slot lag (pg_replication_slots confirmed_flush_lsn vs current LSN), and use heartbeat writes so low-traffic databases still advance the slot. Slots also historically did not survive failover; Postgres 17 added failover slot synchronization to standbys, before which tools like pg_failover_slots or a fresh snapshot were needed.",
+          "Initial snapshots of large tables are hard: a long-running REPEATABLE READ snapshot holds back vacuum and retains log for hours. Debezium's incremental snapshots (based on Netflix's DBLog watermark algorithm) chunk the table by primary key and interleave chunk reads with live log events, using low/high watermark signals to de-duplicate so streaming never pauses and snapshots can be resumed or triggered on demand for one table.",
+          "CDC gives you row changes, not intent. A single business action may touch five tables in one transaction, and consumers see five events. The transactional outbox pattern writes a domain event row to an outbox table in the same transaction as the business change; CDC publishes only the outbox, giving reliable at-least-once event publication without distributed transactions. Ordering is only guaranteed per key (partition); cross-table and cross-partition consumers must use transaction metadata or LSNs to reconstruct consistent views. Schema changes (DDL) need a strategy too, since dropping or renaming a column can break every downstream consumer."
+        ],
+        "failureModes": [
+          { "name": "WAL bloat from a stalled slot", "description": "Connector is down for a day; the replication slot pins WAL and the primary disk fills, causing an outage of the source database. Fix: max_slot_wal_keep_size, slot lag alerting, drop and re-snapshot when lag exceeds a threshold." },
+          { "name": "Duplicate or replayed events", "description": "After a connector crash, events since the last committed offset are re-sent. Non-idempotent consumers double-count. Fix: upsert by primary key, de-dup using LSN or event id." },
+          { "name": "Breaking schema change", "description": "A column rename or type change propagates and crashes sink jobs or corrupts warehouse tables. Fix: schema registry compatibility rules, expand-and-contract migrations, outbox with versioned contracts." }
+        ],
+        "realSystems": [
+          { "name": "Debezium", "note": "The de facto open-source CDC platform for Postgres, MySQL, SQL Server, Oracle, MongoDB and more, running on Kafka Connect or embedded/Debezium Server." },
+          { "name": "LinkedIn Databus / Netflix DBLog", "note": "Early large-scale CDC systems; DBLog introduced the watermark-based incremental snapshot algorithm later adopted by Debezium and Flink CDC." },
+          { "name": "Flink CDC / Fivetran / AWS DMS", "note": "Flink CDC streams changes straight into Flink pipelines (often into Iceberg/Paimon); Fivetran and DMS offer managed log-based replication to warehouses." }
+        ],
+        "questions": [
+          { "q": "How do you keep Elasticsearch in sync with Postgres without dual writes?", "a": "Run Debezium against Postgres's logical replication slot, publish row changes to Kafka keyed by primary key, and have a sink consumer upsert or delete documents in Elasticsearch, using the LSN as a document version so stale replays are rejected (external versioning). Bootstrap with an incremental snapshot. Alert on slot lag and consumer lag; full reindex from snapshot is the recovery path." },
+          { "q": "What is the transactional outbox pattern and why use it with CDC?", "a": "The service writes its business change and an event row to an outbox table in one local transaction, so either both happen or neither does. CDC tails the outbox table and publishes events to Kafka. This avoids the dual-write problem and lets you publish stable domain events instead of leaking internal table schemas." },
+          { "q": "A CDC pipeline into a warehouse shows rows that were deleted in the source. Why?", "a": "Possible causes: the sink is append-only and ignores delete (op=d) or tombstone events, deletes happened during a snapshot gap, or Kafka topic compaction removed tombstones before the sink read them. Fix the sink to apply deletes as MERGE operations, ensure delete.retention.ms exceeds consumer downtime, and reconcile with periodic row-count and checksum comparisons." }
+        ]
+      },
+      "related": ["replication", "message-queues", "stream-processing", "warehouse-lakehouse", "caching"]
+    },
+    {
+      "id": "vector-search",
+      "title": "Vector Search",
+      "gist": "Vector search finds items whose meaning is similar to a query by comparing lists of numbers called embeddings, powering semantic search and retrieval for AI assistants.",
+      "overview": [
+        "Keyword search matches words exactly, so a search for \"cheap flights\" may miss a page about \"budget airfare\". **Vector search** fixes this by first running text (or images, or audio) through an AI model that turns it into an **embedding**: a list of, say, 1,024 numbers that acts like coordinates for meaning. Things with similar meaning land near each other in this space.",
+        "Searching then becomes \"find the points closest to my query's point\". Checking every one of a billion points would be too slow, so vector databases build an **approximate nearest neighbor (ANN)** index. A popular one, **HNSW**, is like a road network with highways: you start on a sparse top layer to get to the right neighborhood quickly, then drop to local streets to find the exact closest houses.",
+        "This is the backbone of **retrieval-augmented generation (RAG)**: before an AI assistant answers, it embeds your question, retrieves the most relevant document chunks from a vector index, and puts them in its prompt. It also powers recommendations, image search and duplicate detection."
+      ],
+      "diagram": {
+        "caption": "A query is embedded, searched in an ANN index, then re-ranked.",
+        "steps": [
+          { "label": "Embed query", "detail": "Model maps text to ~1,024 dims" },
+          { "label": "ANN index", "detail": "HNSW or IVF finds candidates" },
+          { "label": "Filter", "detail": "Apply metadata and permission filters" },
+          { "label": "Re-rank", "detail": "Exact distance or cross-encoder" },
+          { "label": "Top-k results", "detail": "Returned to app or LLM prompt" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Embedding model", "role": "Maps content to fixed-length vectors, e.g. OpenAI text-embedding-3-large (3,072 dims), Cohere Embed v4, or open models like BGE and E5; documents and queries must use the same model." },
+          { "name": "ANN index", "role": "A graph (HNSW, DiskANN/Vamana), clustering (IVF) or hashing structure that finds near neighbors in sublinear time at the cost of some recall." },
+          { "name": "Vector compression", "role": "Product quantization (PQ), scalar int8 or binary quantization shrinks vectors 4-32x so more fit in RAM and distance math is cheaper." },
+          { "name": "Metadata store and filters", "role": "Holds attributes like tenant, date or ACL so results can be filtered, ideally during graph traversal rather than after." },
+          { "name": "Hybrid retrieval and re-ranker", "role": "Combines vector results with BM25 keyword results (e.g. reciprocal rank fusion) and re-scores top candidates with a slower cross-encoder model." }
+        ],
+        "flow": [
+          "Documents are chunked (e.g. ~300-800 tokens with overlap), embedded in batches, and inserted into the index with metadata.",
+          "For HNSW, each new vector is assigned a random top layer and linked to its M nearest neighbors at each layer it occupies.",
+          "At query time, the query is embedded with the same model and normalized if using cosine similarity.",
+          "Search starts at the top-layer entry point, greedily moves to closer neighbors, and descends layer by layer.",
+          "On the bottom layer it runs a beam search with a candidate list of size ef_search, returning the best candidates.",
+          "Candidates are filtered by metadata, optionally re-scored with full-precision vectors or a cross-encoder, and the top-k returned."
+        ],
+        "tradeoffs": [
+          { "choice": "HNSW in RAM vs disk-based (DiskANN, IVF-PQ)", "pro": "HNSW: ~1 ms latency and high recall", "con": "Needs all vectors plus graph in RAM; at 1B x 768-d float32 that is ~3 TB+" },
+          { "choice": "Higher ef_search / nprobe", "pro": "Higher recall", "con": "Linearly more distance computations and latency" },
+          { "choice": "Aggressive quantization", "pro": "4-32x less memory and faster scans", "con": "Lower recall unless you re-rank with full vectors" },
+          { "choice": "Dedicated vector DB vs pgvector in Postgres", "pro": "Postgres: one system, transactions, joins with business data", "con": "Harder to scale past ~10s-100s of millions of vectors with low latency" }
+        ],
+        "numbers": [
+          { "metric": "Typical embedding dimensions", "value": "~384-3,072" },
+          { "metric": "Memory for 1M x 1,536-d float32", "value": "~6 GB raw vectors" },
+          { "metric": "HNSW query latency at ~95% recall", "value": "~1-10 ms on millions of vectors" },
+          { "metric": "Common HNSW parameters", "value": "M ~16-32, ef_construction ~100-200" },
+          { "metric": "Binary quantization compression", "value": "32x vs float32" },
+          { "metric": "pgvector version (2025-2026)", "value": "0.8.x, with HNSW and iterative scans" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Recall is the metric that hides problems: ANN indexes are tuned on benchmarks like ann-benchmarks or BigANN with uniform queries, but production queries cluster and filters change the picture. Filtered search is the hardest case. Post-filtering an HNSW top-k with a selective filter (1% of docs match) returns too few results; pre-filtering breaks graph connectivity. Solutions include filter-aware traversal (Qdrant, Weaviate ACORN-style), iterative scans that keep expanding (pgvector 0.8), per-tenant partitions, and falling back to brute force when the filter matches few enough vectors.",
+          "HNSW updates and deletes are awkward. Deletes are usually tombstones that remain in the graph and degrade search until a rebuild, and heavy churn fragments connectivity. Graph build is CPU-heavy (roughly O(n log n) distance computations), so large systems build segments offline and merge them, LSM-style, as in Milvus, Lucene/Elasticsearch and Vespa. Disk-oriented indexes such as Microsoft's DiskANN store compressed PQ codes in RAM for navigation and full vectors on NVMe for re-ranking, serving billion-scale indexes from one machine with ~5 ms latency.",
+          "In RAG systems, retrieval quality is usually limited by chunking and embeddings rather than the ANN algorithm. Pure dense retrieval misses exact identifiers, error codes and rare names, so hybrid search with BM25 plus a cross-encoder re-ranker typically beats tuning HNSW. Matryoshka embeddings let you truncate vectors (e.g. 3,072 → 256 dims) for a cheap first pass and use full vectors to re-rank. Changing the embedding model requires re-embedding the whole corpus since vectors from different models are not comparable, so version your embeddings and plan dual-index migrations."
+        ],
+        "failureModes": [
+          { "name": "Filtered search returns too few results", "description": "A selective tenant or ACL filter applied after ANN search leaves 2 of 10 requested results, or misses the true best matches. Fix: filter-aware indexes, per-tenant partitions, iterative scanning, brute-force fallback for tiny filtered sets." },
+          { "name": "Embedding model mismatch or drift", "description": "Queries are embedded with a new model version while documents use the old one; similarity scores become meaningless and relevance silently collapses. Fix: store model version per vector, re-embed atomically, dual-write during migration." },
+          { "name": "Memory blowup", "description": "The index outgrows RAM, nodes swap or OOM, and latency jumps from ms to seconds. Fix: quantization, disk-based indexes, sharding by tenant or hash, capacity planning at ~1.5-2x raw vector size for HNSW." }
+        ],
+        "realSystems": [
+          { "name": "FAISS (Meta)", "note": "The foundational library for IVF, PQ, HNSW and GPU-accelerated ANN search; many vector databases embed it or its ideas." },
+          { "name": "pgvector / Elasticsearch / OpenSearch", "note": "Vector search inside existing databases and search engines, popular because it combines with transactions, keyword search and existing ops." },
+          { "name": "Pinecone, Milvus, Qdrant, Weaviate, Turbopuffer", "note": "Dedicated vector stores; newer designs like Turbopuffer and Pinecone serverless keep data in object storage with SSD/RAM caches to cut cost." }
+        ],
+        "questions": [
+          { "q": "Design semantic search over 1 billion documents with p99 under 50 ms.", "a": "Shard the corpus across nodes (e.g. ~50-100M vectors per shard), use a compressed index such as IVF-PQ or DiskANN with PQ codes in RAM and full vectors on NVMe, and query all shards in parallel, merging top-k. Re-rank the merged candidates with full-precision vectors. Add BM25 hybrid retrieval for exact terms, cache popular query embeddings, and measure recall@10 against brute force on sampled queries." },
+          { "q": "Your RAG assistant gives wrong answers even though the right document is in the index. What do you check?", "a": "Measure retrieval separately from generation: is the right chunk in the top-k? If not, check chunking (answer split across chunks), embedding model fit for the domain, missing hybrid keyword search for exact terms, and filters excluding it. If it is retrieved but the model ignores it, look at re-ranking order, context size and prompt construction." },
+          { "q": "Explain HNSW and its main tuning knobs.", "a": "HNSW builds a multi-layer proximity graph where higher layers are sparse long-range links and the bottom layer contains all points. Search greedily descends from the top, then does beam search on the bottom. M controls edges per node (memory and recall), ef_construction controls build quality, and ef_search controls the query-time candidate list, trading latency for recall." }
+        ]
+      },
+      "related": ["llm-inference-basics", "partitioning", "caching", "quantization", "storage-devices"]
+    }
+  ]
+}

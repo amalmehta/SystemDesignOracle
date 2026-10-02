@@ -1,0 +1,457 @@
+{
+  "id": "gpu",
+  "name": "GPUs & Accelerators",
+  "symbol": "cpu",
+  "summary": "The chips that power modern AI: how GPUs run tens of thousands of threads at once, why memory bandwidth usually matters more than raw math, how kernels are tuned, how chips are wired together, and how TPUs and other accelerators compare.",
+  "topics": [
+    {
+      "id": "gpu-architecture",
+      "title": "GPU Architecture: SMs, Warps & SIMT",
+      "gist": "A GPU is a chip with over a hundred small processors that each run thousands of threads in lockstep groups, trading single-thread speed for enormous parallel throughput.",
+      "overview": [
+        "A CPU is built to finish one task as fast as possible: a few very clever cores with big caches and tricks to guess what comes next. A GPU is built for the opposite: doing the same simple operation on millions of numbers at once. It has many simpler cores and accepts that any single thread is slow.",
+        "Picture a CPU as a handful of master chefs, each cooking a complicated dish start to finish. A GPU is a giant cafeteria kitchen with 132 stations (**Streaming Multiprocessors**, or SMs), each staffed by teams of 32 line cooks (**warps**) who all perform the same step at the same moment: everyone chops, then everyone stirs. This style is called **SIMT**, single instruction, multiple threads.",
+        "The trick that makes GPUs fast is **latency hiding**. Fetching data from memory takes hundreds of cycles. Instead of waiting, an SM keeps many warps ready and instantly switches to another warp whose data has arrived. As long as there's enough independent work queued up, the math units stay busy."
+      ],
+      "diagram": {
+        "caption": "How a CUDA kernel launch maps onto GPU hardware.",
+        "steps": [
+          { "label": "Kernel grid", "detail": "Thousands of thread blocks launched" },
+          { "label": "Thread block", "detail": "Up to 1,024 threads, one SM" },
+          { "label": "Warp", "detail": "32 threads in lockstep" },
+          { "label": "Warp scheduler", "detail": "Issues ready warp each cycle" },
+          { "label": "Execution units", "detail": "FP32, INT32, tensor cores, load/store" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Streaming Multiprocessor (SM)", "role": "The basic compute unit: H100 SXM has 132 SMs, each with 4 sub-partitions holding warp schedulers, register files, CUDA cores and tensor cores." },
+          { "name": "Warp", "role": "A group of 32 threads that share one instruction pointer; NVIDIA's unit of scheduling (AMD's equivalent, the wavefront, is 64 threads on CDNA)." },
+          { "name": "Warp scheduler", "role": "Each SM sub-partition picks one eligible warp per cycle and issues its next instruction, switching between warps with zero overhead." },
+          { "name": "Register file", "role": "~256 KB per SM (65,536 32-bit registers) partitioned among resident threads; the fastest storage on the chip." },
+          { "name": "Thread block / CTA and clusters", "role": "Threads that run on one SM and can share memory and synchronize; Hopper added thread block clusters spanning several SMs." },
+          { "name": "GigaThread engine", "role": "Hardware block scheduler that distributes thread blocks onto SMs as resources free up." }
+        ],
+        "flow": [
+          "The host launches a kernel with a grid of thread blocks; the driver queues it on a CUDA stream.",
+          "The block scheduler places each block on an SM with enough free registers, shared memory and thread slots; several blocks can share one SM.",
+          "Each block's threads are grouped into warps of 32 consecutive threads.",
+          "Every cycle, each of the SM's 4 schedulers chooses a warp whose operands are ready and issues its instruction to the right units.",
+          "When a warp waits on memory (hundreds of cycles), schedulers simply issue from other warps, hiding the latency.",
+          "If threads in a warp take different branches, the warp executes each path in turn with inactive threads masked off (divergence).",
+          "When all blocks finish, the kernel completes and the next operation on the stream can start."
+        ],
+        "tradeoffs": [
+          { "choice": "More threads per SM (high occupancy)", "pro": "More warps available to hide memory latency", "con": "Fewer registers and less shared memory per thread, which can force spills and hurt tile reuse" },
+          { "choice": "SIMT lockstep execution", "pro": "One instruction fetch and decode drives 32 lanes, saving huge area and power", "con": "Branch divergence and irregular memory access waste lanes" },
+          { "choice": "Many simple cores vs few complex cores", "pro": "Massive throughput per watt on data-parallel work", "con": "Poor single-thread performance; serial code and control-heavy logic run badly" },
+          { "choice": "Bigger dies vs multi-die packages", "pro": "Multi-die (B200's two reticle-size dies) gets past the reticle limit", "con": "Die-to-die links (10 TB/s on B200) add latency, power and packaging cost" }
+        ],
+        "numbers": [
+          { "metric": "H100 SXM5 SMs", "value": "132 SMs, ~80B transistors, TSMC 4N" },
+          { "metric": "Max resident threads per H100 SM", "value": "2,048 (64 warps)" },
+          { "metric": "B200 (Blackwell)", "value": "~208B transistors across 2 dies, ~1,000 W in HGX" },
+          { "metric": "Max registers per thread", "value": "255" },
+          { "metric": "H100 boost clock", "value": "~1.98 GHz" },
+          { "metric": "AMD MI300X compute units", "value": "304 CUs across 8 XCD chiplets" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Since Volta, NVIDIA threads have independent program counters (independent thread scheduling), so divergent paths can interleave and intra-warp synchronization must be explicit (__syncwarp). Code written for pre-Volta implicit warp-synchronous behavior can deadlock or race. The hardware still executes one path at a time per warp, so divergence costs throughput even though correctness semantics changed.",
+          "Occupancy is a means, not a goal. Volkov's classic result is that instruction-level parallelism can substitute for thread-level parallelism: a kernel with few warps but many independent loads in flight per thread can saturate bandwidth. Modern high-performance GEMM and attention kernels on Hopper and Blackwell deliberately run at low occupancy (one or two big warpgroups per SM), using warp specialization: producer warps issue asynchronous TMA copies while consumer warpgroups run tensor-core MMAs, coordinated by hardware barriers (mbarrier).",
+          "Hopper's thread block clusters let up to 16 (non-portable) blocks on neighboring SMs access each other's shared memory (distributed shared memory) and synchronize in hardware, which matters for kernels that need more on-chip storage than one SM provides. Blackwell goes further with 2-SM cooperative MMA (tcgen05 with CTA pairs) and Tensor Memory, a dedicated per-SM store for MMA accumulators that frees registers. Each generation moves GPUs further from 'many independent threads' toward 'a few big asynchronous dataflow engines per SM'."
+        ],
+        "failureModes": [
+          { "name": "Warp divergence", "description": "Data-dependent branches split warps so only some lanes do work; throughput drops by up to 32x in the worst case. Fix: sort or bin work so neighboring threads take the same path, or use predication." },
+          { "name": "Register spills", "description": "A kernel needs more registers than allowed, so the compiler spills to local memory (actually HBM-backed). Symptom: high local memory traffic in Nsight Compute. Fix: smaller tiles, launch_bounds tuning, fewer live values." },
+          { "name": "Tail effect / wave quantization", "description": "A grid of 133 blocks on 132 SMs runs two waves, the second almost empty, nearly doubling runtime. Fix: size grids to multiples of SM count or use persistent kernels." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA H100 / H200 (Hopper)", "note": "The workhorse of 2023-2025 AI clusters, introducing TMA, warpgroup MMA, thread block clusters and FP8 tensor cores." },
+          { "name": "NVIDIA B200 / B300 (Blackwell)", "note": "Two-die GPUs with 5th-gen tensor cores, Tensor Memory and FP4 support; B300 (Blackwell Ultra) raises HBM to 288 GB and shipped from late 2025." },
+          { "name": "AMD Instinct MI300X / MI355X", "note": "Chiplet-based CDNA 3/4 GPUs with 64-wide wavefronts, large HBM capacities (192-288 GB) and the ROCm/HIP software stack." }
+        ],
+        "questions": [
+          { "q": "Why are GPUs so much better than CPUs for matrix multiplication but not for a web server?", "a": "Matrix multiply is billions of identical, independent multiply-adds with predictable memory access, perfect for SIMT and latency hiding across many warps. A web server is branchy, latency-sensitive, and each request needs fast serial execution plus syscalls and I/O. CPUs' big caches, branch predictors and out-of-order cores win there." },
+          { "q": "A kernel shows 25% occupancy. Is that a problem?", "a": "Not necessarily. Check whether the kernel is stalled on memory latency (many 'long scoreboard' stalls) or saturating bandwidth or tensor cores already. Hand-tuned GEMM and FlashAttention kernels often run at low occupancy because they hide latency with asynchronous copies and ILP. Only raise occupancy if the profiler shows warps stalled with nothing else to issue." },
+          { "q": "What does Blackwell's two-die design change for software?", "a": "Mostly nothing at the programming-model level: the two dies appear as one CUDA device joined by a ~10 TB/s NV-HBI link. But memory access across dies costs more latency, so locality-aware placement and L2 behavior matter for performance tuning, similar to NUMA on CPUs." }
+        ]
+      },
+      "related": ["gpu-memory-hierarchy", "tensor-cores", "kernel-optimization", "processes-threads", "cpu-scheduling", "llm-inference-basics"]
+    },
+    {
+      "id": "gpu-memory-hierarchy",
+      "title": "GPU Memory Hierarchy",
+      "gist": "GPUs have layers of memory from tiny and instant to huge and slow; fast code keeps data in the small fast layers and reuses it as much as possible.",
+      "overview": [
+        "A GPU can do math far faster than it can fetch the numbers to do math on. An H100 can perform about 1,000 trillion 16-bit operations per second but read only about 3.35 trillion bytes per second from its main memory. So the speed of most AI code is limited by memory, not math.",
+        "Think of a carpenter's workshop. The tools in your hand (**registers**) are instant. Your workbench (**shared memory**) holds a few things within arm's reach. A shelf across the room (**L2 cache**) takes a walk. The warehouse down the street (**HBM**, the main GPU memory) holds everything but each trip is slow. Good craftsmanship means bringing a batch of wood to the bench once and making as many cuts as possible before going back.",
+        "Every layer is roughly ten times bigger and several times slower than the one above it. Much of GPU performance work, including famous techniques like FlashAttention, is simply rearranging computation so data makes fewer trips to the warehouse."
+      ],
+      "diagram": {
+        "caption": "H100 memory hierarchy, fastest and smallest at the top.",
+        "steps": [
+          { "label": "Registers", "detail": "~1 cycle, 256 KB per SM" },
+          { "label": "Shared memory / L1", "detail": "~30 cycles, up to 228 KB/SM" },
+          { "label": "L2 cache", "detail": "~200+ cycles, 50 MB chip-wide" },
+          { "label": "HBM3", "detail": "~500+ cycles, 80 GB, 3.35 TB/s" },
+          { "label": "Host / peer memory", "detail": "Microseconds, via PCIe or NVLink" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Registers", "role": "Private per-thread storage with the highest bandwidth on the chip; where tensor-core operands and accumulators live (Blackwell adds Tensor Memory for accumulators)." },
+          { "name": "Shared memory (SMEM)", "role": "Programmer-managed scratchpad per SM, carved from the same 256 KB SRAM as L1; organized in 32 banks of 4 bytes." },
+          { "name": "L1 / texture cache", "role": "Hardware-managed cache for global memory loads, sharing capacity with shared memory per SM." },
+          { "name": "L2 cache", "role": "Chip-wide cache (50 MB on H100, split into two partitions) that all SMs share; the point of coherence for global memory." },
+          { "name": "HBM (High Bandwidth Memory)", "role": "Stacked DRAM dies beside the GPU die on a silicon interposer, with very wide (1024-bit per stack, 2048-bit for HBM4) buses." },
+          { "name": "Tensor Memory Accelerator (TMA)", "role": "Hopper+ hardware copy engine that moves multi-dimensional tiles between HBM and shared memory asynchronously, freeing threads from address math." }
+        ],
+        "flow": [
+          "A kernel asks for a tile of a matrix in global memory; a warp's 32 addresses are coalesced into as few 32-byte sectors as possible.",
+          "The request checks L1, then L2; on a miss, the memory controller fetches from HBM, filling L2 and L1 on the way back.",
+          "With TMA, one thread issues a bulk tensor copy that lands the tile directly in shared memory and signals an mbarrier when done.",
+          "Threads read operands from shared memory into registers, or tensor cores read shared memory directly (wgmma on Hopper).",
+          "Results accumulate in registers (or Tensor Memory on Blackwell) across many tiles before a single write back to HBM.",
+          "Data needed by another GPU travels over NVLink or PCIe, an order of magnitude slower than local HBM."
+        ],
+        "tradeoffs": [
+          { "choice": "More shared memory per block", "pro": "Bigger tiles mean more reuse per byte loaded from HBM", "con": "Fewer blocks fit per SM, reducing latency hiding" },
+          { "choice": "HBM capacity vs bandwidth", "pro": "More stacks/height (H200 141 GB, B300 288 GB) fit bigger models and KV caches", "con": "Cost, power and packaging limits; HBM is a large share of accelerator cost and supply" },
+          { "choice": "Hardware-managed L1 vs explicit shared memory", "pro": "L1 is automatic and easy", "con": "Explicit SMEM gives predictable reuse and is what peak kernels rely on" },
+          { "choice": "Large on-chip SRAM designs (Cerebras, Groq)", "pro": "Tens of PB/s of on-chip bandwidth, great for low-latency inference", "con": "SRAM per chip is tiny (Groq ~230 MB), so large models span many chips" }
+        ],
+        "numbers": [
+          { "metric": "H100 SXM HBM3", "value": "80 GB at ~3.35 TB/s" },
+          { "metric": "H200 HBM3e", "value": "141 GB at ~4.8 TB/s" },
+          { "metric": "B200 HBM3e", "value": "~180-192 GB at ~8 TB/s" },
+          { "metric": "H100 L2 cache", "value": "50 MB" },
+          { "metric": "H100 shared memory", "value": "up to 228 KB per SM (256 KB combined with L1)" },
+          { "metric": "HBM access latency", "value": "~600-800 cycles (~400-600 ns) on a cache miss" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Coalescing rules are about sectors: global memory is served in 32-byte sectors grouped into 128-byte cache lines. If the 32 threads of a warp read 32 consecutive 4-byte floats, that's 4 sectors; if they stride by 128 bytes, it's 32 sectors and effective bandwidth drops 8x. This is why data layout (row-major vs column-major, structure-of-arrays vs array-of-structures) and vectorized 16-byte loads matter so much.",
+          "Shared memory bank conflicts happen when multiple threads in a warp hit different addresses in the same 4-byte bank, serializing the access. The standard fixes are padding (making a row 33 floats wide) or XOR swizzling of addresses, which CUTLASS/CuTe and TMA support natively; Hopper's TMA and wgmma expect specific swizzled layouts (32B/64B/128B swizzle) so that tensor-core reads are conflict-free.",
+          "L2 is a surprisingly important tuning knob. Kernels can set access-policy windows to keep a hot buffer (e.g. a KV cache page or embedding table) persistent in L2, and thread block rasterization order (swizzling the order blocks are launched) can dramatically increase L2 hit rates in GEMMs by making concurrently running blocks share input tiles. On H100 the L2 is split in two partitions, so data homed in the far partition costs extra latency, which is one reason measured L2 bandwidth varies by access pattern."
+        ],
+        "failureModes": [
+          { "name": "Uncoalesced access", "description": "Strided or random global loads waste most of each 32-byte sector; Nsight Compute shows low sector efficiency. Fix: transpose via shared memory, change layout, vectorize loads." },
+          { "name": "Shared memory bank conflicts", "description": "Column-wise access of a 32-wide tile makes all threads hit the same bank, serializing 32-way. Fix: pad rows or swizzle addresses." },
+          { "name": "HBM capacity cliffs", "description": "A model or KV cache slightly exceeds HBM, forcing offload over PCIe at ~64 GB/s, a 50x slowdown. Fix: quantize, shard across GPUs, or pick a higher-capacity part (H200, MI300X, B300)." }
+        ],
+        "realSystems": [
+          { "name": "FlashAttention (1/2/3/4)", "note": "Tiles attention so the N x N score matrix never touches HBM, keeping it in SRAM and registers; turns a memory-bound op into a compute-bound one." },
+          { "name": "SK hynix / Samsung / Micron HBM3e and HBM4", "note": "HBM3e (~1.2 TB/s per stack) feeds Blackwell; HBM4 doubles the interface to 2048 bits and is slated for NVIDIA Rubin and AMD MI400 in 2026." },
+          { "name": "Cerebras WSE-3", "note": "Wafer-scale chip with 44 GB of on-chip SRAM and ~21 PB/s of memory bandwidth, avoiding HBM entirely for weights that fit." }
+        ],
+        "questions": [
+          { "q": "Why is LLM decoding memory-bound on GPUs, and what helps?", "a": "Generating one token at batch size 1 reads every weight once for ~2 FLOPs per parameter, an arithmetic intensity near 1 FLOP/byte versus the H100's ~295 FLOPs/byte ridge point. So speed is set by HBM bandwidth: a 70B BF16 model needs 140 GB per token, ~40 ms on one H100's 3.35 TB/s. Batching, quantization and speculative decoding all raise work per byte read." },
+          { "q": "How would you speed up a matrix transpose kernel?", "a": "A naive transpose coalesces reads but makes writes strided. Load a 32x32 tile into shared memory with coalesced reads, sync, then write it out coalesced from the transposed position, padding the tile to 32x33 to avoid bank conflicts. It then runs near HBM bandwidth." },
+          { "q": "When does adding more HBM capacity help more than more bandwidth?", "a": "When the working set doesn't fit: large models, long-context KV caches, or big inference batches. Capacity lets you avoid sharding across more GPUs (and the communication that brings) or raise batch size, which increases arithmetic intensity. Bandwidth helps when everything fits but you're memory-bound per step." }
+        ]
+      },
+      "related": ["kernel-optimization", "gpu-architecture", "kv-cache", "caching", "virtual-memory", "storage-devices"]
+    },
+    {
+      "id": "tensor-cores",
+      "title": "Tensor Cores & Low-Precision Math",
+      "gist": "Tensor cores are special circuits that multiply small blocks of matrices in a single step, and using fewer bits per number makes them faster still.",
+      "overview": [
+        "Nearly all the work in a neural network is **matrix multiplication**: huge grids of numbers multiplied together. Regular GPU cores multiply one pair of numbers at a time. **Tensor cores** multiply whole small blocks of matrices at once, like a stamp that prints a full grid in one press instead of a pen writing one digit at a time.",
+        "Tensor cores get even faster when the numbers use fewer bits. Halving the bits roughly doubles speed and halves memory, because more numbers fit through the same wires. That's why AI hardware has marched from 32-bit to 16-bit (**BF16**), 8-bit (**FP8**), and now 4-bit (**FP4**) formats.",
+        "The catch is accuracy. With fewer bits, numbers are rounded more coarsely, like measuring with a ruler marked only in centimeters. The solution is to keep accumulating results at high precision and to attach a **scale factor** to small groups of numbers, so each group uses its few bits where they matter."
+      ],
+      "diagram": {
+        "caption": "One tensor-core matrix multiply-accumulate (D = A x B + C).",
+        "steps": [
+          { "label": "Load A, B tiles", "detail": "Low precision from shared memory" },
+          { "label": "Apply block scales", "detail": "MX/NVFP4 per-block scale factors" },
+          { "label": "Multiply-accumulate", "detail": "Whole tile per instruction" },
+          { "label": "FP32 accumulator", "detail": "Registers or Tensor Memory" },
+          { "label": "Epilogue", "detail": "Scale, activation, cast, store" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Tensor core", "role": "Fixed-function unit per SM sub-partition that computes matrix multiply-accumulate on small tiles; 4 per SM on Hopper and Blackwell." },
+          { "name": "MMA instructions (mma, wgmma, tcgen05)", "role": "PTX instructions exposing tensor cores: warp-level mma (Ampere), warpgroup-level asynchronous wgmma (Hopper), and tcgen05 with Tensor Memory (Blackwell)." },
+          { "name": "Number formats", "role": "TF32, BF16, FP16, FP8 (E4M3/E5M2), FP6, FP4 and INT8, each trading range and precision for throughput." },
+          { "name": "Microscaling (MX) formats", "role": "OCP-standard block formats (MXFP8, MXFP6, MXFP4) where 32 elements share an 8-bit power-of-two scale; NVFP4 uses 16-element blocks with FP8 scales." },
+          { "name": "Accumulator", "role": "Higher-precision (usually FP32) storage for partial sums so rounding errors don't compound across the K dimension." }
+        ],
+        "flow": [
+          "A GEMM is tiled so each thread block (or block pair) owns an output tile, e.g. 128 x 256.",
+          "Input tiles of A and B are staged into shared memory by TMA, in the swizzled layout tensor cores expect.",
+          "Warpgroups issue asynchronous MMA instructions that read A and B from shared memory (or registers) and accumulate into FP32.",
+          "For block-scaled formats, hardware applies each block's scale factor inside the MMA so dequantization costs nothing extra.",
+          "The loop walks along K, overlapping the next tile's loads with the current tile's math.",
+          "An epilogue applies bias, activation, rescaling and casting to the output format, then stores to HBM."
+        ],
+        "tradeoffs": [
+          { "choice": "FP8 vs BF16", "pro": "2x peak throughput and half the memory traffic", "con": "Needs scaling and careful recipes; more prone to outlier saturation" },
+          { "choice": "FP4 (NVFP4/MXFP4)", "pro": "Another ~2x over FP8 on Blackwell; enables very cheap inference", "con": "Accuracy loss without good quantization; training in FP4 is still an emerging practice" },
+          { "choice": "Larger MMA tiles", "pro": "Higher efficiency per instruction and more data reuse", "con": "Odd-shaped or small matrices waste work (tile quantization)" },
+          { "choice": "Spending die area on tensor cores vs general cores", "pro": "Enormous gains for matmul-heavy AI workloads", "con": "Little benefit for non-matmul ops, so softmax, norms and elementwise ops become relatively bigger bottlenecks" }
+        ],
+        "numbers": [
+          { "metric": "H100 SXM dense tensor throughput", "value": "~989 TFLOPS BF16, ~1,979 TFLOPS FP8" },
+          { "metric": "B200 dense tensor throughput", "value": "~2.25 PFLOPS BF16, ~4.5 PFLOPS FP8, ~9 PFLOPS FP4" },
+          { "metric": "B300 (Blackwell Ultra) dense FP4", "value": "~15 PFLOPS" },
+          { "metric": "H100 FP32 (non-tensor) throughput", "value": "~67 TFLOPS, ~15x below BF16 tensor" },
+          { "metric": "AMD MI355X dense FP4/FP8", "value": "~10 PFLOPS FP4, ~5 PFLOPS FP8" },
+          { "metric": "Marketing 'sparse' numbers", "value": "~2x the dense figure, needs 2:4 structured sparsity" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Vendor peak numbers are often quoted with 2:4 structured sparsity, which doubles the headline; real dense workloads should use the dense figure, and sustained GEMM throughput is typically ~70-80% of dense peak on large shapes, partly because chips throttle clock speed under full tensor-core load to stay within power limits. Power, not area, is now the binding constraint: a B200 can hit its ~1 kW limit before its theoretical FLOPs.",
+          "Accumulation precision is a hidden variable. Hopper's FP8 tensor cores accumulate with reduced internal precision (DeepSeek measured ~14 bits), so long K dimensions lose accuracy unless partial sums are periodically promoted to FP32 in CUDA cores. Blackwell's tcgen05 instructions accumulate into Tensor Memory, a 256 KB per-SM store, which frees registers for epilogue fusion and allows larger tiles; the 2-CTA MMA variant lets two SMs cooperate on one 256-wide tile, halving per-SM shared-memory traffic for the B operand.",
+          "The ratio of tensor-core FLOPs to everything else keeps rising, which changes kernel design. On H100 the exponential in softmax runs on the special function units at a small fraction of matmul throughput, so FlashAttention-3 overlaps softmax of one tile with GEMMs of another, and FlashAttention-4 on Blackwell uses polynomial approximations of exp on FMA units plus smarter rescaling to keep tensor cores fed. Expect future attention variants and activation functions to be chosen partly for hardware friendliness."
+        ],
+        "failureModes": [
+          { "name": "Tensor cores not used at all", "description": "Matrices in FP32 without TF32 enabled, or dimensions not multiples of 8/16, fall back to slow CUDA-core paths. Fix: use BF16, set torch.backends.cuda.matmul.allow_tf32, pad dims to multiples of 64." },
+          { "name": "Tile and wave quantization", "description": "A dimension of 4,100 with 128-wide tiles needs 33 tiles, the last nearly empty; small batch GEMMs leave SMs idle. Fix: pick padded shapes like vocab 128,256 instead of odd sizes, use split-K or stream-K." },
+          { "name": "Low-precision accuracy collapse", "description": "FP8/FP4 quantization without good scaling causes divergence in training or quality drops in inference. Fix: finer-grained block scaling, keep sensitive layers higher precision, validate on evals." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA CUTLASS / CuTe", "note": "Open-source C++ (and since CUTLASS 4, Python CuTe DSL) templates that implement tensor-core GEMMs and attention for Hopper and Blackwell; the basis of many vendor and custom kernels." },
+          { "name": "cuBLAS / cuBLASLt", "note": "NVIDIA's tuned GEMM library supporting FP8 and block-scaled FP4 matmuls with fused epilogues; what PyTorch matmul calls by default." },
+          { "name": "Google TPU MXU", "note": "TPUs use large systolic matrix units (128x128 on most generations, 256x256 on Trillium) that are the TPU equivalent of tensor cores." }
+        ],
+        "questions": [
+          { "q": "A model's GEMMs hit only 30% of peak tensor throughput. What do you check?", "a": "Check shapes first: small or oddly sized matrices suffer tile and wave quantization, so pad to multiples of 128 and fuse small GEMMs or batch them. Then confirm the right precision path (BF16/FP8, not FP32) and that the kernel is compute-bound per the roofline. Finally profile clocks: power throttling can cap throughput, and memory-bound epilogues may dominate for skinny matrices." },
+          { "q": "Explain why block-scaled FP4 can work when plain FP4 fails.", "a": "FP4 E2M1 can represent only a handful of values, so one scale for a whole tensor wastes most of them on outliers. Giving each block of 16-32 values its own scale adapts the range locally, so each block uses its few levels well. Hardware applies scales inside the MMA, so there's no extra dequantization cost." },
+          { "q": "Why do chips advertise more FLOPs every generation for lower-precision formats specifically?", "a": "Multiplier area and energy grow roughly with the square of mantissa width, so halving bits gives roughly 2x or better throughput per area and per watt, and halves memory traffic. Since AI models tolerate low precision well with scaling, that's the cheapest way to more effective compute, more so than new process nodes alone." }
+        ]
+      },
+      "related": ["mixed-precision", "quantization", "kernel-optimization", "gpu-architecture", "accelerator-landscape", "llm-inference-basics"]
+    },
+    {
+      "id": "kernel-optimization",
+      "title": "Kernels, Fusion & the Roofline",
+      "gist": "A kernel is one program the GPU runs; making kernels fast means doing more math per byte of memory moved, combining steps, and keeping every unit busy.",
+      "overview": [
+        "A **kernel** is a small program launched on the GPU to perform one operation, such as a matrix multiply or adding two arrays. A model's forward pass is a sequence of hundreds of kernels. Whether a model runs at 20% or 70% of the hardware's capability depends mostly on how well those kernels are written and combined.",
+        "The key idea is the **roofline**. Every operation needs some math and some memory traffic. If it does lots of math per byte (like big matrix multiplies), it's limited by the chip's math speed. If it does little math per byte (like adding two arrays), it's limited by memory speed and the math units mostly sit idle. The ratio of math to memory is called **arithmetic intensity**.",
+        "The biggest win for memory-limited operations is **fusion**: combining several steps into one kernel so intermediate results stay on the chip. It's like a cook who chops, seasons and fries in one go instead of putting each ingredient back in the fridge between steps. Compilers like `torch.compile` do much of this automatically; the hardest cases, like attention, get hand-written kernels."
+      ],
+      "diagram": {
+        "caption": "Diagnosing a kernel with the roofline model.",
+        "steps": [
+          { "label": "Count FLOPs, bytes", "detail": "Arithmetic intensity = FLOPs / bytes" },
+          { "label": "Compare ridge point", "detail": "H100 ~295 FLOPs per byte" },
+          { "label": "Memory-bound?", "detail": "Fuse ops, reduce bytes moved" },
+          { "label": "Compute-bound?", "detail": "Use tensor cores, lower precision" },
+          { "label": "Profile and iterate", "detail": "Nsight Compute shows real limiter" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Roofline model", "role": "Performance = min(peak FLOPs, bandwidth x arithmetic intensity); tells you which resource limits a kernel and how far it is from the limit." },
+          { "name": "Kernel fusion", "role": "Merges elementwise, reduction and normalization steps (and GEMM epilogues) into one kernel so intermediates stay in registers or shared memory." },
+          { "name": "Kernel languages and DSLs", "role": "CUDA C++, CUTLASS/CuTe, Triton (Python, block-level), ThunderKittens, TileLang, and vendor equivalents (HIP, Pallas on TPU)." },
+          { "name": "Graph compilers", "role": "torch.compile (TorchInductor generates Triton), XLA, and TensorRT fuse ops and pick kernels automatically from the model graph." },
+          { "name": "CUDA Graphs", "role": "Record a sequence of kernel launches once and replay it, eliminating per-launch CPU overhead of a few microseconds each." },
+          { "name": "Profilers", "role": "Nsight Systems for timeline-level gaps and overlap, Nsight Compute for per-kernel roofline, stall reasons and memory efficiency; the PyTorch profiler for framework-level views." }
+        ],
+        "flow": [
+          "Profile the whole step with Nsight Systems or the PyTorch profiler to find where time goes: big GEMMs, attention, many small kernels, or idle gaps.",
+          "For each hot kernel, compute arithmetic intensity and compare to the hardware ridge point to classify it as memory- or compute-bound.",
+          "For memory-bound chains (norm, activation, residual add, dropout), fuse them with torch.compile or a custom Triton kernel.",
+          "For compute-bound GEMMs, ensure tensor-core-friendly shapes and precisions and good tile and rasterization choices (autotuning helps).",
+          "For launch-bound workloads like small-batch inference, capture CUDA Graphs or write persistent megakernels to remove CPU overhead.",
+          "Re-profile: confirm in Nsight Compute that the kernel now runs near its roofline limit, then move to the next bottleneck."
+        ],
+        "tradeoffs": [
+          { "choice": "Hand-written CUDA/CUTLASS vs Triton", "pro": "CUDA gives full control of TMA, warp specialization and new hardware features", "con": "Weeks of expert effort per kernel; Triton gets ~80-95% of the way in days" },
+          { "choice": "Aggressive fusion", "pro": "Fewer HBM round trips and launches", "con": "Bigger kernels use more registers, lower occupancy, and are harder to reuse and debug" },
+          { "choice": "Compiler auto-fusion (torch.compile)", "pro": "Large speedups (~1.3-2x typical) with one line of code", "con": "Compile time, graph breaks with dynamic shapes or Python side effects, and hard-to-debug recompiles" },
+          { "choice": "Recompute vs store", "pro": "Recomputing cheap values (FlashAttention recomputes attention in backward) saves memory traffic", "con": "Extra FLOPs, which only pay off when the op is memory-bound" }
+        ],
+        "numbers": [
+          { "metric": "H100 SXM ridge point (BF16 dense / HBM3)", "value": "~989 TFLOPS / 3.35 TB/s ~ 295 FLOPs per byte" },
+          { "metric": "Elementwise add arithmetic intensity (BF16)", "value": "~0.17 FLOPs per byte, deeply memory-bound" },
+          { "metric": "Kernel launch overhead", "value": "~3-10 microseconds of CPU time per launch" },
+          { "metric": "FlashAttention-3 on H100", "value": "~740 TFLOPS BF16 (~75% utilization), ~1.2 PFLOPS FP8" },
+          { "metric": "Large GEMM sustained efficiency", "value": "~70-80% of dense peak on H100" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The roofline has more than two roofs. Real kernels can be limited by L2 bandwidth, shared memory bandwidth, special function unit throughput (exp in softmax), instruction issue rate, or latency when there's too little parallelism. Hierarchical roofline analysis in Nsight Compute plots against each level. For attention on Hopper, the exp throughput roof is low enough that FlashAttention-3 pipelines softmax of one tile with the GEMMs of the next using warp specialization; it's a scheduling problem as much as a memory one.",
+          "Persistent kernels and megakernels are an increasingly important pattern. Instead of launching one block per tile, a persistent kernel launches one block per SM that loops over a work queue, which removes wave quantization, lets the epilogue of tile i overlap with the mainloop of tile i+1, and enables stream-K load balancing. Taken further, megakernels fuse an entire transformer forward pass into one launch (as shown by Hazy Research and the Mirage project in 2025) to eliminate inter-kernel bubbles in low-latency decoding.",
+          "Fusing communication with computation is the frontier for multi-GPU work. Rather than computing a GEMM then all-reducing, kernels can issue NVLink stores or NVSHMEM puts tile by tile as results are produced (e.g. Flux, TransformerEngine's userbuffers overlap, DeepSeek's DeepEP for MoE all-to-all). This hides communication that would otherwise serialize with compute in tensor and expert parallelism, at the cost of reserving SMs for communication and complex synchronization."
+        ],
+        "failureModes": [
+          { "name": "Launch-bound execution", "description": "Timeline shows tiny kernels separated by gaps; GPU utilization looks high-ish but throughput is poor, common in small-batch decoding. Fix: CUDA Graphs, fusion, persistent kernels, move Python overhead off the hot path." },
+          { "name": "torch.compile graph breaks and recompiles", "description": "Data-dependent Python control flow or changing shapes cause repeated recompiles and unfused fallbacks. Fix: inspect TORCH_LOGS=graph_breaks,recompiles, mark dynamic dims, remove .item() calls." },
+          { "name": "Optimizing the wrong kernel", "description": "Micro-tuning a GEMM that's 5% of runtime while data loading or communication stalls dominate. Fix: always start from an end-to-end timeline and Amdahl's law." }
+        ],
+        "realSystems": [
+          { "name": "FlashAttention (Dao et al.)", "note": "The canonical fusion success: FA2 for Ampere, FA3 for Hopper with TMA and warp specialization, FA4 for Blackwell; used in nearly every training and inference stack." },
+          { "name": "OpenAI Triton", "note": "Python DSL for block-level GPU kernels that compiles to NVIDIA and AMD GPUs; TorchInductor emits Triton for fused ops." },
+          { "name": "vLLM / SGLang / TensorRT-LLM kernels", "note": "Inference engines combining CUDA Graphs, fused attention (FlashInfer), quantized GEMMs and custom all-reduce kernels to cut decode latency." }
+        ],
+        "questions": [
+          { "q": "LayerNorm takes 15% of your training step. How do you speed it up?", "a": "LayerNorm is memory-bound: it reads and writes the activation with little math. Fuse it with neighbors (residual add before, the next matmul's input cast or quantization after) so the tensor is read once, using torch.compile or a fused Triton/Apex kernel. Using RMSNorm also removes the mean computation. The target is near-HBM-bandwidth time for one read and one write." },
+          { "q": "Is a 4096 x 4096 x 4096 BF16 matmul on H100 compute- or memory-bound?", "a": "FLOPs are 2 x 4096^3 ~ 1.37e11. Minimum bytes are three 4096^2 BF16 matrices ~ 100 MB. Intensity is ~1,365 FLOPs/byte, well above the ~295 ridge, so it's compute-bound and should run at ~0.14 ms near tensor-core peak." },
+          { "q": "Why does batch-size-1 LLM decoding barely benefit from a faster GPU's FLOPs?", "a": "Each decode step is matrix-vector products with intensity near 1 FLOP/byte, far below the ridge point, so runtime is HBM bandwidth plus kernel launch overhead. A newer GPU helps only via more bandwidth. Raising batch size, quantizing weights, CUDA Graphs and speculative decoding are the real levers." }
+        ]
+      },
+      "related": ["gpu-memory-hierarchy", "tensor-cores", "gpu-architecture", "batching", "speculative-decoding", "mixed-precision"]
+    },
+    {
+      "id": "interconnects",
+      "title": "Interconnects: PCIe, NVLink & InfiniBand",
+      "gist": "Big AI jobs use thousands of GPUs as one machine, so the wires between chips, within servers and across the data center decide how fast they can work together.",
+      "overview": [
+        "No single GPU can hold or train a frontier model, so thousands work together and constantly exchange data. The speed of those connections often decides how fast training goes, just as a team's productivity depends on how well its members communicate.",
+        "There are three tiers, like a city's transport system. **PCIe** is the local road connecting a GPU to its server's CPU, network cards and storage. **NVLink** is a private high-speed rail line between GPUs in the same server or rack, roughly 10-20x faster than PCIe. **InfiniBand** or high-end **Ethernet** is the highway network between racks across the whole data center, slower per GPU but reaching tens of thousands of machines.",
+        "Engineers design training jobs so the most talkative parts of the work stay on the fastest links. A newer trend makes the fast tier much bigger: NVIDIA's GB200 NVL72 rack connects 72 GPUs with NVLink so they act almost like one giant GPU."
+      ],
+      "diagram": {
+        "caption": "The three interconnect tiers, per GPU bandwidth.",
+        "steps": [
+          { "label": "PCIe Gen5 x16", "detail": "~64 GB/s each way, host link" },
+          { "label": "NVLink 5", "detail": "~1.8 TB/s, GPU-to-GPU scale-up" },
+          { "label": "NVSwitch domain", "detail": "8 GPUs HGX, 72 in NVL72" },
+          { "label": "Scale-out NIC", "detail": "400-800 Gb/s IB or RoCE" },
+          { "label": "Fat-tree fabric", "detail": "Rail-optimized, tens of thousands GPUs" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "PCIe", "role": "General-purpose serial bus linking GPUs to CPUs, NICs and NVMe; Gen5 x16 gives ~64 GB/s per direction, Gen6 doubles it." },
+          { "name": "NVLink and NVSwitch", "role": "NVIDIA's GPU-to-GPU link (NVLink 4 at 900 GB/s on H100, NVLink 5 at 1.8 TB/s on Blackwell) and switch chips that make all GPUs in a domain fully connected." },
+          { "name": "InfiniBand", "role": "Low-latency, lossless RDMA fabric (NVIDIA Quantum-2 NDR 400G, Quantum-X800 XDR 800G) with credit-based flow control and in-network reduction (SHARP)." },
+          { "name": "RoCEv2 / AI Ethernet", "role": "RDMA over converged Ethernet, used with tuned congestion control (Spectrum-X, Broadcom Tomahawk 5/6) and standardized further by the Ultra Ethernet Consortium spec 1.0 (2025)." },
+          { "name": "GPUDirect RDMA", "role": "Lets the NIC read and write GPU memory directly over PCIe, bypassing CPU memory copies." },
+          { "name": "Collective libraries", "role": "NCCL / RCCL choose ring, tree, NVLS or CollNet algorithms and topology-aware routes for all-reduce, all-gather and all-to-all." }
+        ],
+        "flow": [
+          "A training step finishes a layer and needs to all-reduce gradients; NCCL already knows the topology from discovery at startup.",
+          "Inside the server, GPUs exchange their portions over NVLink through NVSwitch, possibly with NVLink SHARP doing the reduction inside the switch.",
+          "For cross-node traffic, each GPU hands its data to its own dedicated NIC over PCIe via GPUDirect RDMA.",
+          "The NIC sends RDMA writes into a rail-optimized fabric: GPU 0 of every server connects to the same leaf switches, so most traffic crosses one hop.",
+          "Leaf and spine switches route packets; InfiniBand uses credits to avoid drops, while RoCE relies on PFC and ECN-based congestion control.",
+          "The receiving NIC writes directly into the remote GPU's memory and NCCL proceeds to the next chunk of the ring or tree."
+        ],
+        "tradeoffs": [
+          { "choice": "InfiniBand vs RoCE Ethernet", "pro": "InfiniBand is mature, lossless and low-latency out of the box", "con": "Single-vendor and pricier; Ethernet offers multi-vendor scale and familiar operations, now competitive with tuning (Meta trains on both)" },
+          { "choice": "Larger NVLink domains (NVL72)", "pro": "Tensor and expert parallelism over 72 GPUs at TB/s speeds", "con": "~120 kW liquid-cooled racks, copper cable spines, and one failed component can affect the whole rack" },
+          { "choice": "Full-bisection fat tree vs oversubscribed", "pro": "Any traffic pattern runs at full speed", "con": "Cost and power of optics and switches; many fabrics oversubscribe higher tiers to save money" },
+          { "choice": "Copper vs optics", "pro": "Copper is cheap, reliable and low power within a rack", "con": "Copper reaches only a few meters at 200G per lane; optics (and soon co-packaged optics) are needed beyond" }
+        ],
+        "numbers": [
+          { "metric": "H100 NVLink 4", "value": "~900 GB/s total per GPU (18 links)" },
+          { "metric": "B200 NVLink 5", "value": "~1.8 TB/s per GPU" },
+          { "metric": "GB200 NVL72 aggregate NVLink", "value": "~130 TB/s across 72 GPUs" },
+          { "metric": "PCIe 5.0 x16 / PCIe 6.0 x16", "value": "~64 / ~128 GB/s per direction" },
+          { "metric": "InfiniBand NDR / XDR per port", "value": "400 / 800 Gb/s (~50 / ~100 GB/s)" },
+          { "metric": "RDMA latency across a fabric", "value": "~1-3 microseconds vs ~sub-microsecond NVLink hops" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Rail-optimized topologies exploit the fact that NCCL pairs GPU i on one server with GPU i on another. Each of a server's 8 NICs connects to a different rail of leaf switches, so most all-reduce traffic stays within a rail, one switch hop away, and only cross-rail traffic climbs to the spine. When NVLink is available, PXN (PCIe x NVLink) routes data over NVLink to the GPU whose NIC is on the right rail before sending it out, avoiding expensive spine hops.",
+          "Congestion behaves very differently for AI traffic than for web traffic. Collectives produce synchronized, elephant flows with low entropy, so ECMP hashing frequently collides several flows onto one link while others sit idle. Mitigations include adaptive routing and packet spraying (Spectrum-X, UEC transport), multiple queue pairs per connection to raise entropy, and careful PFC/DCQCN tuning to avoid head-of-line blocking and PFC storms on RoCE. Meta's 24K-GPU RoCE and InfiniBand clusters both reached similar performance after this tuning.",
+          "The scale-up versus scale-out boundary is a core architectural choice in 2025-2026. NVIDIA pushes ever-larger NVLink domains (NVL72 now, NVL144 and beyond with Rubin), and NVLink Fusion opens it to third-party CPUs and accelerators. The rest of the industry formed UALink (1.0 spec in 2025, 200G per lane, up to 1,024 accelerators) as an open scale-up alternative, while Google's TPU pods use direct chip-to-chip ICI links in a 3D torus reconfigured by optical circuit switches. Bigger scale-up domains mostly benefit MoE all-to-all and tensor parallelism."
+        ],
+        "failureModes": [
+          { "name": "Flapping or degraded links", "description": "A marginal optic or cable drops to lower speed or flaps, silently slowing every collective that crosses it. Fix: monitor link error counters and speeds, run nccl-tests on burn-in, replace optics proactively." },
+          { "name": "ECMP hash collisions", "description": "Synchronized large flows land on the same uplinks; observed bus bandwidth is a fraction of line rate and varies run to run. Fix: adaptive routing, more QPs, rail-aligned job placement." },
+          { "name": "PCIe topology mistakes", "description": "GPU and its NIC sit under different PCIe switches or CPU sockets, so GPUDirect traffic crosses the inter-socket link. Fix: verify with nvidia-smi topo -m and pin GPU/NIC pairs that share a switch." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA GB200 / GB300 NVL72", "note": "Rack-scale systems with 72 Blackwell GPUs and 36 Grace CPUs on one NVLink fabric, designed for trillion-parameter MoE training and inference." },
+          { "name": "Meta 24K-GPU H100 clusters", "note": "Two otherwise identical clusters, one on RoCE (Arista) and one on InfiniBand, used for Llama 3; both tuned to similar collective performance." },
+          { "name": "xAI Colossus", "note": "~100K-200K H100/H200 GPUs on NVIDIA Spectrum-X Ethernet, showing RoCE-based fabrics at six-figure GPU scale." }
+        ],
+        "questions": [
+          { "q": "Why put tensor parallelism inside a node and data parallelism across nodes?", "a": "Tensor parallelism all-reduces activations twice per layer, every micro-batch, which needs NVLink-class bandwidth (~900 GB/s) and microsecond latency. Data parallelism exchanges gradients once per step and can overlap with backward, so it tolerates the ~50 GB/s per GPU of a 400G NIC. Mapping the chattiest dimension to the fastest link minimizes exposed communication time." },
+          { "q": "Estimate the time to all-reduce 10 GB of gradients across 1,024 GPUs with 400 Gb/s NICs.", "a": "Ring all-reduce sends ~2 x 10 GB = 20 GB per GPU. At ~50 GB/s that's ~0.4 seconds, or less with hierarchical schemes that reduce inside NVLink first so each NIC carries only part of the traffic. It's hidden if backward compute per step is several seconds and overlap works." },
+          { "q": "InfiniBand or Ethernet for a new 32K-GPU cluster?", "a": "Both work at this scale today. InfiniBand gives lossless, low-latency behavior and SHARP with less tuning, but locks you into one vendor. Ethernet (RoCE with Spectrum-X or Tomahawk-class switches and UEC-style transport) offers multi-vendor supply, existing operational tooling and lower cost, at the price of congestion-control tuning. Many hyperscalers now choose Ethernet; many neoclouds still choose InfiniBand for time to production." }
+        ]
+      },
+      "related": ["datacenter-networking", "data-parallelism", "model-parallelism", "tcp-ip", "accelerator-landscape", "load-balancing"]
+    },
+    {
+      "id": "accelerator-landscape",
+      "title": "TPUs & Other Accelerators",
+      "gist": "NVIDIA GPUs dominate AI, but Google's TPUs, AMD's GPUs, Amazon's Trainium and novel designs from Cerebras and Groq compete by specializing for matrix math.",
+      "overview": [
+        "GPUs were originally graphics chips that turned out to be great at AI. Other companies asked: what if you designed a chip *only* for neural networks? The result is a family of **accelerators** that drop graphics features and spend almost all their silicon on matrix math and memory.",
+        "Google's **TPU** (Tensor Processing Unit) is the most mature alternative. At its heart is a **systolic array**: a grid of tiny multipliers where numbers pulse through like blood through a heart, each cell multiplying and passing results to its neighbor. TPUs are linked directly to each other into pods of thousands of chips. Amazon's **Trainium**, AMD's **Instinct** GPUs, and startups like **Cerebras** (one chip the size of a dinner plate) and **Groq** (all memory on-chip for fast responses) each make different bets.",
+        "Hardware alone doesn't win. NVIDIA's real advantage is **CUDA**, nearly two decades of software, libraries and developer habits. Any competitor must make popular frameworks like PyTorch and JAX run fast on its chip without users rewriting their code, which is why software stacks are as important as transistor counts."
+      ],
+      "diagram": {
+        "caption": "Spectrum of AI accelerator designs, general to specialized.",
+        "steps": [
+          { "label": "NVIDIA / AMD GPUs", "detail": "Programmable SIMT plus tensor cores" },
+          { "label": "Google TPU", "detail": "Systolic arrays, compiler-driven, torus pods" },
+          { "label": "AWS Trainium", "detail": "Systolic engines, Neuron SDK" },
+          { "label": "Cerebras wafer", "detail": "Whole-wafer chip, 44 GB SRAM" },
+          { "label": "Groq LPU", "detail": "Deterministic dataflow, SRAM-only inference" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Systolic array (MXU)", "role": "A 2D grid of multiply-accumulate cells (128x128 on most TPUs, 256x256 on Trillium) through which weights and activations flow rhythmically, giving huge reuse with minimal control logic." },
+          { "name": "XLA compiler", "role": "Compiles JAX, TensorFlow and PyTorch/XLA graphs into TPU (and GPU) programs, handling fusion, layout and sharding (GSPMD) statically." },
+          { "name": "Inter-chip interconnect (ICI)", "role": "TPU chips connect directly to neighbors in a 3D torus, with optical circuit switches (OCS) reconfiguring slices of pods without a packet-switched network." },
+          { "name": "AWS Neuron SDK", "role": "Compiler and runtime mapping PyTorch/JAX onto Trainium and Inferentia NeuronCores, plus NKI for custom kernels." },
+          { "name": "AMD ROCm", "role": "AMD's open GPU software stack (HIP, rocBLAS, hipBLASLt, RCCL, Composable Kernel) with upstream PyTorch, vLLM and SGLang support." },
+          { "name": "Wafer-scale / SRAM-centric designs", "role": "Cerebras WSE-3 and Groq LPU keep weights in on-chip SRAM for extreme bandwidth, trading capacity for latency." }
+        ],
+        "flow": [
+          "A model is written in PyTorch or JAX; the framework traces it into a computation graph.",
+          "The backend compiler (CUDA libraries plus Inductor, XLA, Neuron, ROCm) lowers ops to the target's matrix units, vector units and memory hierarchy.",
+          "Sharding annotations or a parallelism library map the graph onto many chips: an NVLink domain plus InfiniBand, a TPU torus slice, or a Trainium UltraServer.",
+          "At runtime, matrix units do the bulk of FLOPs while vector or scalar units handle softmax, norms and control.",
+          "Chips exchange activations and gradients over their native interconnect using the platform's collective library (NCCL, RCCL, ICI collectives, Neuron CC).",
+          "Operators the compiler doesn't support well fall back to slower paths or need custom kernels (CUDA, HIP, Pallas, NKI), which is where most porting effort goes."
+        ],
+        "tradeoffs": [
+          { "choice": "General GPU vs specialized ASIC", "pro": "ASICs like TPU and Trainium can deliver better cost and power per useful FLOP for their target workloads", "con": "Less flexibility for new model architectures and a much smaller software ecosystem" },
+          { "choice": "Compiler-driven (XLA) vs kernel-driven (CUDA)", "pro": "Whole-program compilation enables global fusion and automatic sharding", "con": "Dynamic shapes and unusual ops are harder; you rely on the compiler team for performance" },
+          { "choice": "Torus (TPU ICI) vs switched fabric", "pro": "Torus avoids expensive switches and scales to ~9K chips per pod", "con": "Bandwidth between distant chips is multi-hop; topology-aware sharding is mandatory" },
+          { "choice": "SRAM-only (Groq, Cerebras) vs HBM", "pro": "Very low latency and high tokens/second per user for inference", "con": "Limited capacity means hundreds of chips for one large model, and weak economics for training" }
+        ],
+        "numbers": [
+          { "metric": "Google TPU v5p", "value": "~459 TFLOPS BF16, 95 GB HBM, pods of 8,960 chips" },
+          { "metric": "Google TPU v7 Ironwood (2025)", "value": "~4.6 PFLOPS FP8, 192 GB HBM3e at ~7.4 TB/s, pods of 9,216 chips" },
+          { "metric": "AMD Instinct MI355X (2025)", "value": "288 GB HBM3e at ~8 TB/s" },
+          { "metric": "AWS Trainium2", "value": "96 GB HBM, ~1.3 PFLOPS dense FP8; 64-chip Trn2 UltraServers" },
+          { "metric": "Cerebras WSE-3", "value": "~4T transistors, ~900K cores, 44 GB on-chip SRAM" },
+          { "metric": "NVIDIA share of AI accelerator spend", "value": "~80%+ of merchant market (estimates)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "TPU pods' optical circuit switches are an underappreciated advantage: the OCS layer can carve a 4,096 or 9,216-chip pod into arbitrary torus or twisted-torus slices, route around failed racks without rewiring, and give each job a topology matched to its sharding. Combined with XLA's static compilation (GSPMD and the Shardy partitioner), Google trains Gemini across multiple pods with data-center-scale multislice training over DCN between pods, a different philosophy from NVIDIA's larger-switch approach.",
+          "Total cost of ownership is the comparison that matters, not peak FLOPs. Buyers weigh achieved MFU on their workloads, HBM capacity (AMD has often led here, which helps serving large models on fewer chips), power per rack, availability, and engineering cost to port and maintain kernels. Anthropic, for example, trains and serves on a mix of Google TPUs, AWS Trainium (Project Rainier, hundreds of thousands of Trainium2 chips) and NVIDIA GPUs, which requires a portable software stack and per-platform kernel work.",
+          "The 2026 roadmaps show convergence on the same ideas: HBM4 with 2048-bit interfaces, block-scaled FP4/FP8 formats (OCP MX), rack-scale scale-up domains (NVIDIA Vera Rubin NVL144, AMD's MI400-based Helios rack with UALink, Trainium3 UltraServers), and liquid cooling at 100-200 kW per rack. Differentiation is shifting to software maturity, interconnect scale, and supply of HBM and advanced packaging (TSMC CoWoS), which constrain how many chips anyone can actually ship."
+        ],
+        "failureModes": [
+          { "name": "Software gap on porting", "description": "A model runs on a new accelerator but at a fraction of expected speed because key ops (custom attention variants, MoE routing) fall back to slow paths. Fix: budget kernel work, prefer standard architectures, test early on target hardware." },
+          { "name": "Compiler recompilation storms", "description": "On XLA/Neuron, changing input shapes trigger expensive recompiles that stall serving or training. Fix: bucket sequence lengths, pad to fixed shapes, cache compiled programs." },
+          { "name": "Benchmark-driven procurement", "description": "Choosing hardware on peak or vendor-tuned benchmark numbers that don't reflect your model mix and scale. Fix: run your own representative workloads at realistic cluster size, including communication." }
+        ],
+        "realSystems": [
+          { "name": "Google TPU (v5e, v5p, Trillium, Ironwood)", "note": "Powers Gemini training and serving and is rented on Google Cloud; Ironwood (v7) is the first TPU marketed primarily for inference." },
+          { "name": "AWS Trainium2 / Project Rainier", "note": "Amazon's training chip deployed at very large scale, including an ~hundreds-of-thousands-chip cluster built for Anthropic." },
+          { "name": "AMD Instinct MI300X / MI355X", "note": "Deployed by Microsoft, Meta, Oracle and others, especially for inference where large HBM capacity lets big models fit on fewer GPUs." }
+        ],
+        "questions": [
+          { "q": "Why can a TPU pod scale without the big InfiniBand fabric GPUs need?", "a": "TPUs have ICI links built into each chip that connect directly to torus neighbors, so chips talk without NICs or packet switches; optical circuit switches only reconfigure connections between racks. Collectives map onto torus dimensions, and XLA knows the topology at compile time. The tradeoff is multi-hop latency between distant chips and less flexibility for irregular traffic like MoE all-to-all." },
+          { "q": "Your company wants to cut inference costs by 40% by moving off NVIDIA. How do you evaluate options?", "a": "Benchmark your actual models at production batch sizes and latency SLOs on candidates (AMD MI355X, TPU, Trainium/Inferentia), measuring cost per million tokens including power and engineering effort. Check framework support (vLLM/SGLang on ROCm, JAX/vLLM on TPU, Neuron), quantization formats and availability. Often a hybrid fleet with a portable serving layer is the realistic outcome." },
+          { "q": "What's the core idea of a systolic array, and why is it efficient?", "a": "Operands enter the edges of a grid of MAC units and move one cell per cycle; each cell multiplies, adds to a partial sum, and passes data along. Each value loaded from memory is reused across a whole row or column of the grid, so memory bandwidth per FLOP is tiny and almost no control logic is needed. The downside is rigidity: it's ideal for dense matmuls and poor for irregular work." }
+        ]
+      },
+      "related": ["tensor-cores", "interconnects", "gpu-architecture", "serving-fleet", "quantization", "av-safety"]
+    }
+  ]
+}

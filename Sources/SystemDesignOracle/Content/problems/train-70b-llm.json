@@ -1,0 +1,173 @@
+{
+  "id": "train-70b-llm",
+  "title": "Pre-training a 70B LLM on 2,000 GPUs",
+  "domain": "ml-training",
+  "prompt": "Design the system to pre-train a 70B-parameter language model on ~15T tokens using a cluster of ~2,000 GPUs. Cover parallelism, data pipeline, fault tolerance, and how you know training is healthy.",
+
+  "gist": "Shard the model with 8-way tensor parallel inside nodes, pipeline across nodes, and sharded data parallel across the rest; stream packed tokens; checkpoint asynchronously every ~30 minutes; and watch loss, gradient norms and MFU continuously.",
+
+  "overview": [
+    "Training a 70B model on 15T tokens takes about 6.3e24 floating-point operations, which is around three months of work for 2,000 H100-class GPUs running well. No single GPU can hold the model and its optimizer state (about 1.1 TB), so the job is as much a distributed-systems problem as an ML one: split the model across GPUs, keep all of them busy, and survive the hardware failures that will happen every day.",
+    "The model is split three ways. Within a server, eight GPUs share each layer's matrices (tensor parallelism) over fast NVLink. Across a few servers, the layers are divided into stages like an assembly line (pipeline parallelism). Then the whole arrangement is copied 64 times, each copy processing different data, with gradients averaged every step (data parallelism) and the optimizer state sharded across copies.",
+    "Data arrives as pre-tokenized, deduplicated, quality-filtered shards mixed in planned proportions (web, code, math, multilingual), packed into fixed-length sequences, and read in a deterministic order so a restart resumes exactly where it stopped.",
+    "Something breaks roughly every day at this scale: a GPU, a NIC, a cable, a silent numerical error. The system detects failures fast, swaps in spare nodes, and resumes from a recent checkpoint, losing minutes rather than hours. Health is judged by a dashboard of loss, gradient norm, throughput and periodic benchmark evals, compared against predictions from smaller pilot runs."
+  ],
+
+  "diagram": {
+    "caption": "The training system: data in, sharded model in the middle, checkpoints and telemetry out.",
+    "steps": [
+      { "label": "Data pipeline", "detail": "dedup, filter, mix, tokenize, pack 8k sequences" },
+      { "label": "Loaders", "detail": "deterministic, resumable shard readers per DP rank" },
+      { "label": "3D-parallel model", "detail": "TP=8 × PP=4 × DP=64 on 2,048 GPUs" },
+      { "label": "Optimizer step", "detail": "AdamW, ZeRO-1 sharded, BF16/FP8 compute" },
+      { "label": "Async checkpoints", "detail": "~1 TB every ~30 min to object storage" },
+      { "label": "Health monitoring", "detail": "loss, grad norm, MFU, evals, node health" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Train a ~70B dense decoder-only transformer (e.g. 80 layers, d_model 8192, GQA with 8 KV heads) on ~15T tokens with a planned data mixture and an 8k context, with a later long-context extension phase.",
+      "Resume bit-exactly (same data order, RNG state, optimizer state) after any failure.",
+      "Support changing the data mixture, learning-rate schedule and cluster size mid-run without restarting from scratch.",
+      "Produce evaluation checkpoints regularly and report quality metrics automatically."
+    ],
+    "nonFunctional": [
+      "Efficiency: MFU of 40%+ (BF16) on H100-class hardware; goodput (useful training time ÷ wall time) above 90%.",
+      "Fault tolerance: recover from a node failure in under ~10–15 minutes, losing at most one checkpoint interval of work.",
+      "Reproducibility and auditability: every token's provenance, every config change and every rollback is logged.",
+      "Cost: on the order of 4–5M GPU-hours; every 1% of MFU is roughly 40k GPU-hours."
+    ],
+    "estimates": [
+      { "metric": "Training compute", "value": "6 × 70e9 params × 15e12 tokens ≈ 6.3e24 FLOPs" },
+      { "metric": "Wall-clock time", "value": "2,048 H100 × 989 TFLOPS × 40% MFU ≈ 8.1e17 FLOP/s → 6.3e24 ÷ 8.1e17 ≈ 7.8e6 s ≈ 90 days (B200-class or FP8: ~40–60 days)" },
+      { "metric": "Model + optimizer state", "value": "70B × 16 bytes (BF16 weights + grads, FP32 master + Adam m, v) ≈ 1.1 TB" },
+      { "metric": "Global batch and steps", "value": "~16M tokens/step (2,048 × 8,192) → 15e12 ÷ 16e6 ≈ 940k steps at ~8 s/step" },
+      { "metric": "Data volume", "value": "15T tokens × 4 bytes (uint32 ids) ≈ 60 TB tokenized; read rate only ~2M tokens/s ≈ 8 MB/s" },
+      { "metric": "Failure rate", "value": "Llama 3 saw ~1 interruption per 3 h on 16k GPUs → roughly 1 per day on 2k GPUs" }
+    ]
+  },
+
+  "stages": [
+    {
+      "name": "Cluster and model shape",
+      "summary": "Fix the hardware topology and model architecture first, because the parallelism plan has to fit both.",
+      "points": [
+        "**Hardware**: 256 nodes × 8 GPUs (H100/H200 or B200), NVLink/NVSwitch inside a node (~900 GB/s per H100), 8× 400 Gb/s InfiniBand or RoCE NICs per node on a rail-optimized, non-blocking fat tree.",
+        "**Spares**: hold ~3–5% extra nodes (8–16) hot so a failed node is replaced without waiting for repair.",
+        "**Architecture**: Llama-style dense transformer: 80 layers, d_model 8192, FFN ~28k with SwiGLU, 64 query heads and 8 KV heads (GQA), RoPE, RMSNorm, vocab ~128k.",
+        "**Chinchilla check**: compute-optimal would be ~20 tokens/param ≈ 1.4T tokens; 15T (~200 tokens/param) deliberately over-trains for a cheaper, stronger model at inference time.",
+        "**Storage**: a parallel filesystem or object store (Lustre / VAST / S3-compatible) with tens of GB/s aggregate write bandwidth for checkpoints, plus local NVMe on each node."
+      ],
+      "deepDive": [
+        "Choose shapes that are friendly to hardware: hidden sizes and head dimensions multiples of 128 for tensor cores, layers divisible by the pipeline stage count, and heads divisible by the tensor-parallel degree (64 query heads ÷ 8 = 8 per GPU; 8 KV heads ÷ 8 = 1 per GPU). A pilot ladder of smaller models (e.g. 1B, 3B, 8B) on the same data and recipe fits scaling laws that predict the final 70B loss within a few hundredths of a nat; that prediction becomes the yardstick for 'is training healthy?'."
+      ]
+    },
+    {
+      "name": "Parallelism",
+      "summary": "Use 3D parallelism (tensor × pipeline × data) mapped onto the network topology, with sharded optimizer state and activation recomputation to fit memory.",
+      "points": [
+        "**Tensor parallel (TP=8)** within a node: split attention heads and FFN columns/rows (Megatron style); needs ~4 all-reduces of activations per layer per micro-batch, so it must stay on NVLink. Add sequence parallelism to shard LayerNorm/dropout activations too.",
+        "**Pipeline parallel (PP=4)** across nodes: 20 layers per stage; 1F1B interleaved schedule with virtual stages to shrink the bubble. With 32 micro-batches per replica, bubble ≈ (p−1)/(m+p−1) = 3/35 ≈ 9%, about half that interleaved.",
+        "**Data parallel (DP=64)**: 8 × 4 × 64 = 2,048 GPUs; gradients reduce-scattered and parameters all-gathered with ZeRO-1 (optimizer state sharded), overlapped with backward compute.",
+        "**Memory per GPU**: 70B ÷ 32 (TP×PP) ≈ 2.2B params → ~8.8 GB BF16 weights + grads, ~26 GB FP32 master + Adam ÷ 64 DP shards ≈ 0.4 GB, leaving room for activations with selective recomputation on an 80 GB GPU.",
+        "**Alternative**: FSDP/ZeRO-3 (+TP) avoids the pipeline bubble and is simpler; at 2k GPUs it is viable but costs more network traffic per step, so TP+PP+ZeRO-1 is the common high-MFU choice.",
+        "**Long context**: for the 32k–128k extension phase, add context parallelism (ring attention) across GPUs rather than shrinking batch."
+      ],
+      "deepDive": [
+        "Map parallel dimensions to bandwidth: TP traffic is the heaviest and latency-sensitive (per layer, all-reduce of a micro-batch's activations: 8,192 tokens × 8,192 × 2 bytes ≈ 134 MB, several times per layer), so it gets NVLink. PP sends only one activation tensor between stages, point-to-point, so it tolerates the inter-node network. DP all-reduce is large (2.2B params × 2 bytes ≈ 4.4 GB per GPU per step) but happens once per step and overlaps with backward; at ~45 GB/s effective per GPU, a reduce-scatter plus all-gather takes ~0.2 s against an ~8 s step. Placing DP groups so each rail's traffic stays on its own leaf switch avoids spine congestion.",
+        "Throughput tuning is empirical: sweep micro-batch size, number of virtual pipeline stages, recompute granularity (recompute only attention softmax and activations of cheap ops) and communication bucket sizes, measuring MFU on a 64–128 node slice before the real run. Use FP8 matmuls (Transformer Engine with delayed or per-block scaling) for a further 1.3–1.5× if stability holds in pilot runs; DeepSeek-V3 showed FP8 is viable at scale with fine-grained scaling."
+      ]
+    },
+    {
+      "name": "Data pipeline",
+      "summary": "Build the 15T-token corpus offline, then stream packed sequences deterministically so any restart resumes at the exact token.",
+      "points": [
+        "**Offline processing** (Spark/Ray on CPUs): extract text from Common Crawl and other sources, language ID, heuristic and model-based quality filters, PII scrubbing, toxicity filtering, and decontamination against eval benchmarks.",
+        "**Deduplication**: exact (hash) and near-duplicate (MinHash LSH over 5-grams) at document level; dedup removes 30–50% of web data and measurably improves quality.",
+        "**Mixture**: e.g. ~50% general web, ~17% code, ~25% math/reasoning, ~8% multilingual, tuned with small proxy runs; upweight high-quality sources in the final annealing phase.",
+        "**Tokenize once**, store as uint32 token arrays in large shards (~60 TB total), with an index of document boundaries; pack documents into 8,192-token sequences with document-masking so attention does not cross documents.",
+        "**Deterministic loader**: each DP rank reads a seeded permutation of shard offsets; the loader state is just (epoch, global step), so resume needs no replay. Prefetch to local NVMe; bandwidth needed is tiny (~8 MB/s total).",
+        "**Lineage**: record which shard and offset every step consumed so a loss spike can be traced to its data."
+      ],
+      "deepDive": [
+        "Data quality is the biggest quality lever after scale. Model-based classifiers (e.g. a small model trained to recognize 'educational' text, as in FineWeb-Edu or DCLM) consistently beat heuristic filters. The final few percent of training (annealing with a decaying learning rate on the highest-quality data, including math and code) gives outsized benchmark gains, which is why the schedule and mixture are planned together. Keep the data mixture versioned and change it only at well-defined step boundaries so analysis stays clean."
+      ]
+    },
+    {
+      "name": "Training recipe and stability",
+      "summary": "Pick a recipe that is known to be stable at scale and add guardrails for the loss spikes that will still happen.",
+      "points": [
+        "**Optimizer**: AdamW (β1 0.9, β2 0.95, weight decay 0.1), gradient clipping at 1.0, peak LR ~1.5e-4 for 70B with ~2k-step warmup, then cosine or warmup-stable-decay (WSD) schedule.",
+        "**Batch ramp**: start at ~4M tokens/step and grow to ~16M as loss drops, improving early stability and sample efficiency.",
+        "**Precision**: BF16 activations and weights with FP32 master weights and FP32 reductions; optional FP8 GEMMs with per-tensor or per-block scaling.",
+        "**Stability tricks**: z-loss on the output logits, QK-norm or logit soft-capping, no bias terms, careful init scaling with depth.",
+        "**Spike handling**: automatically skip a batch whose loss or grad norm exceeds k× the running mean; if spikes persist, roll back to the last good checkpoint, and skip or reorder the offending data."
+      ],
+      "deepDive": [
+        "Loss spikes at scale usually come from a few attention logits or output logits blowing up, Adam's second-moment estimate lagging behind a sudden gradient change, or bad data (long runs of repeated tokens, binary garbage). Diagnose with per-layer gradient and activation norms plus the data lineage for the spiking step. Fixes that work: lower β2 or larger ε, QK-norm, lower LR, removing bad data, and rewinding a few hundred steps with a different data order. The OPT-175B logbook is the classic record of how painful this is without these guardrails."
+      ]
+    },
+    {
+      "name": "Fault tolerance and checkpointing",
+      "summary": "Expect about one failure per day, detect it in minutes, replace hardware from a spare pool, and restart from a checkpoint no more than ~30 minutes old.",
+      "points": [
+        "**Checkpoint size**: BF16 weights 140 GB + FP32 master and Adam state 840 GB ≈ 1 TB; written sharded, each of 2,048 ranks writes ~0.5 GB in parallel.",
+        "**Asynchronous checkpointing**: copy state to pinned host memory in a few seconds, resume training, and flush to storage in the background; keep the last few in memory/local NVMe and every Nth durably in object storage.",
+        "**Interval**: optimal interval ≈ √(2 × checkpoint cost × MTBF) (Young/Daly); with ~10 s blocking cost and a 24 h MTBF, that is ~20–40 minutes; checkpoint every ~30 min.",
+        "**Detection**: NCCL watchdog timeouts, heartbeats from each rank, ECC/Xid error monitoring, NIC link flaps; a controller kills the job, cordons the bad node and swaps in a spare.",
+        "**Pre-flight checks**: before any (re)start, run quick GPU burn-in, NCCL all-reduce bandwidth tests and memory tests on all nodes, which catches most bad hardware before it wastes a run.",
+        "**Silent data corruption**: periodically recompute a step on two replicas and compare, or track per-rank gradient checksums, since a faulty GPU can produce wrong numbers without crashing."
+      ],
+      "deepDive": [
+        "Goodput is the real metric: wall time lost = detection time + restart time + recomputed work (on average half the checkpoint interval). If restart takes 10 minutes and the interval is 30 minutes, each failure costs ~25 minutes; at one per day that is ~2% of the run. The biggest wins come from fast restarts: keep the process group warm, preload the container and data, load checkpoints from peers' host memory instead of remote storage, and use elastic training so the job can continue at reduced DP size while a node is replaced. Meta reported ~419 unexpected interruptions over 54 days of Llama 3 training on 16k GPUs, ~78% hardware related, and still achieved over 90% effective training time with this kind of automation."
+      ]
+    },
+    {
+      "name": "Health monitoring and evaluation",
+      "summary": "Know training is healthy by comparing live signals against scaling-law predictions and by running automatic evals on checkpoints.",
+      "points": [
+        "**Every step**: training loss, gradient norm, learning rate, tokens/s, MFU, step time per rank (to find stragglers), and loss scale or FP8 amax statistics.",
+        "**Every few hundred steps**: per-layer weight, gradient and activation norms; attention logit maxima; fraction of steps clipped.",
+        "**Held-out loss** on fixed validation sets per domain (web, code, math, multilingual), which catches mixture problems the training loss hides.",
+        "**Checkpoint evals** every ~1–2k steps on a fixed suite: MMLU, HellaSwag, ARC, GSM8K, HumanEval/MBPP, long-context retrieval; small-model-friendly cloze formats early in training.",
+        "**Compare to prediction**: the loss curve should track the scaling-law fit from pilot runs; a persistent gap means a bug (data, LR, or numerics), not bad luck.",
+        "**Infrastructure health**: per-node GPU temperature, power and clocks, NIC errors and NCCL bandwidth; a single slow GPU throttles all 2,048."
+      ],
+      "deepDive": [
+        "Stragglers are a quiet MFU killer: synchronous training runs at the speed of the slowest rank, and a GPU with a degraded HBM or a thermally throttled node can cost 5–10% across the cluster. Collect per-rank compute and communication timings each step, flag ranks consistently above the median, and evict them. Similarly, a drop in MFU after a restart often means a bad node or a changed NCCL algorithm. Treat the run like a production service: on-call rotation, runbooks, and alerting on loss divergence from the prediction band."
+      ]
+    }
+  ],
+
+  "tradeoffs": [
+    { "choice": "TP + PP + ZeRO-1 vs FSDP/ZeRO-3", "pro": "Highest MFU at this scale; communication matched to topology; less traffic per step.", "con": "Pipeline bubbles, more complex scheduling and checkpoint resharding; FSDP is simpler and more flexible." },
+    { "choice": "BF16 vs FP8 compute", "pro": "FP8 gives ~1.3–1.5× throughput and less memory traffic, saving weeks.", "con": "Higher risk of instability and subtle quality loss; needs careful scaling and pilot validation." },
+    { "choice": "Frequent vs infrequent checkpoints", "pro": "Frequent checkpoints lose less work per failure.", "con": "Each checkpoint stalls training and loads storage; async checkpointing shrinks but does not remove the cost." },
+    { "choice": "Over-training (15T tokens) vs compute-optimal (~1.4T)", "pro": "A smaller model that is far better per parameter, much cheaper to serve.", "con": "~10× more training compute than compute-optimal for the same loss at a larger size; diminishing returns per token." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Loss spikes and divergence", "description": "Sudden loss jumps from logit growth, bad data or optimizer state lag; can kill the run if unhandled. Mitigate with z-loss, QK-norm, clipping, batch skipping and checkpoint rollback." },
+      { "name": "Hung collectives", "description": "One rank stalls (bad NIC, deadlock), and all 2,048 GPUs wait silently. NCCL watchdogs with short timeouts and per-rank heartbeats turn hangs into fast restarts." },
+      { "name": "Silent data corruption", "description": "A faulty GPU computes wrong values without errors, corrupting gradients across the cluster. Detect via redundant computation, gradient checksums and anomaly detection on per-rank norms." },
+      { "name": "Data loader bugs", "description": "Repeated or skipped shards after a resume, or a mixture drifting from plan, quietly degrade the model. Deterministic indexing, lineage logs and per-domain held-out loss catch it." }
+    ],
+    "realSystems": [
+      { "name": "Meta Llama 3 / 3.1", "note": "70B and 405B trained on ~15T tokens with 4D parallelism (TP, PP, CP, FSDP) on up to 16k H100s; documented interruptions and goodput." },
+      { "name": "NVIDIA Megatron-LM / NeMo and PyTorch TorchTitan", "note": "Reference implementations of tensor, pipeline, context and FSDP parallelism with async distributed checkpointing." },
+      { "name": "DeepSeek-V3", "note": "671B MoE trained in ~2.8M H800 GPU-hours with FP8 mixed precision and DualPipe, showing communication-aware design." },
+      { "name": "ByteDance MegaScale", "note": "Production system paper on training at 10k+ GPUs with 55% MFU, focused on diagnostics and fault tolerance." }
+    ],
+    "questions": [
+      { "q": "Why put tensor parallelism inside a node and not across nodes?", "a": "TP needs several all-reduces of activations in every layer, on the critical path. NVLink gives ~900 GB/s per GPU versus ~50 GB/s over InfiniBand, so TP across nodes would make the GPUs wait on the network. Pipeline and data parallel traffic is smaller or overlappable, so they go across nodes." },
+      { "q": "Your MFU dropped from 42% to 35% after a restart. How do you debug it?", "a": "Compare per-rank step timings to find a straggler (degraded GPU, throttled node, bad link), run NCCL bandwidth tests across the new node set, check the network placement of the replacement node, and confirm configs did not change (micro-batch, recompute, NCCL algorithm). Evict or move the slow node." },
+      { "q": "How do you pick the checkpoint interval?", "a": "Balance checkpoint overhead against expected lost work using Young/Daly: interval ≈ √(2 × checkpoint cost × MTBF). With async checkpoints costing ~10 s of stall and failures roughly daily, that gives ~30 minutes; shorten it if failure rates rise." },
+      { "q": "How would you know the run is going wrong before the final evals?", "a": "Loss tracking above the scaling-law prediction band, rising gradient norm or clipping rate, held-out loss on one domain diverging, attention logit growth, and early-eval scores lagging smaller-model trajectories. Any of these triggers investigation before more compute is spent." },
+      { "q": "What changes if you get B200s instead of H100s?", "a": "~2.3× BF16 FLOPs, more HBM (192 GB) and NVLink 5 with larger NVLink domains (NVL72). You could use smaller TP or drop pipeline parallelism, larger micro-batches, and finish in ~40 days; communication becomes relatively more expensive, so overlap matters more." }
+    ]
+  },
+
+  "related": [ "model-parallelism", "data-parallelism", "checkpointing", "training-data-pipeline", "mixed-precision", "interconnects", "training-loop" ]
+}

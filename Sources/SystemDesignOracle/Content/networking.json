@@ -1,0 +1,384 @@
+{
+  "id": "networking",
+  "name": "Networking",
+  "symbol": "antenna.radiowaves.left.and.right",
+  "summary": "How bytes actually get from one machine to another: the transport protocols, naming, edge caching and datacenter fabrics underneath every distributed system. Latency budgets, tail behavior and failure modes all start here.",
+  "topics": [
+    {
+      "id": "tcp-ip",
+      "title": "TCP/IP & Congestion Control",
+      "gist": "IP moves individual packets between machines on a best-effort basis; TCP builds a reliable, ordered byte stream on top and paces itself so it does not overwhelm the network.",
+      "overview": [
+        "Think of the internet as a postal service that sometimes loses, delays or reorders letters. **IP** is that postal service: every packet carries a destination address and routers pass it hop by hop toward it, with no promise it arrives. **TCP** is a careful correspondent on top: it numbers every letter, asks the recipient to confirm what arrived, and resends anything that went missing, so the application sees one clean, in-order stream of bytes.",
+        "Before any data flows, TCP does a *three-way handshake* (SYN, SYN-ACK, ACK) so both sides agree on starting sequence numbers. That costs one round trip, which is why a server on another continent feels slow even for tiny requests: the speed of light in fiber is ~200,000 km/s, so New York to London and back is ~70 ms no matter how fast your servers are.",
+        "The subtle part is **congestion control**. If every sender blasted data as fast as its network card allowed, shared links would overflow and drop everything. So TCP keeps a *congestion window*: how many bytes may be in flight unacknowledged. It starts small, grows while things go well, and backs off when it sees loss or rising delay. It is like merging onto a highway: speed up while there is room, ease off when brake lights appear."
+      ],
+      "diagram": {
+        "caption": "The layers a TCP payload passes through on its way out.",
+        "steps": [
+          { "label": "Application", "detail": "write() bytes to a socket" },
+          { "label": "TCP", "detail": "segments, sequence numbers, retransmits" },
+          { "label": "IP", "detail": "addresses and routes each packet" },
+          { "label": "Link (Ethernet)", "detail": "frames on one physical hop" },
+          { "label": "Routers", "detail": "forward hop by hop to destination" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Sequence numbers & ACKs", "role": "Every byte has a sequence number; the receiver returns cumulative ACKs (plus SACK blocks for holes) so the sender knows exactly what to retransmit." },
+          { "name": "Receive window (rwnd)", "role": "Flow control: the receiver advertises how much buffer it has left, so a fast sender cannot overrun a slow reader. Window scaling (RFC 7323) lets it exceed 64 KB." },
+          { "name": "Congestion window (cwnd)", "role": "Sender-side limit on bytes in flight, set by the congestion-control algorithm. Effective send rate is roughly min(cwnd, rwnd) / RTT." },
+          { "name": "Congestion-control algorithm", "role": "CUBIC (Linux default) grows cwnd as a cubic function of time since last loss; BBR (v1 to v3) instead models bottleneck bandwidth and min RTT and paces packets to match." },
+          { "name": "Retransmission timer (RTO)", "role": "If no ACK arrives within a smoothed RTT estimate plus variance (minimum ~200 ms on Linux), the segment is resent and cwnd collapses." },
+          { "name": "IP routing & MTU", "role": "IP forwards packets using longest-prefix-match tables; the path MTU (usually 1500 bytes, 9000 with jumbo frames) caps segment size at ~1460 bytes of payload." }
+        ],
+        "flow": [
+          "Client sends SYN with its initial sequence number, MSS and window-scale options; server replies SYN-ACK; client ACKs. One RTT has passed.",
+          "Sender starts in slow start with an initial window of 10 segments (~14 KB, RFC 6928) and roughly doubles cwnd every RTT as ACKs return.",
+          "Once cwnd passes the slow-start threshold or loss is detected, the algorithm switches to congestion avoidance (CUBIC's cubic growth, or BBR's probe cycles).",
+          "The receiver ACKs every second segment (delayed ACK); out-of-order arrivals trigger duplicate ACKs with SACK blocks describing the gaps.",
+          "Three duplicate ACKs (or RACK-TLP time-based detection) trigger fast retransmit of the missing segment without waiting for the RTO; cwnd is reduced (CUBIC multiplies by 0.7).",
+          "If ACKs stop entirely, the RTO fires, cwnd drops to 1 segment, and slow start begins again.",
+          "Closing uses FIN/ACK in each direction; the side that closes first sits in TIME_WAIT for 2x MSL (~60 s on Linux) to absorb stray packets."
+        ],
+        "tradeoffs": [
+          { "choice": "CUBIC (loss-based)", "pro": "Mature, fair with other CUBIC flows, default on Linux/Windows/macOS", "con": "Fills buffers until loss, causing bufferbloat and poor throughput on lossy long-haul links" },
+          { "choice": "BBR (model-based)", "pro": "High throughput on lossy, high-BDP paths; low queueing delay; used by Google and YouTube", "con": "Fairness issues against CUBIC (v1 especially); more complex, still evolving (BBRv3)" },
+          { "choice": "Nagle's algorithm on", "pro": "Coalesces tiny writes into fewer packets", "con": "Interacts with delayed ACK to add ~40-200 ms latency to request/response protocols; most RPC stacks set TCP_NODELAY" },
+          { "choice": "Long-lived pooled connections", "pro": "Skip handshake and slow start on every request", "con": "Need health checks, idle timeouts and load rebalancing; stale connections fail in surprising ways" }
+        ],
+        "numbers": [
+          { "metric": "Speed of light in fiber", "value": "~200,000 km/s (~5 us per km)" },
+          { "metric": "Transatlantic RTT (NYC to London)", "value": "~70 ms" },
+          { "metric": "Initial congestion window (Linux)", "value": "10 segments, ~14.6 KB" },
+          { "metric": "Bandwidth-delay product, 10 Gb/s at 100 ms", "value": "~125 MB must be in flight" },
+          { "metric": "Linux minimum RTO", "value": "~200 ms" },
+          { "metric": "Typical Ethernet MTU / TCP MSS", "value": "1500 / 1460 bytes" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Throughput on a long fat pipe is bounded by window / RTT, so a single TCP flow across 100 ms with a default 4 MB max buffer tops out near ~320 Mb/s regardless of link speed. Tuning net.ipv4.tcp_rmem/wmem upward, or running parallel streams, is why bulk transfer tools (gsutil, rclone, aws s3 cp) open many connections. The Mathis formula, throughput ~ MSS / (RTT * sqrt(loss)), shows why even 0.01% loss cripples loss-based algorithms on intercontinental paths, and why BBR, which does not treat isolated loss as congestion, wins there.",
+          "Head-of-line blocking is inherent: TCP delivers bytes in order, so one lost segment stalls every byte behind it even if those bytes belong to independent requests multiplexed over the connection (HTTP/2 streams, gRPC calls). This is the core motivation for QUIC. Within datacenters the opposite problem dominates: incast, where hundreds of servers answer one aggregator at once and overflow a shallow switch buffer, causing synchronized loss and RTO stalls of 200 ms on 10 us networks. Fixes include DCTCP (ECN-marked, proportional backoff), lowering min RTO, and application-level request pacing.",
+          "Kernel details matter at scale: SYN floods are absorbed with SYN cookies; accept-queue overflow (somaxconn, listen backlog) silently drops connections; ephemeral port exhaustion (~28k ports by default) hits proxies making many outbound connections to one backend, mitigated with SO_REUSEADDR, tcp_tw_reuse, more source IPs or connection pooling. Modern Linux uses RACK-TLP for loss detection, fq qdisc for pacing, and TSO/GRO to hand 64 KB super-segments to the NIC so per-packet CPU cost stays manageable at 100-400 Gb/s."
+        ],
+        "failureModes": [
+          { "name": "Bufferbloat", "description": "Deep router or modem buffers absorb a loss-based flow's excess, so RTT balloons from 20 ms to 500+ ms and interactive traffic suffers. Fix with AQM (fq_codel, CAKE) at the bottleneck or BBR at the sender." },
+          { "name": "Incast collapse", "description": "Many-to-one fan-in overflows a shallow switch buffer, causing synchronized drops and 200 ms RTO stalls; p99 latency spikes by 1000x. Fix with DCTCP/ECN, smaller min RTO, jittered or bounded fan-out." },
+          { "name": "Ephemeral port / TIME_WAIT exhaustion", "description": "A proxy opening and closing many short connections to one destination runs out of 4-tuples and connect() fails with EADDRNOTAVAIL. Fix with keep-alive pooling, tcp_tw_reuse, or more source addresses." },
+          { "name": "Silent half-open connections", "description": "A NAT or load balancer drops idle state and the peer never learns; the next write hangs until RTO retries exhaust (~15 minutes by default). Fix with TCP keepalives or application heartbeats shorter than middlebox idle timeouts (often 350 s on AWS NLB)." }
+        ],
+        "realSystems": [
+          { "name": "Google BBR", "note": "Deployed on Google.com and YouTube edges; Google reported ~4% higher YouTube throughput globally and over 14% in some countries, with lower queueing delay." },
+          { "name": "DCTCP in datacenters", "note": "Uses ECN marks at a shallow queue threshold to back off proportionally, keeping switch queues near-empty; supported in Linux and Windows Server and used inside Microsoft datacenters." },
+          { "name": "Linux TCP stack", "note": "Defaults to CUBIC, RACK-TLP and initcwnd 10; tunable per route (ip route ... initcwnd) and per socket, and is the reference most cloud traffic runs on." }
+        ],
+        "questions": [
+          { "q": "A service in us-east-1 copies 1 TB to eu-west-1 over a 10 Gb/s link but gets only ~300 Mb/s. Why, and how do you fix it?", "a": "The bandwidth-delay product at ~80 ms RTT is ~100 MB, but default socket buffers cap the window at a few MB, so one flow is window-limited, and any loss further throttles CUBIC. Raise tcp_rmem/wmem maxima, switch to BBR, and parallelize into many streams or chunked uploads. Verify with ss -ti to see cwnd, rtt and retransmits." },
+          { "q": "Your p99 latency for a fan-out search service jumps to 200+ ms under load, while p50 stays at 2 ms. What is a likely network cause?", "a": "Incast: the aggregator's many shard responses arrive simultaneously, overflow the top-of-rack buffer, and lost tail segments wait for the ~200 ms minimum RTO. Confirm via switch drop counters and TCP retransmit stats. Mitigate with DCTCP/ECN, lower min RTO for intra-DC routes, staggering or limiting outstanding requests, and hedged requests." },
+          { "q": "Why do RPC frameworks set TCP_NODELAY?", "a": "Nagle holds back small writes until outstanding data is ACKed, and the receiver's delayed ACK waits up to ~40 ms hoping to piggyback. A small request then stalls for the delayed-ACK timer. Disabling Nagle sends small messages immediately; frameworks batch writes themselves instead." }
+        ]
+      },
+      "related": [ "quic-http", "datacenter-networking", "load-balancing", "io-models", "tls-crypto" ]
+    },
+    {
+      "id": "quic-http",
+      "title": "HTTP/2, HTTP/3 & QUIC",
+      "gist": "HTTP is the request/response language of the web; HTTP/2 multiplexes many requests on one connection, and HTTP/3 runs on QUIC, a faster encrypted transport built on UDP.",
+      "overview": [
+        "HTTP is how a browser or app asks a server for something: a method like GET, a path, some headers, maybe a body, and a response with a status code. The original HTTP/1.1 could only carry one request at a time per connection, so browsers opened ~6 parallel connections per site, like a shop with six checkout lanes where each customer must finish before the next starts.",
+        "**HTTP/2** (2015) put many requests on one connection by slicing them into small *frames* tagged with a stream number, interleaved like several conversations on one phone line. It also compresses repetitive headers (HPACK). But it still rode on TCP, and TCP insists on delivering bytes in order, so one lost packet freezes every stream until it is resent.",
+        "**QUIC** fixes that by building its own reliable, encrypted transport on top of UDP. Each stream is ordered independently, so a lost packet only stalls the stream it belonged to. TLS 1.3 is built in, so setting up an encrypted connection takes one round trip instead of two or three, and returning visitors can send data immediately (0-RTT). **HTTP/3** is HTTP's semantics carried over QUIC; by 2026 roughly a third of web traffic uses it."
+      ],
+      "diagram": {
+        "caption": "Protocol stacks side by side: HTTP/2 vs HTTP/3.",
+        "steps": [
+          { "label": "HTTP semantics", "detail": "methods, headers, status codes" },
+          { "label": "HTTP/2 or HTTP/3", "detail": "framing, HPACK or QPACK" },
+          { "label": "TLS 1.3", "detail": "separate over TCP, built into QUIC" },
+          { "label": "TCP or QUIC", "detail": "QUIC streams avoid HOL blocking" },
+          { "label": "IP / UDP", "detail": "QUIC runs in UDP datagrams" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Streams and frames", "role": "HTTP/2 and QUIC split each request/response into frames carrying a stream ID; many streams share one connection, each with its own flow-control window." },
+          { "name": "Header compression (HPACK / QPACK)", "role": "Static and dynamic tables replace repeated headers like cookies and user-agent with small indices. QPACK is HPACK redesigned so out-of-order delivery does not block decoding." },
+          { "name": "QUIC handshake (TLS 1.3 inside)", "role": "Transport and crypto negotiation happen together in 1 RTT; resumed sessions can send 0-RTT early data using a pre-shared key." },
+          { "name": "Connection IDs", "role": "QUIC connections are identified by IDs, not the IP/port 4-tuple, so a phone switching from Wi-Fi to cellular keeps the same connection (connection migration)." },
+          { "name": "User-space loss recovery", "role": "QUIC implements ACKs, retransmission and congestion control (usually CUBIC or BBR) in the application library, with monotonically increasing packet numbers that remove retransmission ambiguity." }
+        ],
+        "flow": [
+          "Client resolves the host; DNS HTTPS records or an Alt-Svc header from a prior HTTP/2 response advertise h3 support.",
+          "Client sends a QUIC Initial packet (padded to at least 1200 bytes) containing the TLS ClientHello and transport parameters.",
+          "Server responds with its Initial and Handshake packets (ServerHello, certificate, Finished); keys are derived and the client can send requests after 1 RTT.",
+          "Each HTTP request is opened on a new bidirectional QUIC stream; headers are QPACK-encoded and sent as HEADERS frames, bodies as DATA frames.",
+          "Packets are ACKed with ranges; a lost packet's frames are re-sent in a new packet number, and only the affected streams wait.",
+          "If the client's IP changes, it keeps using the connection ID; the server validates the new path before sending large amounts of data.",
+          "Idle connections close after a negotiated timeout, or explicitly via CONNECTION_CLOSE."
+        ],
+        "tradeoffs": [
+          { "choice": "HTTP/3 over QUIC", "pro": "No transport HOL blocking, 1-RTT/0-RTT setup, connection migration, faster evolution in user space", "con": "UDP is blocked or throttled on ~3-5% of networks; higher CPU per byte than kernel TCP with offloads; harder to debug since headers are encrypted" },
+          { "choice": "HTTP/2 over TCP", "pro": "Universally reachable, kernel and NIC offloads (TSO, kTLS), mature tooling", "con": "Single lost packet stalls all streams; 2-RTT setup with TLS 1.3 over a fresh TCP connection" },
+          { "choice": "0-RTT early data", "pro": "Saves a full RTT for returning clients, big win on mobile", "con": "Replayable by an attacker; only safe for idempotent requests, servers must reject or guard non-idempotent ones" },
+          { "choice": "gRPC on HTTP/2", "pro": "Streaming RPCs, strong tooling, efficient Protobuf framing", "con": "Long-lived connections defeat L4 load balancing; needs L7-aware balancing or client-side load balancing" }
+        ],
+        "numbers": [
+          { "metric": "HTTP/3 share of web requests (Cloudflare Radar, 2025)", "value": "~30%" },
+          { "metric": "New connection setup, TCP + TLS 1.3", "value": "2 RTT before first request byte" },
+          { "metric": "New connection setup, QUIC", "value": "1 RTT (0 RTT on resumption)" },
+          { "metric": "Minimum QUIC Initial datagram size", "value": "1200 bytes" },
+          { "metric": "Browser HTTP/1.1 connections per origin", "value": "~6" },
+          { "metric": "Default HTTP/2 max concurrent streams (common servers)", "value": "~100-128" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "QUIC's packet numbers are never reused, so ACKs unambiguously identify which transmission arrived, which makes RTT sampling and loss detection cleaner than TCP's. All of QUIC's headers except a few bits are encrypted and authenticated, deliberately preventing middleboxes from ossifying the protocol the way they froze TCP options. The cost is that operators lose passive RTT and loss visibility; the spin bit is an optional concession. Because QUIC runs in user space, sending a packet is a syscall per datagram unless the stack uses UDP GSO/GRO and sendmmsg, which is the single biggest CPU optimization; without it QUIC can cost 2-3x the CPU of TCP+TLS for bulk transfer.",
+          "Load balancing QUIC is tricky: the 4-tuple can change during migration, so L4 balancers must route on the connection ID. The QUIC-LB draft standardizes encoding a server ID into the connection ID so a stateless balancer (like Katran or Unimog) can route correctly. Amplification attacks are bounded by the anti-amplification limit: before a client address is validated, servers may send at most 3x the bytes received, which is also why Initial packets are padded to 1200 bytes.",
+          "HTTP/2 has its own attack surface: the 2023 Rapid Reset attack (CVE-2023-44487) opened and immediately cancelled streams to generate hundreds of millions of requests per second, because stream cancellation did not count against concurrency limits. HTTP/2 server push was removed by Chrome in 2022 for lack of benefit; 103 Early Hints replaced it. Extended CONNECT and WebTransport build on HTTP/3 to offer bidirectional streams and unreliable datagrams to browsers, and MASQUE uses the same machinery to proxy UDP and IP (Apple iCloud Private Relay)."
+        ],
+        "failureModes": [
+          { "name": "UDP blocked or rate-limited", "description": "Enterprise firewalls or carriers drop or throttle UDP/443, so QUIC handshakes time out. Clients must race or fall back to TCP (happy eyeballs style); a slow fallback adds seconds to page loads." },
+          { "name": "Rapid Reset / stream floods", "description": "Attackers abuse cheap stream creation and cancellation to exhaust server CPU. Fix by counting reset streams toward limits, rate-limiting RST_STREAM, and closing abusive connections." },
+          { "name": "Connection-level load imbalance", "description": "HTTP/2 and gRPC multiplex everything over a few long-lived connections, so an L4 balancer pins all traffic from one client to one backend. Fix with L7 proxies (Envoy), client-side balancing, or periodic connection max-age." }
+        ],
+        "realSystems": [
+          { "name": "Google QUIC and Chrome", "note": "Google deployed gQUIC from 2013 across Search and YouTube, then standardized it with the IETF as RFC 9000 (2021); Chrome uses HTTP/3 by default where advertised." },
+          { "name": "Cloudflare quiche and Meta mvfst", "note": "Open-source QUIC stacks in Rust and C++; Meta reports the majority of its app traffic on QUIC with measurable tail-latency gains on poor networks." },
+          { "name": "Apple iCloud Private Relay", "note": "Uses MASQUE over HTTP/3 to tunnel user traffic through two relays so no single party sees both the user IP and destination." }
+        ],
+        "questions": [
+          { "q": "Your mobile app has high tail latency in emerging markets. Would moving the API to HTTP/3 help, and what would you measure?", "a": "Likely yes: lossy, high-RTT mobile links suffer from TCP HOL blocking and multi-RTT setup, and network switches break TCP connections. Roll out with Alt-Svc and a TCP fallback, A/B by client, and measure connection setup time, time to first byte, p95/p99 request latency, and the fallback rate to TCP. Also watch server CPU, since QUIC costs more per byte." },
+          { "q": "How would you load-balance gRPC traffic across 50 backends?", "a": "L4 balancing pins each long-lived HTTP/2 connection to one backend, so load is uneven. Use an L7 proxy such as Envoy that balances per request (least-request or P2C), or client-side balancing with xDS or a lookaside balancer. Add max connection age so clients periodically reconnect and rebalance when backends scale." },
+          { "q": "Is it safe to enable 0-RTT for every endpoint?", "a": "No. 0-RTT data can be replayed by an attacker capturing the packets, so it should only carry idempotent requests like GETs. Servers or edge proxies should reject 0-RTT for non-idempotent methods (or return 425 Too Early), and apply anti-replay windows where possible." }
+        ]
+      },
+      "related": [ "tcp-ip", "cdn", "dns", "tls-crypto", "load-balancing" ]
+    },
+    {
+      "id": "dns",
+      "title": "DNS",
+      "gist": "DNS is the internet's phone book: it turns names like example.com into IP addresses through a global hierarchy of servers and lots of caching.",
+      "overview": [
+        "Computers talk using numeric addresses like 93.184.215.14, but people use names. DNS (the Domain Name System) is the lookup service that connects the two. Instead of one giant phone book, it is split into a tree: the *root* knows who runs `.com`, the `.com` servers know who runs `example.com`, and `example.com`'s own servers know its actual addresses.",
+        "Your device rarely walks that tree itself. It asks a *recursive resolver*, typically run by your ISP or a public service like Cloudflare 1.1.1.1 or Google 8.8.8.8, which does the legwork and remembers answers. Every answer comes with a *TTL* (time to live), an expiry stamp saying how long it may be cached. That caching is why DNS is fast and survives enormous load, but also why changes take time to spread.",
+        "Because DNS sits in front of almost every connection, it is also a powerful control knob. Companies use it to send users to the nearest datacenter, to shift traffic away from a failing region, or to spread load. And because nearly everything depends on it, a DNS outage looks like the whole internet is down."
+      ],
+      "diagram": {
+        "caption": "A cold lookup for www.example.com through the hierarchy.",
+        "steps": [
+          { "label": "Stub resolver", "detail": "OS asks configured recursive resolver" },
+          { "label": "Recursive resolver", "detail": "checks cache, else walks tree" },
+          { "label": "Root servers", "detail": "refers to .com TLD servers" },
+          { "label": "TLD servers", "detail": "refers to example.com nameservers" },
+          { "label": "Authoritative server", "detail": "returns A/AAAA record with TTL" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Stub resolver", "role": "The minimal client in the OS or app (getaddrinfo, systemd-resolved, Android's DoT client) that sends one recursive query and caches results briefly." },
+          { "name": "Recursive resolver", "role": "Performs iterative lookups on behalf of clients, caches by TTL, validates DNSSEC, and often runs as an anycast fleet (1.1.1.1, 8.8.8.8, Quad9)." },
+          { "name": "Root and TLD servers", "role": "13 root server identities (A to M) served by ~1,900+ anycast instances; TLD operators like Verisign run .com. They only return referrals, not final answers." },
+          { "name": "Authoritative nameservers", "role": "Hold the zone's real records (A, AAAA, CNAME, MX, TXT, NS, HTTPS/SVCB) and are the source of truth; managed services include Route 53, Cloudflare DNS, NS1." },
+          { "name": "Record types and TTLs", "role": "A/AAAA map names to IPv4/IPv6, CNAME aliases one name to another, HTTPS/SVCB advertise ALPN and ECH keys; TTL controls cache lifetime from seconds to days." }
+        ],
+        "flow": [
+          "An app calls getaddrinfo(‘www.example.com’); the OS checks its own cache and hosts file.",
+          "On a miss the stub sends a query over UDP/53, or encrypted via DoH/DoT, to the recursive resolver.",
+          "The resolver checks its cache; on a miss it asks a root server, which refers it to the .com TLD servers (this referral is almost always cached).",
+          "The TLD server returns NS records (and glue IPs) for example.com's authoritative nameservers.",
+          "The resolver asks the authoritative server, which may return a CNAME (for example to a CDN hostname) that triggers another lookup chain.",
+          "The final A/AAAA answer is cached for its TTL, optionally DNSSEC-validated, and returned to the client.",
+          "The client connects to the IP; if it is a geo-steered answer, it points at a nearby edge or region."
+        ],
+        "tradeoffs": [
+          { "choice": "Short TTL (30-60 s)", "pro": "Fast failover and traffic shifting", "con": "More queries, higher authoritative load, more resolver-miss latency; some clients and resolvers ignore low TTLs anyway" },
+          { "choice": "Long TTL (hours)", "pro": "Resilient to authoritative outages, fewer lookups, faster for users", "con": "Changes and failovers take hours to propagate; bad records linger" },
+          { "choice": "DNS-based load balancing / GeoDNS", "pro": "Global steering with no extra hop, works for any protocol", "con": "Coarse: you steer the resolver's location, not the user's (EDNS Client Subnet helps), and caching delays reaction" },
+          { "choice": "Encrypted DNS (DoH/DoT)", "pro": "Privacy from on-path observers, resists tampering", "con": "Bypasses enterprise DNS controls; adds TLS setup cost; centralizes queries at a few big resolvers" }
+        ],
+        "numbers": [
+          { "metric": "Root server identities / anycast instances", "value": "13 / ~1,900+" },
+          { "metric": "Cached lookup latency at nearby resolver", "value": "~1-20 ms" },
+          { "metric": "Cold recursive lookup", "value": "~50-200 ms" },
+          { "metric": "Classic UDP DNS payload limit", "value": "512 bytes (EDNS0 commonly ~1232)" },
+          { "metric": "Route 53 SLA", "value": "100% availability" },
+          { "metric": "Cloudflare 1.1.1.1 query volume", "value": "~1+ trillion queries/day" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "TTLs are a request, not a guarantee. Some resolvers clamp minimum TTLs, JVMs historically cached forever unless networkaddress.cache.ttl was set, and long-lived clients that resolve once at startup never see changes at all. Real failover therefore combines DNS changes with health-checked anycast or load balancers that do not depend on clients re-resolving. Negative answers (NXDOMAIN) are cached too, per the SOA minimum, so a misconfigured record deleted for a minute can stay broken for an hour.",
+          "Resolution is a dependency chain that is easy to make circular or fragile: CNAME chains through a CDN and a traffic manager can mean four lookups; using a single DNS provider is a single point of failure (the 2016 Dyn DDoS took down Twitter, GitHub and others). Multi-provider authoritative DNS requires keeping zones in sync and avoiding provider-specific features like proprietary latency routing. Glue records and the NS delegation in the parent zone are cached for days, so changing nameservers is the slowest DNS change of all.",
+          "Security: classic DNS over UDP is spoofable, and the 2008 Kaminsky attack showed cache poisoning was practical; source-port randomization, 0x20 case randomization and DNSSEC are the defenses. DNSSEC signs records with a chain of trust from the root, but adoption for second-level domains is still low (~5-10% of .com) and misconfigured key rollovers cause hard outages. HTTPS/SVCB records (RFC 9460) now let a single lookup advertise HTTP/3 support, alternative endpoints and ECH keys, removing a round trip from connection setup."
+        ],
+        "failureModes": [
+          { "name": "Provider or zone outage", "description": "The authoritative provider is DDoSed or misconfigured; as caches expire, everything that resolves through it fails. Mitigate with multi-provider DNS, sensible TTLs, and serve-stale (RFC 8767) on resolvers." },
+          { "name": "Bad record propagation", "description": "A wrong record with a long TTL is cached worldwide and cannot be recalled. Lower TTLs before planned changes, validate changes in CI, and stage rollouts." },
+          { "name": "Resolver overload / internal DNS dependency", "description": "Internal services all depend on a cluster resolver (CoreDNS, VPC resolver) that saturates or rate-limits, causing cascading timeouts. Mitigate with node-local caches, connection reuse, and avoiding per-request lookups; Kubernetes ndots:5 can multiply queries 5x." }
+        ],
+        "realSystems": [
+          { "name": "Amazon Route 53", "note": "Anycast authoritative DNS with latency-based, geolocation, weighted and failover routing tied to health checks; backed by a 100% availability SLA." },
+          { "name": "Cloudflare 1.1.1.1", "note": "Anycast public resolver in 300+ cities offering DoH, DoT and DNSSEC validation, with aggressive negative caching and serve-stale." },
+          { "name": "Facebook October 2021 outage", "note": "A BGP change withdrew routes to Facebook's authoritative DNS servers, which also had withdrawn themselves on health failure; the domains vanished for ~6 hours and internal tools that depended on DNS broke too." }
+        ],
+        "questions": [
+          { "q": "You need to fail traffic from us-east to us-west within one minute. Is DNS enough?", "a": "Not alone. Even with a 30 s TTL, some resolvers and clients cache longer, and long-lived connections never re-resolve. Use DNS failover as one layer, but front regions with an anycast or global load balancer that can shift traffic instantly, and make clients reconnect on errors. Measure actual drain time in game days." },
+          { "q": "How do CDNs use DNS to pick an edge server?", "a": "The customer CNAMEs their hostname to the CDN's name; the CDN's authoritative servers see the resolver IP (and the EDNS Client Subnet if sent) and return the IP of a healthy, nearby, lightly loaded edge with a short TTL. Many CDNs now prefer anycast instead, returning the same IP everywhere and letting BGP route to the nearest PoP." },
+          { "q": "Pods in Kubernetes see intermittent 5 s delays on outbound calls. What do you check?", "a": "Classic culprits are DNS: ndots:5 causes several search-domain queries per external name, and conntrack races on parallel A/AAAA UDP queries drop packets, triggering the 5 s resolver timeout. Fix with NodeLocal DNSCache, fully qualified names with a trailing dot, lower ndots, or single-request-reopen." }
+        ]
+      },
+      "related": [ "cdn", "load-balancing", "quic-http", "caching", "tls-crypto" ]
+    },
+    {
+      "id": "cdn",
+      "title": "CDNs & Edge",
+      "gist": "A CDN keeps copies of content and runs code in hundreds of locations close to users, so requests travel a few miles instead of across oceans.",
+      "overview": [
+        "Light is fast but not instant: a user in Sydney fetching a file from Virginia waits ~200 ms per round trip, and a web page needs many round trips. A **Content Delivery Network** solves this the way a supermarket chain does: instead of everyone driving to the factory, popular goods are stocked in local stores. CDNs run *points of presence* (PoPs) in hundreds of cities, each full of caching servers.",
+        "When a user requests a file, they reach the nearest PoP. If it already has a fresh copy (a *cache hit*), it answers immediately. If not (a *miss*), it fetches from your *origin* server once, keeps a copy, and serves everyone else nearby. Popular sites serve 90-99% of their bytes from the edge, which also shields the origin from traffic spikes and attacks.",
+        "Modern CDNs do much more than cache images. They terminate TLS close to users, absorb DDoS attacks, run firewalls, and increasingly let you run your own code at the edge (Cloudflare Workers, Fastly Compute, Lambda@Edge) for things like personalization, authentication and A/B tests, without a round trip to a central datacenter."
+      ],
+      "diagram": {
+        "caption": "A request path through a tiered CDN.",
+        "steps": [
+          { "label": "User", "detail": "DNS or anycast picks nearest PoP" },
+          { "label": "Edge PoP", "detail": "TLS termination, cache lookup, WAF" },
+          { "label": "Regional shield tier", "detail": "collapses misses from many PoPs" },
+          { "label": "Origin", "detail": "your servers or object storage" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "PoPs and edge servers", "role": "Clusters of servers in IXPs and ISP networks with large RAM and NVMe caches; big CDNs run 300+ cities, and Netflix and Akamai place appliances inside ISPs." },
+          { "name": "Request routing (anycast or DNS)", "role": "Anycast advertises the same IP from every PoP so BGP delivers users to a nearby one; DNS-based steering returns a PoP-specific IP chosen by location and load." },
+          { "name": "Cache key and policy", "role": "The cache key (usually host + path + selected query params and headers) decides what counts as the same object; Cache-Control, s-maxage and Vary decide how long and for whom." },
+          { "name": "Tiered caching / origin shield", "role": "Misses from edge PoPs go to a smaller set of upper-tier caches before the origin, so one popular object costs one origin fetch rather than one per PoP." },
+          { "name": "Edge compute", "role": "V8 isolates (Cloudflare Workers, Deno Deploy) or WebAssembly (Fastly Compute) run customer code per request with ~ms cold starts, plus edge KV and storage." }
+        ],
+        "flow": [
+          "User resolves cdn.example.com; anycast or GeoDNS directs them to a nearby PoP.",
+          "The PoP terminates TLS (HTTP/2 or HTTP/3), applies WAF and bot rules, and computes the cache key.",
+          "On a hit with a fresh object, the response is served from RAM or SSD in ~1-10 ms.",
+          "On a miss or stale object, the edge asks the regional shield; concurrent requests for the same key are collapsed into one upstream fetch.",
+          "The shield fetches from origin over a warm, long-lived connection, possibly revalidating with If-None-Match / ETag and getting a cheap 304.",
+          "The response is stored per its TTL and served; stale-while-revalidate lets edges serve the old copy while refreshing in the background.",
+          "On content change, the origin issues a purge by URL or surrogate key/tag, which propagates globally in ~a few hundred ms to seconds."
+        ],
+        "tradeoffs": [
+          { "choice": "Long TTL + purge on change", "pro": "Highest hit ratio and lowest origin load", "con": "Correctness depends on purges working; requires tagging and a purge pipeline" },
+          { "choice": "Short TTL / revalidation", "pro": "Simpler, content never too stale", "con": "More origin traffic and miss latency; cheap 304s still cost a round trip" },
+          { "choice": "Anycast routing", "pro": "Instant failover via BGP, built-in DDoS spreading, no DNS caching lag", "con": "Route changes can move flows mid-connection; less precise control over which PoP a user hits" },
+          { "choice": "Edge compute vs origin logic", "pro": "Lower latency for personalization and auth; reduces origin load", "con": "Limited CPU time and memory per request, data locality problems if logic needs the central database" }
+        ],
+        "numbers": [
+          { "metric": "Cloudflare network footprint (2025)", "value": "~330+ cities, ~400+ Tbps capacity" },
+          { "metric": "Typical static asset hit ratio", "value": "~90-99%" },
+          { "metric": "Edge hit latency (TTFB)", "value": "~10-30 ms for most users" },
+          { "metric": "Global purge time (Fastly, Cloudflare)", "value": "~150 ms to a few seconds" },
+          { "metric": "Netflix Open Connect share of Netflix traffic", "value": "~100% of video served from OCAs" },
+          { "metric": "Largest DDoS mitigated (Cloudflare, 2025)", "value": "~22 Tbps" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Cache hit ratio is governed by the cache key and the long tail. Accidental key fragmentation, from tracking query params, Vary: User-Agent or unnormalized headers, can turn a 98% hit ratio into 60%. Byte hit ratio and request hit ratio differ: video CDNs care about bytes, API acceleration about requests. Large objects are cached as ranges or slices so a seek in a 4 GB video does not force a full fetch. Eviction is LRU-like but production systems add admission filters (only cache on second request, TinyLFU) to stop one-hit wonders from flushing hot content.",
+          "Thundering herds are the classic CDN failure: when a hot object expires or is purged, thousands of edges miss simultaneously. Request collapsing (one in-flight fetch per key per tier), origin shields, stale-while-revalidate and stale-if-error are the defenses. Purges are themselves dangerous; a purge-all during peak can hammer the origin with a full cold-cache load. Soft purge (mark stale instead of delete) lets edges keep serving while revalidating.",
+          "Dynamic content still benefits: TLS and TCP handshakes terminate near the user, and the edge-to-origin leg uses warm connections over the CDN's optimized backbone (Cloudflare Argo, Akamai SureRoute), cutting latency 20-40% even at 0% hit rate. Personalized pages can be split with ESI or edge compute assembling cached fragments. Security-sensitive caching bugs, such as caching a response with Set-Cookie or a private user page under a shared key (web cache deception), leak data between users; enforce Cache-Control: private and strip cookies on cacheable routes."
+        ],
+        "failureModes": [
+          { "name": "Cache stampede on expiry or purge", "description": "A hot object expires everywhere at once and origin load jumps 100x, often causing an outage. Fix with request collapsing, origin shield, staggered TTLs, and stale-while-revalidate / stale-if-error." },
+          { "name": "Cache key leaks private data", "description": "A response meant for one user is cached and served to others (web cache deception, missing Vary). Mark personalized responses private, never cache Set-Cookie responses, and test cache keys." },
+          { "name": "Global config push outage", "description": "A bad edge config or rule deploys to every PoP in seconds and breaks everything, as with Fastly's June 2021 and Cloudflare's July 2019 regex outages. Fix with staged rollouts, canary PoPs and fast rollback." }
+        ],
+        "realSystems": [
+          { "name": "Netflix Open Connect", "note": "Netflix-built caching appliances with ~hundreds of TB of storage placed free inside ISPs; content is pre-positioned overnight using popularity prediction, so peak traffic barely touches the backbone." },
+          { "name": "Cloudflare", "note": "Anycast network where every server in every PoP runs every service (cache, WAF, Workers, DNS); uses tiered caching and Unimog L4 balancing." },
+          { "name": "Fastly", "note": "Varnish-heritage CDN known for ~150 ms instant purge and surrogate-key tagging; Compute runs WebAssembly at the edge." }
+        ],
+        "questions": [
+          { "q": "Design caching for a news site where articles change unpredictably but must update within seconds.", "a": "Cache article HTML at the edge with a long s-maxage and tag each response with surrogate keys (article ID, section). On publish or edit, the CMS emits a purge by tag, which reaches all PoPs in about a second. Add stale-while-revalidate and an origin shield so post-purge refills are collapsed. Keep personalization client-side or in edge fragments so pages stay shareable." },
+          { "q": "Your origin goes down. How can the CDN keep the site up?", "a": "Configure stale-if-error so edges keep serving expired copies when origin returns 5xx or times out, use long TTLs with purges for freshness, and keep the shield tier holding a large working set. For writes or uncached dynamic paths, fail over to a secondary origin or region via CDN origin pools with health checks." },
+          { "q": "Why would a 0% cacheable API still benefit from a CDN?", "a": "TLS and TCP handshakes complete at a nearby PoP, saving 1-2 long RTTs; the edge reuses warm, pre-tuned connections to origin over an optimized backbone; plus you get DDoS absorption, WAF and HTTP/3 to clients without changing the origin." }
+        ]
+      },
+      "related": [ "dns", "quic-http", "caching", "object-storage", "load-balancing" ]
+    },
+    {
+      "id": "datacenter-networking",
+      "title": "Datacenter Networks & RDMA",
+      "gist": "Inside a datacenter, thousands of servers are wired in layered switch fabrics, and RDMA lets one machine read another's memory directly with microsecond latency.",
+      "overview": [
+        "A modern datacenter holds tens of thousands of servers that constantly talk to each other, far more than they talk to the outside world. Wiring them like an office network, with one big switch at the top, would create a traffic jam. Instead they use a **Clos** or *leaf-spine* fabric: each rack's top switch (the *leaf*) connects to every switch in the next layer (the *spines*), so any two servers are a fixed, small number of hops apart and there are many equal paths between them, like a city grid instead of a single highway.",
+        "Traffic is spread across those paths by hashing each flow to one of them (*ECMP*). With enough paths and enough flows, load evens out and the fabric behaves like one giant switch with predictable latency of a few microseconds per hop.",
+        "For the most demanding work, like AI training and fast storage, even the operating system's network stack is too slow. **RDMA** (Remote Direct Memory Access) lets a network card copy data straight into another machine's memory without involving either CPU, cutting latency to ~2 microseconds. It runs on InfiniBand or on Ethernet via RoCE, and it is why a cluster of thousands of GPUs can act like one computer."
+      ],
+      "diagram": {
+        "caption": "Path between two servers in a three-tier Clos fabric.",
+        "steps": [
+          { "label": "Server NIC", "detail": "100-800 Gb/s, RDMA capable" },
+          { "label": "Leaf / ToR switch", "detail": "one per rack, ~1 us hop" },
+          { "label": "Spine switches", "detail": "ECMP across many equal paths" },
+          { "label": "Super-spine", "detail": "connects pods across the building" },
+          { "label": "Remote leaf", "detail": "delivers to destination server" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Leaf-spine (Clos) fabric", "role": "Every leaf connects to every spine; adding spines adds bisection bandwidth. Built from merchant silicon like Broadcom Tomahawk 5 (51.2 Tb/s) or NVIDIA Spectrum-4." },
+          { "name": "ECMP routing", "role": "Switches hash each flow's 5-tuple to pick among equal-cost next hops, usually with BGP as the routing protocol (RFC 7938) on each link." },
+          { "name": "RDMA NICs (RNICs)", "role": "NICs like NVIDIA ConnectX-7/8 and BlueField DPUs implement queue pairs, memory registration and transport in hardware so verbs (READ, WRITE, SEND) bypass the kernel." },
+          { "name": "InfiniBand vs RoCEv2", "role": "InfiniBand is a lossless, credit-based fabric with its own subnet manager (Quantum-2/X800); RoCEv2 carries InfiniBand transport over UDP/IP on Ethernet and needs PFC/ECN to avoid loss." },
+          { "name": "Congestion control (DCQCN, Swift, HPCC)", "role": "Datacenter-specific algorithms react to ECN marks, delay or in-band telemetry within microseconds to keep queues short and avoid PFC storms." }
+        ],
+        "flow": [
+          "Application registers a memory buffer with the RNIC, pinning pages and getting keys that a peer can use.",
+          "The two sides exchange queue pair numbers and keys out of band (often over TCP or via a connection manager).",
+          "The sender posts a work request (for example RDMA WRITE of 1 MB) to its send queue and rings a doorbell, with no syscall.",
+          "The RNIC segments the data into packets; each flow is hashed by switches onto one ECMP path through leaf, spine and remote leaf.",
+          "If queues build, switches set ECN bits; the receiver's NIC returns congestion notifications and the sender's NIC lowers its rate (DCQCN).",
+          "The remote RNIC DMAs payload straight into the registered buffer, without waking the remote CPU.",
+          "A completion entry appears in the sender's completion queue; the application polls it in ~2-5 us end to end."
+        ],
+        "tradeoffs": [
+          { "choice": "InfiniBand", "pro": "Lossless by design, lowest latency, mature for HPC and AI training, adaptive routing", "con": "Single-vendor (NVIDIA) ecosystem, separate management and skills, higher cost" },
+          { "choice": "RoCEv2 on Ethernet", "pro": "Commodity switches, one fabric for everything, multi-vendor, Ultra Ethernet roadmap", "con": "Needs careful PFC/ECN tuning; PFC deadlocks and pause storms are real risks" },
+          { "choice": "Kernel TCP", "pro": "Works everywhere, tolerant of loss, easy to operate", "con": "~10-30 us latency and much more CPU per byte than RDMA" },
+          { "choice": "Oversubscribed fabric (for example 3:1)", "pro": "Cheaper, fewer spines and optics", "con": "Congestion when many racks talk at once; unacceptable for AI training's all-to-all traffic, which wants 1:1 rail-optimized fabrics" }
+        ],
+        "numbers": [
+          { "metric": "Broadcom Tomahawk 5 switch capacity", "value": "51.2 Tb/s (64 x 800G)" },
+          { "metric": "Per-hop switch latency (cut-through)", "value": "~0.5-1 us" },
+          { "metric": "RDMA one-sided read latency", "value": "~2-3 us" },
+          { "metric": "Kernel TCP RTT within a rack", "value": "~10-30 us" },
+          { "metric": "Per-GPU network bandwidth (H100/B200 clusters)", "value": "400-800 Gb/s per GPU" },
+          { "metric": "Largest AI training fabrics (2025)", "value": "~100k+ GPUs in one cluster" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "ECMP hashing works when there are many small flows; AI training produces the opposite: a few huge, synchronized elephant flows from collective operations (all-reduce, all-to-all). Hash collisions put two 400G flows on one link while others sit idle, and the slowest flow dictates step time. Remedies include adaptive routing and packet spraying (InfiniBand AR, NVIDIA Spectrum-X, Ultra Ethernet's packet-level multipathing with out-of-order delivery), rail-optimized topologies where GPU i in every server connects to the same leaf, and collective libraries (NCCL) that are topology-aware.",
+          "RoCE needs a lossless or near-lossless network because its go-back-N recovery behaves terribly with drops. Priority Flow Control pauses upstream senders per class when buffers fill, but pauses propagate: head-of-line blocking spreads congestion to innocent flows, cyclic buffer dependencies can deadlock, and a misbehaving NIC can emit a pause storm that freezes a fabric. Microsoft's RDMA deployment paper documents these. Newer RNICs support selective retransmission and better congestion control so that some operators run RoCE with ECN only and little or no PFC.",
+          "Beyond the fabric: SmartNICs and DPUs (BlueField-3, AWS Nitro, Google's IPU) offload virtual switching, encryption and storage so the host CPU is not taxed by the network. Hyperscalers also run their own transports: AWS SRD on Nitro sprays packets across up to 64 paths with out-of-order delivery for EFA, and Google's Falcon and Swift target microsecond tails. Optical circuit switching (Google Jupiter's Apollo OCS) lets operators reconfigure topology in software and skip a spine layer's power and cost."
+        ],
+        "failureModes": [
+          { "name": "ECMP hash polarization / collisions", "description": "Large flows hash onto the same link, causing hotspots while capacity elsewhere is idle; training step time degrades unpredictably. Fix with adaptive routing, packet spraying, flowlet switching, or different hash seeds per tier." },
+          { "name": "PFC pause storms and deadlock", "description": "A stuck NIC or cyclic buffer dependency propagates pause frames, freezing large parts of a RoCE fabric. Fix with PFC watchdogs, ECN-first congestion control, and careful QoS class design." },
+          { "name": "Gray link failures", "description": "A flapping optic or link with a low bit-error rate drops a fraction of packets without going fully down, causing retransmits and stragglers in a training job. Detect with per-link FEC/CRC telemetry and automatically drain suspect links." }
+        ],
+        "realSystems": [
+          { "name": "Google Jupiter", "note": "Google's datacenter fabric, now using optical circuit switches to directly connect aggregation blocks, delivering 6+ Pb/s per fabric with reconfigurable topology." },
+          { "name": "Meta's AI training clusters", "note": "Meta built two 24k-GPU clusters for Llama 3, one on RoCEv2 (Arista 7800) and one on InfiniBand (Quantum-2), and reported comparable performance after tuning." },
+          { "name": "AWS EFA with SRD", "note": "Elastic Fabric Adapter uses the Scalable Reliable Datagram protocol on Nitro cards, spraying packets over many paths for HPC and ML at up to 3,200 Gb/s per instance (P5)." }
+        ],
+        "questions": [
+          { "q": "Design the network for a 16k-GPU training cluster.", "a": "Use a non-blocking (1:1) rail-optimized Clos with 400-800G per GPU, so each of the 8 GPUs per node goes to its own rail leaf and collective traffic mostly stays within a rail. Choose InfiniBand or RoCEv2 with adaptive routing and tuned ECN/PFC, keep a separate front-end Ethernet network for storage and control, and make NCCL topology-aware. Add per-link telemetry and automatic straggler detection, since one bad link slows the whole job." },
+          { "q": "Why doesn't plain ECMP work well for AI collectives?", "a": "ECMP assumes many small, independent flows. Collectives create a few long, synchronized, high-bandwidth flows, so hash collisions overload some links while others idle, and the slowest flow gates every step. Adaptive routing or packet spraying, which balance per packet using queue state, fix this at the cost of reordering that the NIC must tolerate." },
+          { "q": "When is RDMA worth the operational complexity over TCP?", "a": "When latency in microseconds or CPU per byte dominates: distributed training, disaggregated storage (NVMe-oF), in-memory databases and key-value stores like FaRM. For typical RPC microservices with millisecond budgets, kernel TCP (maybe with busy polling or io_uring) is simpler and good enough." }
+        ]
+      },
+      "related": [ "interconnects", "data-parallelism", "tcp-ip", "load-balancing", "storage-devices" ]
+    }
+  ]
+}

@@ -1,0 +1,452 @@
+{
+  "id": "os",
+  "name": "Operating Systems",
+  "symbol": "terminal",
+  "summary": "The layer that turns raw hardware into safe, shareable abstractions: processes, scheduling, memory, I/O and isolation. Every server, database and GPU job ultimately runs on these mechanisms.",
+  "topics": [
+    {
+      "id": "processes-threads",
+      "title": "Processes & Threads",
+      "gist": "A process is a running program with its own private memory; threads are multiple workers inside one process that share that memory and run at the same time.",
+      "overview": [
+        "When you launch a program, the operating system creates a **process**: a container holding the program's code, its private memory, its open files and at least one thread of execution. Processes are walled off from one another, so a crash in your browser tab doesn't corrupt your text editor.",
+        "A **thread** is a single line of execution inside a process. One process can have many threads, all sharing the same memory. Think of a process as a kitchen and threads as cooks: cooks in the same kitchen share ingredients and counters (fast, but they can bump into each other), while separate kitchens are safer but must pass dishes through a window to cooperate.",
+        "Designers constantly choose between these models. Many processes give isolation and crash safety (Chrome runs each site in its own process). Many threads give cheap sharing and fast communication (a database's worker pool). And many languages now add lightweight **green threads** (Go goroutines, Java virtual threads) that let a program juggle millions of tasks on a handful of real OS threads."
+      ],
+      "diagram": {
+        "caption": "What a process contains and what its threads share.",
+        "steps": [
+          { "label": "Process", "detail": "PID, credentials, resource limits" },
+          { "label": "Address space", "detail": "Code, heap, mmaps; shared by threads" },
+          { "label": "File descriptors", "detail": "Sockets, files, pipes; shared" },
+          { "label": "Threads", "detail": "Own stack, registers, signal mask" },
+          { "label": "Kernel task_struct", "detail": "One per thread on Linux" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Process control block (task_struct)", "role": "The kernel's record for each schedulable task on Linux: state, priority, pointers to the memory map (mm_struct), file table, credentials and namespaces." },
+          { "name": "Address space", "role": "The virtual memory map: text, data, heap, memory-mapped files and one stack per thread. Threads of a process share one map; separate processes get separate maps." },
+          { "name": "File descriptor table", "role": "Per-process array of integers pointing to open files, sockets and pipes; inherited across fork and kept across exec unless marked close-on-exec." },
+          { "name": "Thread context", "role": "Registers, program counter, stack pointer, thread-local storage and signal mask; the state saved and restored on every context switch." },
+          { "name": "clone() / fork() / exec()", "role": "Linux creates both processes and threads with clone(), using flags (CLONE_VM, CLONE_FILES, CLONE_THREAD) to decide what is shared; exec() replaces the program image." }
+        ],
+        "flow": [
+          "A shell calls fork() (really clone() without sharing flags); the kernel copies the task_struct and marks the parent's pages copy-on-write instead of copying memory.",
+          "The child calls execve(), which discards the copied address space and maps the new program's ELF segments, a fresh stack and the dynamic loader.",
+          "The dynamic loader maps shared libraries such as libc and jumps to main().",
+          "The program calls pthread_create(), which invokes clone() with CLONE_VM | CLONE_FILES | CLONE_THREAD and a newly mmapped stack, creating a thread sharing everything but registers and stack.",
+          "The scheduler runs each thread independently on any core; threads coordinate with futex-based mutexes and condition variables.",
+          "When a thread exits, its stack is released; when the last thread exits, the process becomes a zombie until the parent collects its exit status with wait()."
+        ],
+        "tradeoffs": [
+          { "choice": "Process per task", "pro": "Strong isolation: a crash or memory corruption is contained, and privileges can differ per process.", "con": "Higher memory overhead, costlier creation and context switches, and communication needs IPC (pipes, sockets, shared memory)." },
+          { "choice": "Thread per task", "pro": "Cheap sharing of memory and file descriptors, fast communication.", "con": "Data races and deadlocks; one bad pointer crashes everything; ~8 MB virtual stack each limits counts." },
+          { "choice": "User-space green threads (M:N)", "pro": "Millions of tasks with ~KB stacks and context switches in ~100-200 ns without entering the kernel.", "con": "Blocking system calls or long CPU loops can stall an OS thread; needs runtime support for preemption and async I/O." }
+        ],
+        "numbers": [
+          { "metric": "Thread context switch on modern x86 Linux", "value": "~1-3 µs including cache effects" },
+          { "metric": "Default glibc thread stack (virtual)", "value": "~8 MB" },
+          { "metric": "Go goroutine initial stack (Go 1.4+)", "value": "~2 KB, grows dynamically" },
+          { "metric": "fork() of a process with ~1 GB resident memory", "value": "~1-10 ms (page-table copying)" },
+          { "metric": "Linux pid_max upper limit (64-bit)", "value": "~4.2 million (2^22)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Linux has no separate kernel notion of 'thread': every thread is a task with its own TID, and a 'process' is a thread group sharing a TGID. That's why ps -L, /proc/<pid>/task and per-thread CPU accounting work the way they do, and why signals are subtle: a process-directed signal is delivered to any thread that hasn't blocked it, so robust multithreaded programs block signals everywhere and handle them in one dedicated thread or via signalfd.",
+          "fork() in a multithreaded program copies only the calling thread, but it copies all memory, including mutexes held by threads that no longer exist in the child. The child can deadlock on the first malloc. POSIX only guarantees async-signal-safe calls between fork and exec, which is why posix_spawn() and vfork()/CLONE_VFORK are preferred for launching subprocesses from big multithreaded servers; they also avoid copying page tables for large heaps, which can take tens of milliseconds and stall the parent.",
+          "Green threads moved the scheduling problem into runtimes. Go multiplexes goroutines (G) onto OS threads (M) via per-core run queues (P), with asynchronous preemption via signals since Go 1.14; Java 21 virtual threads mount onto carrier threads and unmount when they block, though early versions pinned carriers inside synchronized blocks until JDK 24 (JEP 491) fixed it. Rust's Tokio uses stackless futures instead. The OS still sees only a few threads, so OS-level tools (top, perf) need runtime-aware profilers to make sense of behaviour."
+        ],
+        "failureModes": [
+          { "name": "Zombie and orphan buildup", "description": "A parent never calls wait(), so exited children stay as zombies holding PIDs; in containers without a proper init, PID 1 doesn't reap orphans and the PID limit is eventually hit. Fix: reap children (SIGCHLD handler or waitpid loop) and use a minimal init like tini or docker run --init." },
+          { "name": "Fork-after-threads deadlock", "description": "A child process created by fork() in a multithreaded server hangs forever on a lock that another thread held at fork time (often inside malloc or logging). Fix: use posix_spawn, or fork only before starting threads, and exec immediately." },
+          { "name": "Thread explosion", "description": "A thread-per-connection server under a traffic spike creates tens of thousands of threads, exhausting memory and pid limits and thrashing the scheduler. Fix: bounded thread pools, event loops, or virtual threads with backpressure." }
+        ],
+        "realSystems": [
+          { "name": "Google Chrome", "note": "Multi-process architecture with site isolation: each site's renderer runs in a sandboxed process so exploits and crashes are contained." },
+          { "name": "PostgreSQL", "note": "Classic process-per-connection design forked from a postmaster; connection poolers like PgBouncer exist partly because each backend costs megabytes and a fork." },
+          { "name": "Go runtime", "note": "M:N scheduler running millions of goroutines on GOMAXPROCS OS threads, with work stealing and a netpoller built on epoll/kqueue." }
+        ],
+        "questions": [
+          { "q": "When would you choose processes over threads for a server design?", "a": "When isolation matters more than sharing: untrusted or crash-prone code (browser renderers, plugins), different privilege levels, or languages with a global interpreter lock (CPython multiprocessing). Processes also make memory leaks recoverable by recycling workers. Threads win when tasks share large in-memory state and communicate often." },
+          { "q": "Why can a Redis BGSAVE double memory usage, and how is it bounded?", "a": "Redis forks a child that writes the snapshot while the parent keeps serving writes. Pages are shared copy-on-write, so every page the parent modifies during the snapshot is duplicated. Worst case is a full copy if the whole dataset is written; it is bounded by write rate times snapshot duration, and made worse by transparent huge pages, since one byte written copies 2 MB." },
+          { "q": "How many threads should a CPU-bound worker pool have, and why is I/O-bound different?", "a": "For CPU-bound work, roughly one thread per available core (respecting cgroup CPU quotas, not host core count), since more just adds context switches. For I/O-bound work, threads spend most time blocked, so you need about cores x (1 + wait/compute time), or better, an async event loop or virtual threads that don't tie up an OS thread while waiting." }
+        ]
+      },
+      "related": ["cpu-scheduling", "virtual-memory", "syscalls-kernel", "containers-vms", "isolation-sandboxing"]
+    },
+    {
+      "id": "cpu-scheduling",
+      "title": "CPU Scheduling",
+      "gist": "The scheduler is the operating system's traffic cop, deciding which of many waiting threads gets to run on each CPU core, and for how long.",
+      "overview": [
+        "A typical computer has far more threads wanting to run than it has CPU cores. The **scheduler** decides who runs next, on which core, and when to interrupt them so someone else gets a turn. It makes this decision thousands of times per second on every core.",
+        "Think of a busy shared gym with a few treadmills. A fair attendant gives everyone time slots proportional to their membership tier, lets people who just arrived (or who rarely use the machines) hop on quickly, and keeps people on the same treadmill they warmed up on. Schedulers balance exactly these goals: fairness, responsiveness for interactive tasks, throughput for heavy work, and keeping threads near their cached data.",
+        "Linux's general-purpose scheduler was rewritten in 2023 (the EEVDF scheduler replaced CFS), and since 2024 Linux also lets companies plug in their own scheduling policies written as safe BPF programs. Special real-time classes exist for tasks like audio or robotics that must run within strict deadlines."
+      ],
+      "diagram": {
+        "caption": "How Linux picks the next task on a core.",
+        "steps": [
+          { "label": "Timer or wakeup", "detail": "Preemption point or task becomes runnable" },
+          { "label": "Scheduling class", "detail": "Deadline > RT > fair > idle" },
+          { "label": "Per-CPU runqueue", "detail": "Red-black tree by deadline" },
+          { "label": "Pick next task", "detail": "Earliest eligible virtual deadline" },
+          { "label": "Context switch", "detail": "Swap registers, maybe address space" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Scheduling classes", "role": "Linux checks classes in priority order: SCHED_DEADLINE (EDF with runtime/period budgets), SCHED_FIFO/SCHED_RR real-time, the fair class (SCHED_NORMAL/BATCH, now EEVDF), sched_ext BPF schedulers, and idle." },
+          { "name": "Per-CPU runqueues", "role": "Each core has its own queue of runnable tasks, avoiding a global lock; fair tasks sit in a red-black tree ordered by virtual deadline." },
+          { "name": "Weights and nice values", "role": "Nice -20 to +19 maps to weights (nice 0 = 1024, each step ~1.25x), so CPU share is proportional to weight among competing tasks." },
+          { "name": "Load balancer", "role": "Periodically and on idle, migrates tasks between cores within scheduling domains (SMT siblings, cache clusters, NUMA nodes), trading cache warmth against balance." },
+          { "name": "cgroup CPU controller", "role": "Groups tasks for hierarchical fair sharing (cpu.weight) and hard caps (cpu.max quota per period), the mechanism behind container CPU requests and limits." }
+        ],
+        "flow": [
+          "A timer interrupt fires or a sleeping task wakes (for example when its network packet arrives), and the kernel sets a need-resched flag if the woken task should preempt the current one.",
+          "At the next preemption point (return from interrupt or syscall, or immediately on fully preemptible kernels), schedule() runs.",
+          "It asks each scheduling class in priority order for a task; real-time or deadline tasks always win over fair tasks.",
+          "In the fair class, EEVDF picks among eligible tasks (those not ahead of their fair share) the one with the earliest virtual deadline, computed from its requested slice and weight.",
+          "The kernel switches context: saves registers, switches stacks, and switches page tables if the new task is in a different process.",
+          "The running task's virtual runtime advances at a rate inversely proportional to its weight, so heavier tasks get more real time.",
+          "Periodically the load balancer pulls tasks from busy cores to idle ones, preferring moves within the same cache or NUMA domain."
+        ],
+        "tradeoffs": [
+          { "choice": "Short time slices", "pro": "Better responsiveness and lower latency for interactive or request-serving threads.", "con": "More context switches and cache pollution, reducing throughput for batch work." },
+          { "choice": "Aggressive load balancing", "pro": "Idle cores are filled quickly and tail latency drops.", "con": "Migrations lose warm caches and may cross NUMA nodes, slowing memory access." },
+          { "choice": "Hard CPU limits (cgroup cpu.max)", "pro": "Predictable isolation for multi-tenant containers.", "con": "Throttling: a bursty multithreaded app can burn its quota early and stall for the rest of the period, causing latency spikes." },
+          { "choice": "Real-time classes (SCHED_FIFO)", "pro": "Bounded latency for control loops, audio and trading systems.", "con": "A runaway RT thread can starve the whole system; needs RT throttling and careful priority design." }
+        ],
+        "numbers": [
+          { "metric": "EEVDF default base slice (Linux 6.6+)", "value": "~0.75 ms x (1 + log2 CPUs), ~3 ms on 8+ cores" },
+          { "metric": "Default cgroup CFS bandwidth period", "value": "100 ms" },
+          { "metric": "Weight ratio per nice level", "value": "~1.25x (nice 0 = 1024)" },
+          { "metric": "PREEMPT_RT worst-case latency on tuned x86", "value": "~tens of µs" },
+          { "metric": "Remote NUMA memory access penalty", "value": "~1.5-2x local latency" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "EEVDF (Earliest Eligible Virtual Deadline First), merged in Linux 6.6 in late 2023, replaced CFS's heuristic-laden wakeup preemption with a cleaner model: each task has a lag (service owed minus received) and is eligible only when lag is non-negative; among eligible tasks the earliest virtual deadline (eligible time plus slice/weight) runs. Latency-sensitive tasks can request shorter slices (sched_setattr with sched_runtime, from Linux 6.12), which gives them earlier deadlines without giving them more total CPU, something CFS could not express. Lag is preserved across short sleeps so tasks can't game fairness by sleeping.",
+          "sched_ext, merged in Linux 6.12 (November 2024), lets BPF programs implement whole scheduling policies, loaded at runtime with automatic fallback to the fair class if the scheduler misbehaves or stalls a task (watchdog). Meta runs scx_layered in production to partition hosts into latency-sensitive and batch layers; Valve and Linux gamers use scx_lavd; Google's earlier ghOSt explored user-space scheduling delegation. This turns scheduling into something tuned per workload rather than one compromise for all.",
+          "Containers expose a classic pitfall: the CFS bandwidth controller enforces cpu.max per period across all threads, so a 2-CPU limit on a 32-thread JVM lets the app burn 200 ms of CPU in ~6 ms of wall time and then stall for ~94 ms. Kernel fixes (Linux 5.4 removed a per-CPU slice expiry bug) and cpu.max.burst (5.14) help, but many teams now set CPU requests without limits, or use Kubernetes' static CPU manager to pin Guaranteed pods to exclusive cores. Hybrid CPUs (Intel P/E cores with Thread Director, Apple's P/E clusters with QoS classes) add another axis: the scheduler must pick not just when but on which kind of core."
+        ],
+        "failureModes": [
+          { "name": "CFS quota throttling", "description": "A latency-sensitive service shows p99 spikes of ~100 ms despite low average CPU, because bursts exhaust the cgroup quota early in each 100 ms period. Check nr_throttled in cpu.stat. Fix: remove or raise limits, use cpu.max.burst, size thread pools to the quota, or pin to dedicated cores." },
+          { "name": "Priority inversion", "description": "A high-priority task waits on a lock held by a low-priority task that is preempted by medium-priority work, so the high-priority task misses deadlines (famously on Mars Pathfinder in 1997). Fix: priority-inheritance mutexes (PTHREAD_PRIO_INHERIT, rt_mutex) and avoiding shared locks across priority levels." },
+          { "name": "NUMA-blind placement", "description": "Threads migrate away from the node holding their memory, and throughput drops 20-40% from remote memory accesses. Fix: numactl or cpusets to bind threads and memory together, and NUMA-aware allocators; check automatic NUMA balancing behaviour." }
+        ],
+        "realSystems": [
+          { "name": "Meta scx_layered", "note": "A sched_ext BPF scheduler deployed across Meta's fleet that groups tasks into layers with different policies to protect latency-critical services from batch work." },
+          { "name": "Kubernetes CPU manager", "note": "The static policy gives Guaranteed pods with integer CPU requests exclusive cores via cpusets, avoiding CFS quota throttling and noisy neighbours." },
+          { "name": "Apple macOS / iOS QoS", "note": "Threads declare quality-of-service classes (user-interactive through background) that steer them onto performance or efficiency cores and set their priority." }
+        ],
+        "questions": [
+          { "q": "A Kubernetes service with a 4-CPU limit shows 100 ms latency spikes while averaging 30% CPU. Diagnose it.", "a": "This is the signature of CFS bandwidth throttling: many threads burst together, burn the 400 ms quota for the 100 ms period in a few ms, and the whole cgroup stalls until the next period. Confirm via nr_throttled and throttled_usec in cpu.stat. Fix by removing the limit (keep the request), enabling cpu.max.burst, reducing thread pool sizes to match the quota, or using exclusive cores." },
+          { "q": "How does a fair scheduler keep an interactive app responsive while a compile job uses every core?", "a": "Interactive tasks sleep most of the time, so they accumulate little virtual runtime and are eligible with early deadlines when they wake; EEVDF lets them preempt the compile threads promptly. Their short bursts finish within one slice. Raising the compile job's nice value or putting it in a lower-weight cgroup further shifts share toward interactive work." },
+          { "q": "When would you use SCHED_DEADLINE instead of SCHED_FIFO?", "a": "When tasks have periodic work with known runtime budgets, like a 1 kHz control loop needing 200 µs every 1 ms. SCHED_DEADLINE runs earliest-deadline-first with admission control that rejects task sets that would overcommit the CPU, and it enforces budgets so one task can't starve others, which fixed-priority FIFO cannot guarantee." }
+        ]
+      },
+      "related": ["processes-threads", "containers-vms", "batching", "syscalls-kernel", "av-safety"]
+    },
+    {
+      "id": "virtual-memory",
+      "title": "Virtual Memory & Paging",
+      "gist": "Every program believes it has its own huge, private memory; the hardware and OS quietly translate those fake addresses to real RAM, one page at a time.",
+      "overview": [
+        "Programs don't use physical RAM addresses directly. Each process gets its own **virtual address space**, a private, enormous range of addresses, and the hardware translates each virtual address to a real location in RAM on every memory access. Memory is managed in fixed-size chunks called **pages**, typically 4 KB.",
+        "It works like a hotel where every guest is told their room is number 100. The front desk keeps a ledger (the **page table**) mapping each guest's 'room 100' to the actual room they occupy. Guests can't wander into each other's rooms, the hotel can move guests around without telling them, and rooms are only assigned when a guest actually shows up.",
+        "That indirection buys a lot: isolation between programs, the ability to promise more memory than physically exists, loading program code lazily from disk, sharing one copy of a library among hundreds of processes, and instant process copies via copy-on-write. The cost is translation overhead, which the CPU hides with a small cache of recent translations called the **TLB**."
+      ],
+      "diagram": {
+        "caption": "Translating one virtual address on x86-64.",
+        "steps": [
+          { "label": "Virtual address", "detail": "48-bit, per process" },
+          { "label": "TLB lookup", "detail": "Hit in ~1 cycle, usually" },
+          { "label": "Page-table walk", "detail": "4 levels on a miss" },
+          { "label": "Page fault", "detail": "Kernel allocates or loads page" },
+          { "label": "Physical frame", "detail": "Real DRAM location" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "MMU and page tables", "role": "The CPU's memory management unit walks a radix tree of page tables (4 levels for 48-bit addresses on x86-64, 5 levels for 57-bit) pointed to by the CR3 register." },
+          { "name": "TLB", "role": "A per-core cache of recent translations, typically ~64 L1 entries and ~1,500-3,000 shared L2 entries; huge pages let one entry cover 2 MB or 1 GB." },
+          { "name": "Page fault handler", "role": "The kernel routine invoked when a page is missing or protected: it allocates a zeroed page, reads from file or swap, breaks copy-on-write, or delivers SIGSEGV." },
+          { "name": "Page cache", "role": "Kernel cache of file contents in RAM; mmap'd files and read() share it, and dirty pages are written back asynchronously." },
+          { "name": "Reclaim and swap", "role": "When memory is short, the kernel evicts clean file pages, writes anonymous pages to swap or zram, and ultimately invokes the OOM killer; Linux 6.1+ uses multi-generational LRU (MGLRU) to pick victims." }
+        ],
+        "flow": [
+          "The program loads from a virtual address; the CPU checks the TLB, which usually hits.",
+          "On a TLB miss, the hardware page walker reads up to four page-table entries from cache or memory to find the physical frame.",
+          "If the entry is not present (first touch of malloc'd memory, an unread file page, or swapped-out data), the CPU raises a page fault.",
+          "The kernel finds the virtual memory area (VMA) covering the address, checks permissions, and allocates a frame, reads it from disk, or copies it for copy-on-write.",
+          "The kernel installs the page-table entry and returns; the instruction retries and now succeeds.",
+          "Under memory pressure, background reclaim (kswapd) ages pages, writes back dirty ones and unmaps cold pages, which requires TLB shootdowns via inter-processor interrupts on other cores."
+        ],
+        "tradeoffs": [
+          { "choice": "Huge pages (2 MB / 1 GB)", "pro": "Far fewer TLB misses and shorter page walks; often 5-20% faster for large-heap databases and VMs.", "con": "Internal fragmentation, costly compaction to find contiguous memory, and bigger copy-on-write copies." },
+          { "choice": "Memory overcommit", "pro": "Programs can reserve large sparse regions and fork cheaply; utilization stays high.", "con": "The OOM killer may terminate a process later when promised memory is actually touched." },
+          { "choice": "Swap enabled", "pro": "Cold anonymous pages move out, freeing RAM for active data and page cache.", "con": "Latency cliffs if hot pages are swapped; many latency-critical services disable swap or use zram." },
+          { "choice": "Larger base pages (16 KB on Apple Silicon, Android 15+ option)", "pro": "4x TLB reach and fewer faults; Android reported ~5-10% app performance gains.", "con": "More memory waste for small allocations and compatibility issues for code assuming 4 KB pages." }
+        ],
+        "numbers": [
+          { "metric": "x86-64 virtual address space, 4-level paging", "value": "48 bits = 256 TiB" },
+          { "metric": "x86-64 with 5-level paging (Ice Lake+)", "value": "57 bits = 128 PiB" },
+          { "metric": "Minor page fault cost", "value": "~0.5-2 µs" },
+          { "metric": "Major fault from NVMe SSD", "value": "~50-100 µs" },
+          { "metric": "TLB miss page walk", "value": "~20-100+ cycles; worse in VMs" },
+          { "metric": "Apple Silicon (M-series) base page size", "value": "16 KB" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "TLB reach is the hidden limit for big-memory workloads. With ~2,000 L2 TLB entries and 4 KB pages, a core covers only ~8 MB; random access over a 100 GB heap misses constantly, and each miss is a dependent chain of up to four memory loads (up to 24 in a VM with nested paging, since every guest page-table access also needs host translation). Transparent huge pages (THP) automatically promote aligned 2 MB regions, but khugepaged and synchronous compaction can cause latency spikes, which is why Redis, MongoDB and some JVMs advise madvise-only THP. Linux's ongoing folio conversion and multi-size THP (mTHP, 6.8+) allow intermediate 16-64 KB allocations as a middle ground.",
+          "Address-space changes are expensive in multithreaded processes because other cores may cache stale translations. munmap, mprotect and page migration require TLB shootdowns: IPIs to every core running the process, each flushing entries and acknowledging. Heavy mmap/munmap churn (some allocators, garbage collectors returning memory) can therefore serialize a 64-core process. PCIDs (process-context identifiers) avoid full flushes on context switch, which became important after KPTI made every syscall switch page tables.",
+          "Overcommit and the OOM killer define failure semantics. Linux by default (vm.overcommit_memory=0) heuristically allows allocations beyond RAM plus swap, so failure arrives as a SIGKILL from the OOM killer at page-fault time rather than a NULL from malloc. In containers, cgroup v2 memory.max triggers a cgroup-local OOM, memory.high throttles via reclaim first, and PSI (pressure stall information) lets user-space daemons like systemd-oomd and Meta's oomd kill gracefully before the kernel does. The same virtual-memory ideas reappear elsewhere: PagedAttention for LLM KV caches and GPU unified memory both apply paging with software or driver-managed page tables."
+        ],
+        "failureModes": [
+          { "name": "Thrashing", "description": "The working set exceeds RAM, so the system spends its time faulting pages in and out; CPU is busy in reclaim, latency explodes and the machine appears hung. Fix: reduce working set, add memory, disable or limit swap for latency-critical services, and use PSI-based early killing." },
+          { "name": "THP compaction stalls", "description": "Allocating huge pages on a fragmented system triggers synchronous compaction, causing multi-millisecond pauses in databases like Redis. Fix: set THP to madvise or never, or defrag=defer, and use explicitly reserved hugetlbfs pages where needed." },
+          { "name": "Container OOM kills without warning", "description": "A JVM or Python process exceeds its cgroup memory.max because page cache, off-heap buffers or thread stacks weren't counted, and is SIGKILLed with exit code 137. Fix: size heaps from cgroup limits (JVM UseContainerSupport), monitor memory.current and memory.events, and set memory.high below memory.max." }
+        ],
+        "realSystems": [
+          { "name": "Redis BGSAVE", "note": "Uses fork() and copy-on-write so the child snapshots a consistent view while the parent keeps serving writes." },
+          { "name": "vLLM PagedAttention", "note": "Applies OS-style paging and block tables to the GPU KV cache, eliminating fragmentation in LLM serving." },
+          { "name": "Android 16 KB pages", "note": "Android 15 added 16 KB page support and Google Play began requiring 16 KB-compatible native code for new apps targeting Android 15+ in 2025, citing ~5-10% performance gains." }
+        ],
+        "questions": [
+          { "q": "Why might a database run faster with huge pages, and what's the risk?", "a": "A buffer pool of hundreds of GB with 4 KB pages blows through the TLB, so most random accesses add a page walk; 2 MB or 1 GB pages raise TLB reach by 512x or more and cut walk depth. The risks are fragmentation and compaction stalls with THP, so production databases often reserve explicit hugetlbfs pages at boot (PostgreSQL huge_pages=on, Oracle) instead." },
+          { "q": "malloc(10 GB) succeeds on a machine with 8 GB RAM. Explain, and what happens next?", "a": "malloc for large sizes uses mmap, which only reserves virtual address space; with default overcommit, no physical pages are allocated until touched. As the program writes to the memory, page faults allocate frames until RAM and swap run out, at which point the OOM killer terminates some process, possibly this one." },
+          { "q": "How does fork() avoid copying the entire parent's memory?", "a": "The kernel copies the page tables but marks all writable private pages read-only in both parent and child, sharing the same frames. When either writes, a protection fault triggers copy-on-write: the kernel copies just that page and makes it writable. Page-table copying itself still costs time for large processes, which is why vfork or posix_spawn are used before exec." }
+        ]
+      },
+      "related": ["processes-threads", "kv-cache", "gpu-memory-hierarchy", "storage-devices", "file-systems", "syscalls-kernel"]
+    },
+    {
+      "id": "syscalls-kernel",
+      "title": "The Kernel & System Calls",
+      "gist": "The kernel is the privileged core of the operating system; programs ask it to do protected things, like reading files or sending data, through system calls.",
+      "overview": [
+        "The **kernel** is the part of the operating system that runs with full control of the hardware. Ordinary programs run in a restricted mode where they cannot touch devices, other programs' memory, or the CPU's control settings directly. This split keeps a buggy or malicious app from taking down the whole machine.",
+        "When a program needs something only the kernel can do (open a file, send a network packet, create a thread, get more memory) it makes a **system call**. It's like a bank: customers can't walk into the vault, so they fill in a slip at the teller window, the teller checks it, does the work behind the counter, and hands back the result.",
+        "Crossing that counter costs time, so fast systems try to cross it less often: they batch requests, share memory with the kernel, or handle some work without the kernel at all. Modern Linux also lets you run small, verified programs *inside* the kernel with **eBPF**, safely adding observability, networking and security logic without writing kernel modules."
+      ],
+      "diagram": {
+        "caption": "Life of a read() system call on x86-64 Linux.",
+        "steps": [
+          { "label": "libc wrapper", "detail": "Syscall number into rax" },
+          { "label": "syscall instruction", "detail": "Ring 3 to ring 0" },
+          { "label": "Entry & dispatch", "detail": "Save registers, index syscall table" },
+          { "label": "VFS / driver work", "detail": "Copy data, maybe sleep" },
+          { "label": "sysret to user", "detail": "Return value or -errno" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Privilege levels", "role": "x86 ring 0 vs ring 3 (ARM EL1 vs EL0): only kernel mode can execute privileged instructions, change page tables or access device registers." },
+          { "name": "System call interface", "role": "A numbered table of entry points (~460 on x86-64 Linux 6.x), invoked via the syscall instruction (svc on ARM) with arguments in registers." },
+          { "name": "Kernel subsystems", "role": "Process management, memory management, VFS and file systems, networking stack, device drivers and security modules (SELinux, AppArmor, Landlock)." },
+          { "name": "vDSO", "role": "A small kernel-provided shared library mapped into every process so calls like clock_gettime and gettimeofday run in user space without a mode switch." },
+          { "name": "eBPF", "role": "In-kernel virtual machine running verified programs attached to hooks (kprobes, tracepoints, XDP, cgroups, LSM), JIT-compiled to native code." },
+          { "name": "seccomp", "role": "Per-process syscall filter (a BPF program) that blocks or traps disallowed syscalls; used by Docker, Chrome and systemd to shrink attack surface." }
+        ],
+        "flow": [
+          "The program calls read(fd, buf, n); the libc wrapper places the syscall number and arguments in registers and executes syscall.",
+          "The CPU switches to ring 0, jumps to the kernel entry point, and swaps to the kernel stack (and, with KPTI, to kernel page tables).",
+          "The entry code saves user registers, runs seccomp and audit hooks if configured, and dispatches through the syscall table.",
+          "The VFS resolves the file descriptor; if data is in the page cache it is copied to the user buffer with copy_to_user; otherwise the task sleeps while the block driver issues I/O.",
+          "On completion the kernel checks for pending signals or reschedule requests, restores registers and executes sysret back to user mode.",
+          "The libc wrapper turns a negative return into -1 plus errno, and the program continues."
+        ],
+        "tradeoffs": [
+          { "choice": "Monolithic kernel (Linux)", "pro": "Fast: drivers and subsystems call each other directly in one address space.", "con": "A bug in any driver can crash or compromise the whole kernel." },
+          { "choice": "Microkernel (seL4, QNX, Fuchsia's Zircon)", "pro": "Drivers and services run in user space; smaller trusted base, formal verification possible (seL4).", "con": "More IPC and context switches; historically slower for I/O-heavy work." },
+          { "choice": "Kernel bypass (DPDK, SPDK, RDMA)", "pro": "No syscalls or interrupts in the data path; millions of packets or IOPS per core.", "con": "Gives up kernel features (TCP stack, firewall, sharing) and burns cores busy-polling." },
+          { "choice": "eBPF instead of kernel modules", "pro": "Safe, verified, hot-loadable extensions without rebooting or risking panics.", "con": "Verifier limits on loops and complexity; kernel-version-dependent features and helpers." }
+        ],
+        "numbers": [
+          { "metric": "Minimal syscall round trip (getpid-class) on modern x86", "value": "~50-150 ns; more with mitigations" },
+          { "metric": "vDSO clock_gettime", "value": "~15-25 ns" },
+          { "metric": "System calls on x86-64 Linux 6.x", "value": "~460" },
+          { "metric": "KPTI (Meltdown mitigation) overhead on syscall-heavy loads", "value": "~5-30% on affected CPUs" },
+          { "metric": "Linux kernel source size (6.x)", "value": "~35-40 million lines" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The direct cost of a syscall is small; the indirect costs dominate. Entering the kernel pollutes L1 caches, branch predictors and TLBs, and post-2018 mitigations add work: KPTI switches page tables on every entry on Meltdown-affected CPUs, retpolines or IBRS slow indirect branches, and Spectre-BHI and Retbleed fixes added further barriers. Newer CPUs (Intel since Ice Lake/Sapphire Rapids, AMD Zen) need fewer mitigations, which is one reason syscall-heavy benchmarks vary so much across hardware. FlexSC-style measurements showed user-mode IPC can drop by half for thousands of cycles after a syscall.",
+          "The modern answer to syscall overhead is to amortize or eliminate transitions: batch with readv/writev, sendmmsg and recvmmsg; share ring buffers with the kernel (io_uring, AF_XDP, perf rings); move hot logic into the kernel (eBPF/XDP drops DDoS packets before skb allocation at ~10+ Mpps per core); or bypass the kernel entirely (DPDK, SPDK, RDMA verbs). Each step trades away generality, observability or security policy for speed.",
+          "The kernel is also the main attack surface for container escapes, since all containers on a host share it. seccomp default profiles block ~40-60 rarely needed syscalls, Landlock (5.13+) lets unprivileged processes sandbox their own file access, and Rust has been accepted for new drivers since Linux 6.1 (with Rust-based components like the Nova GPU driver and Android Binder work landing through 2025) to cut memory-safety bugs, which make up roughly two-thirds of kernel CVEs. Sandboxes like gVisor go further by reimplementing the syscall surface in a user-space kernel."
+        ],
+        "failureModes": [
+          { "name": "Syscall storm", "description": "Code issues tiny read()/write() calls per byte or per message, or polls gettimeofday on a system where the vDSO is disabled (some VMs with unstable clocksources), burning CPU in kernel entry. Symptom: high sys% in top and perf showing entry_SYSCALL_64. Fix: buffer I/O, batch calls, use io_uring, and fix the clocksource (tsc instead of a paravirtual one where safe)." },
+          { "name": "seccomp breakage", "description": "A new glibc or runtime starts using a newer syscall (clone3, statx, io_uring_setup) that an older container seccomp profile denies, so programs fail with EPERM or ENOSYS mysteriously. Fix: update seccomp profiles alongside base images and test with strace -f to see the denied call." },
+          { "name": "Kernel panics from drivers", "description": "Out-of-tree kernel modules (GPU, storage, security agents) crash the host, as in the July 2024 CrowdStrike Windows incident that bricked ~8.5 million machines via a faulty kernel-mode driver content update. Fix: prefer eBPF or user-space agents, stage rollouts, and keep a known-good boot path." }
+        ],
+        "realSystems": [
+          { "name": "Cilium", "note": "Kubernetes networking and security built on eBPF, replacing iptables chains with BPF maps and programs at the socket and XDP layers." },
+          { "name": "gVisor", "note": "Google's user-space application kernel (Sentry) that intercepts container syscalls, used in GKE Sandbox and Cloud Run, shrinking the host kernel surface exposed to untrusted code." },
+          { "name": "bpftrace and strace", "note": "strace uses ptrace to log syscalls (high overhead); bpftrace attaches eBPF to tracepoints for low-overhead production tracing." }
+        ],
+        "questions": [
+          { "q": "Your service spends 40% of CPU in kernel mode. How do you investigate and reduce it?", "a": "Profile with perf top or a flame graph including kernel stacks, and count syscalls with bpftrace or strace -c to find which calls dominate. Typical fixes: larger buffers and batching (writev, sendmmsg), avoiding needless syscalls like repeated stat or time calls, epoll or io_uring for many sockets, and checking for lock contention in the kernel (futex) or excessive page faults." },
+          { "q": "Why are some syscalls like clock_gettime nearly free?", "a": "They are implemented in the vDSO, a kernel-maintained code page mapped into user space that reads a shared data page updated by the kernel plus the CPU's TSC. No privilege transition happens, so it costs tens of nanoseconds. It only works when the clocksource is readable from user space; otherwise it falls back to a real syscall." },
+          { "q": "When would you use eBPF versus a kernel module versus a user-space daemon?", "a": "Use a user-space daemon when latency allows and you want easy development and isolation. Use eBPF for safe in-kernel observability, packet filtering or security hooks that must see every event at low overhead, accepting verifier constraints. Write a kernel module only for new hardware drivers or functionality eBPF can't express, since bugs can crash the machine." }
+        ]
+      },
+      "related": ["io-models", "processes-threads", "virtual-memory", "isolation-sandboxing", "datacenter-networking", "containers-vms"]
+    },
+    {
+      "id": "io-models",
+      "title": "I/O Models: epoll & io_uring",
+      "gist": "How a program waits for slow things like network data and disk reads decides whether one server can handle ten connections or a million.",
+      "overview": [
+        "Disks and networks are millions of times slower than the CPU. The simplest way to read data is **blocking I/O**: ask, then sleep until the answer arrives. That's fine for one task, but a server with 100,000 connections can't dedicate a sleeping thread to each one.",
+        "Picture a waiter in a restaurant. With blocking I/O, a waiter stands at one table until that diner decides, so you need one waiter per table. With **event notification** (select, poll, epoll, kqueue) a single waiter scans the room and only visits tables whose diners have raised a hand. With **completion-based I/O** (io_uring on Linux, IOCP on Windows) you hand the kitchen a stack of orders and simply collect finished dishes from a pass-through window.",
+        "Linux's **epoll** (2002) made it practical to watch hundreds of thousands of sockets with one thread and powers nginx, Node.js and Redis. **io_uring** (2019) goes further: the program and kernel share two ring buffers, one for requests and one for results, so many operations, including file I/O that epoll can't handle, are submitted and completed with few or even zero system calls."
+      ],
+      "diagram": {
+        "caption": "io_uring's shared submission and completion rings.",
+        "steps": [
+          { "label": "App fills SQEs", "detail": "Read, write, accept, send ops" },
+          { "label": "Submission queue", "detail": "Shared ring, no copying" },
+          { "label": "io_uring_enter", "detail": "One syscall, or SQPOLL thread" },
+          { "label": "Kernel executes", "detail": "Async, possibly via worker pool" },
+          { "label": "Completion queue", "detail": "App reaps CQEs from ring" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Non-blocking file descriptors", "role": "Sockets opened with O_NONBLOCK return EAGAIN instead of sleeping, so one thread can try many of them." },
+          { "name": "select / poll", "role": "Original readiness APIs: the caller passes the full list of fds every call and the kernel scans them all, O(n) per call." },
+          { "name": "epoll", "role": "Linux readiness API with a persistent interest set (epoll_ctl) and a ready list (epoll_wait), O(ready) per call; level- or edge-triggered." },
+          { "name": "kqueue / IOCP", "role": "BSD and macOS readiness-plus-events API (kqueue), and Windows completion ports (IOCP), the completion-model ancestor of io_uring." },
+          { "name": "io_uring", "role": "Linux 5.1+ interface with mmapped submission (SQ) and completion (CQ) rings, supporting reads, writes, accept, send/recv, fsync, timeouts, linked ops, registered buffers and multishot operations." },
+          { "name": "Event loop / runtime", "role": "User-space layer (libuv, Tokio, Netty, Seastar, Go netpoller) that turns readiness or completion events into callbacks, futures or resumed coroutines." }
+        ],
+        "flow": [
+          "With epoll, the server registers each socket once with epoll_ctl(EPOLL_CTL_ADD).",
+          "A packet arrives; the NIC interrupt and network stack queue data on the socket, and the socket's wait queue callback adds it to the epoll ready list.",
+          "The event loop's epoll_wait returns only the ready fds; the loop then issues non-blocking read() calls on each until EAGAIN.",
+          "With io_uring, the app instead writes submission entries (e.g. recv into a registered buffer) directly into the SQ ring in shared memory.",
+          "One io_uring_enter call submits a batch, or a kernel SQPOLL thread picks entries up with no syscall at all.",
+          "The kernel completes operations inline if data is ready, or arms a poll or hands them to async workers, then posts completion entries to the CQ ring.",
+          "The app reads CQEs from shared memory, matching them to requests via user_data, and resubmits; multishot accept/recv keep producing completions from one submission."
+        ],
+        "tradeoffs": [
+          { "choice": "Thread-per-connection blocking I/O", "pro": "Simple, linear code and easy debugging.", "con": "Memory and context-switch overhead limit you to thousands, not millions, of connections." },
+          { "choice": "epoll readiness model", "pro": "Mature, portable in spirit (kqueue), excellent for sockets; huge ecosystem.", "con": "Doesn't work for regular files (always 'ready'), and still needs one syscall per read/write." },
+          { "choice": "io_uring completion model", "pro": "Batching, true async file I/O, zero-copy send, fewer syscalls; big wins for storage-heavy and high-IOPS systems.", "con": "Complex API, kernel-version-dependent features, and a large attack surface that many sandboxes disable." },
+          { "choice": "Edge-triggered vs level-triggered epoll", "pro": "Edge-triggered reduces repeated wakeups for busy fds.", "con": "You must drain each fd until EAGAIN or you'll miss data and hang." }
+        ],
+        "numbers": [
+          { "metric": "epoll introduced", "value": "Linux 2.5.44 (2002)" },
+          { "metric": "io_uring introduced", "value": "Linux 5.1 (2019)" },
+          { "metric": "io_uring 4 KB random reads, one core (Jens Axboe, Optane, 2021)", "value": "~10M+ IOPS with polling" },
+          { "metric": "Typical NVMe SSD 4 KB read latency", "value": "~50-100 µs" },
+          { "metric": "Share of 2022 kCTF kernel exploit submissions using io_uring (Google)", "value": "~60%" },
+          { "metric": "C10K problem (Dan Kegel)", "value": "10,000 connections, 1999" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Readiness and completion models differ in who owns the buffer. With epoll the kernel says 'you can read now' and the app supplies a buffer at read time, so idle connections need no buffer. With io_uring or IOCP the app must provide a buffer up front for each outstanding receive, which wastes memory across 1M idle sockets; io_uring solves this with provided buffer rings (the kernel picks a buffer from a pool when data arrives) and multishot recv. Completion models also make cancellation and buffer lifetime tricky in safe languages: Rust runtimes like tokio-uring and monoio must keep buffers alive until the CQE arrives even if the future is dropped.",
+          "io_uring's power comes with operational caveats. Not every operation is truly async in the kernel: some fall back to io-wq worker threads, which can surprise people with thread counts and CPU usage. SQPOLL burns a core busy-polling. Google reported in 2023 that ~60% of exploits submitted to its kCTF kernel bug bounty in 2022 targeted io_uring, and it is disabled on ChromeOS, Android apps and Google production servers; Docker's and containerd's default seccomp profiles block it too. Linux 6.6 added a sysctl (kernel.io_uring_disabled) to turn it off system-wide.",
+          "Epoll has its own sharp edges. Many threads waiting on one epoll set or one listening socket cause thundering-herd wakeups, addressed by EPOLLEXCLUSIVE (4.5) and SO_REUSEPORT so each worker gets its own accept queue. Epoll registers the underlying open file description, not the fd number, so closing a duplicated fd doesn't remove it from the set. And disk files are always 'readable', so epoll-based runtimes (libuv, Tokio) push file I/O to thread pools; PostgreSQL 18 (2025) added io_method=io_uring for async reads, one of the first mainstream databases to adopt it."
+        ],
+        "failureModes": [
+          { "name": "Edge-triggered starvation", "description": "With EPOLLET, a handler reads only part of the available data and returns; no new edge fires, so the connection hangs. Fix: loop until EAGAIN, or use level-triggered mode; for fairness, bound per-fd work and requeue." },
+          { "name": "Event loop blocked", "description": "One CPU-heavy callback or a synchronous file read in Node.js or a Tokio task stalls every connection served by that loop, showing up as latency spikes across all clients. Fix: move CPU work and blocking calls to worker pools (spawn_blocking, worker_threads) and monitor event-loop lag." },
+          { "name": "io_uring blocked by sandbox", "description": "An application relying on io_uring fails with EPERM or ENOSYS in Docker, Kubernetes or gVisor because seccomp or the kernel disables it. Fix: detect at startup and fall back to epoll or a thread pool; document required kernel and seccomp settings." }
+        ],
+        "realSystems": [
+          { "name": "nginx", "note": "Event-driven worker processes, one per core, each running an epoll (or kqueue) loop over tens of thousands of connections, with SO_REUSEPORT to spread accepts." },
+          { "name": "ScyllaDB / Seastar", "note": "Shard-per-core C++ framework using Linux AIO and io_uring with its own I/O scheduler to saturate NVMe without kernel thread pools." },
+          { "name": "TigerBeetle", "note": "Financial database built on io_uring (kqueue on macOS) with direct I/O and a single-threaded event loop for deterministic, high-throughput storage." }
+        ],
+        "questions": [
+          { "q": "Design a server that handles 1 million mostly idle WebSocket connections.", "a": "Use an event-driven model (epoll via Netty, Tokio, or Go's netpoller) with a few threads per core and SO_REUSEPORT listeners. Keep per-connection memory tiny: no dedicated thread or receive buffer while idle, compact connection structs, and tuned TCP buffers. Raise fd limits and ephemeral/conntrack limits, and shard connections across several machines behind a load balancer for resilience." },
+          { "q": "When does io_uring beat epoll, and when is it not worth it?", "a": "io_uring wins for storage-heavy workloads (true async file I/O with batching and polled NVMe), very high message rates where syscall overhead dominates, and zero-copy networking. For typical web services, epoll plus a mature runtime is already efficient, more portable, and works in locked-down sandboxes where io_uring is disabled, so the added complexity often isn't worth it." },
+          { "q": "Why can't epoll make regular file reads asynchronous?", "a": "epoll reports readiness, and regular files are always considered ready, so a read() still blocks if the page isn't cached and the disk must be accessed. Async file I/O needs a completion interface (io_uring, Linux AIO with O_DIRECT, or IOCP) or offloading to a thread pool, which is what libuv and Tokio do." }
+        ]
+      },
+      "related": ["syscalls-kernel", "processes-threads", "storage-devices", "tcp-ip", "load-balancing", "file-systems"]
+    },
+    {
+      "id": "containers-vms",
+      "title": "Containers & Virtual Machines",
+      "gist": "Containers and virtual machines both let many isolated workloads share one physical computer; containers share the host's kernel, VMs each bring their own.",
+      "overview": [
+        "Running many applications on one big server saves money, but they must not interfere with each other. Two technologies make this work. A **virtual machine** pretends to be an entire computer, with its own operating system kernel, running on top of a **hypervisor**. A **container** is just a normal process that the host kernel tricks into seeing its own private filesystem, network and process list.",
+        "Think of an apartment building. VMs are separate houses on a shared plot: each has its own foundation, plumbing and walls, so they're very independent but heavier to build. Containers are apartments in one building: they share the foundation and plumbing (the kernel), so they're cheap and quick to set up, but a flaw in the shared structure affects everyone.",
+        "In practice the two combine. Cloud servers are VMs, containers run inside them, and for untrusted code (serverless functions, AI agents' sandboxes) providers use **microVMs** like Firecracker that boot in a fraction of a second, giving VM-strength isolation with container-like speed."
+      ],
+      "diagram": {
+        "caption": "Layers in a typical cloud container deployment.",
+        "steps": [
+          { "label": "Physical server", "detail": "CPU with VT-x/AMD-V, IOMMU" },
+          { "label": "Hypervisor (KVM)", "detail": "Runs guest VMs or microVMs" },
+          { "label": "Guest kernel", "detail": "Linux inside each VM" },
+          { "label": "Container runtime", "detail": "containerd plus runc or Kata" },
+          { "label": "Containers", "detail": "Namespaces, cgroups, layered images" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Namespaces", "role": "Kernel feature giving a process its own view of a resource: mount, PID, network, IPC, UTS (hostname), user, cgroup and time namespaces." },
+          { "name": "cgroups v2", "role": "Hierarchical resource control and accounting for CPU (cpu.max, cpu.weight), memory (memory.max/high), I/O and PIDs; the default in modern distros and Kubernetes." },
+          { "name": "Images and overlayfs", "role": "OCI images are stacks of read-only tar layers, mounted with overlayfs plus a thin writable layer so many containers share the same base files." },
+          { "name": "Container runtime", "role": "containerd or CRI-O manages images and lifecycle; a low-level OCI runtime (runc, crun, gVisor's runsc, Kata) actually sets up namespaces and cgroups." },
+          { "name": "Hypervisor", "role": "KVM (in the Linux kernel) with a VMM like QEMU, Cloud Hypervisor or Firecracker uses hardware virtualization (VT-x/AMD-V, EPT/NPT nested paging) to run guest kernels." },
+          { "name": "Virtual devices", "role": "virtio paravirtual disks and NICs, or SR-IOV and VFIO passthrough for near-native performance; AWS Nitro offloads this to dedicated cards." }
+        ],
+        "flow": [
+          "Kubernetes schedules a pod onto a node, and the kubelet asks containerd (via CRI) to run it.",
+          "containerd pulls the image layers (if not cached) and prepares an overlayfs root filesystem.",
+          "runc calls clone() with new namespace flags, sets up mounts, pivots root into the image, and writes cgroup limits.",
+          "It applies security settings (dropped capabilities, seccomp profile, AppArmor/SELinux label, optionally a user namespace) and execs the container's entrypoint.",
+          "The container's processes run directly on the host kernel; the scheduler and memory manager enforce cgroup limits like any other process.",
+          "For a VM-isolated runtime (Kata, Firecracker), the runtime instead boots a minimal guest kernel in a microVM and starts the container inside it, adding a hardware virtualization boundary."
+        ],
+        "tradeoffs": [
+          { "choice": "Containers (shared kernel)", "pro": "Start in ~100s of ms, near-zero overhead, high density, tiny images.", "con": "Weaker isolation: one kernel bug can enable escape across tenants." },
+          { "choice": "Full VMs", "pro": "Strong hardware-enforced isolation, any guest OS, live migration.", "con": "Seconds to boot, hundreds of MB of overhead per guest, slower density." },
+          { "choice": "MicroVMs (Firecracker, Cloud Hypervisor)", "pro": "VM isolation with ~125 ms boots and ~5 MB overhead; ideal for multi-tenant serverless.", "con": "Minimal device model (no GPUs in Firecracker), and still more overhead than plain containers." },
+          { "choice": "User-space kernels (gVisor)", "pro": "Intercepts syscalls so the host kernel attack surface shrinks, without hardware virtualization.", "con": "Syscall-heavy and I/O-heavy workloads can be noticeably slower; incomplete syscall compatibility." }
+        ],
+        "numbers": [
+          { "metric": "Firecracker microVM boot to user space", "value": "~125 ms" },
+          { "metric": "Firecracker memory overhead per microVM", "value": "< ~5 MiB" },
+          { "metric": "runc container start (image cached)", "value": "~100-300 ms" },
+          { "metric": "CPU overhead of hardware-virtualized compute", "value": "~1-5% for most workloads" },
+          { "metric": "Linux namespace types", "value": "8 (mnt, pid, net, ipc, uts, user, cgroup, time)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Containers leak the host in subtle ways. /proc/cpuinfo and /proc/meminfo show host resources, so runtimes that size thread pools or heaps from them over-provision (older JVMs, Node, Go before GOMAXPROCS respected cgroup quotas in Go 1.25). Kernel parameters, the clock, kernel keyrings and many sysctls are shared. Root in a container is root on the host unless user namespaces map it to an unprivileged UID; Kubernetes user-namespace support for pods became beta-on-by-default in 1.33 (2025). Notable escapes like runc CVE-2019-5736 (overwriting the host runc binary via /proc/self/exe) and CVE-2024-21626 'Leaky Vessels' (leaked fd to host cgroup directory) came from runtime bugs, not namespaces themselves.",
+          "Hardware virtualization overhead is now mostly in memory translation and I/O. With EPT/NPT, a TLB miss can require up to 24 memory references (each of 4 guest levels translated through 4 host levels plus the final access), so huge pages on both host and guest matter a lot. I/O exits are expensive, so virtio uses shared rings with batched notifications, vhost moves the backend into the host kernel, and SR-IOV or AWS Nitro hand the guest a real hardware queue. Confidential computing (AMD SEV-SNP, Intel TDX, NVIDIA H100/Blackwell confidential mode) encrypts guest memory against the hypervisor itself, with ~few-percent overheads on CPU and more for I/O bounce buffers.",
+          "The industry trend is VM isolation per workload with container ergonomics. AWS Lambda and Fargate run each function or task in a Firecracker microVM, with snapshot-restore (Lambda SnapStart) to skip initialization; Kata Containers and Cloud Hypervisor bring the same model to Kubernetes; Apple's Containerization framework (WWDC 2025, macOS 26) runs each Linux container in its own lightweight VM. AI agent sandboxes (code interpreters, browser agents) largely adopted microVMs or gVisor because they run untrusted, model-generated code at scale."
+        ],
+        "failureModes": [
+          { "name": "Noisy neighbour", "description": "Containers on one host contend for resources cgroups don't fully isolate: last-level cache, memory bandwidth, disk I/O queue, kernel locks or conntrack tables. Symptom: latency spikes unrelated to your own load. Fix: Intel RDT/AMD QoS cache partitioning, I/O controllers, dedicated nodes for latency-critical pods, and good CPU pinning." },
+          { "name": "Container escape", "description": "A kernel or runtime vulnerability lets code break out of namespaces to the host, compromising every tenant. Fix: patch runc and kernels promptly, drop capabilities, use seccomp and user namespaces, never run privileged pods for untrusted code, and use microVMs or gVisor for multi-tenant workloads." },
+          { "name": "Resource misdetection in containers", "description": "An app reads host CPU count (e.g. 96) instead of its 2-CPU quota, spawns 96 GC or worker threads and gets throttled; or sizes its heap from host RAM and gets OOM-killed. Fix: use runtimes that read cgroup limits (JVM 10+, Go 1.25, .NET), or set explicit thread and heap sizes." }
+        ],
+        "realSystems": [
+          { "name": "AWS Firecracker", "note": "Rust-based microVM monitor on KVM that powers AWS Lambda and Fargate, running trillions of function invocations per month with per-function VM isolation." },
+          { "name": "gVisor", "note": "User-space kernel used for GKE Sandbox and Cloud Run, trading some syscall performance for a much smaller host attack surface." },
+          { "name": "Kubernetes with containerd", "note": "The dominant orchestration stack; RuntimeClass lets the same cluster run runc for trusted pods and Kata or gVisor for untrusted ones." }
+        ],
+        "questions": [
+          { "q": "You're building a platform that runs customer-submitted code. Containers or VMs?", "a": "Shared-kernel containers alone are too risky for untrusted multi-tenant code because one kernel exploit compromises the host. Use microVMs (Firecracker, Cloud Hypervisor via Kata) or gVisor per tenant, with container images for packaging. Add snapshot-restore and warm pools to hide boot time, plus strict network egress controls." },
+          { "q": "Why might a Java app in a container get OOM-killed even though its heap is well under the memory limit?", "a": "The cgroup memory limit counts everything: heap, metaspace, thread stacks, direct buffers, JIT code cache, native libraries and page cache charged to the cgroup. If the heap is sized near the limit (or from host RAM on old JVMs), off-heap usage pushes total memory over memory.max. Size the heap at ~60-75% of the limit and monitor native memory tracking." },
+          { "q": "How do containers make image startup fast, and what still makes cold starts slow?", "a": "Layered images share common base layers through overlayfs and the local cache, so starting a cached image just creates namespaces and a writable layer in ~100 ms. Cold starts are slow when large layers must be pulled and decompressed, or the app itself initializes slowly (JVM warmup, loading ML weights). Lazy-loading snapshotters (stargz, SOCI), smaller images and snapshot-restore address these." }
+        ]
+      },
+      "related": ["isolation-sandboxing", "processes-threads", "cpu-scheduling", "virtual-memory", "serving-fleet", "secrets-management"]
+    }
+  ]
+}

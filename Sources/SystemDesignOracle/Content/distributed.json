@@ -1,0 +1,450 @@
+{
+  "id": "distributed",
+  "name": "Distributed Systems",
+  "symbol": "network",
+  "summary": "How many machines cooperate to act like one reliable, fast service, even when networks drop messages and servers crash. These patterns sit underneath every large web service, database and AI serving fleet.",
+  "topics": [
+    {
+      "id": "load-balancing",
+      "title": "Load Balancing",
+      "gist": "A load balancer is the front desk that spreads incoming requests across many identical servers so none is overwhelmed and a dead one is quietly skipped.",
+      "overview": [
+        "Picture a busy supermarket with twenty checkout lanes. If every shopper queued at lane 1, the wait would be awful while nineteen cashiers sat idle. A store manager who points each new shopper to a short line is doing load balancing. In computing, the shoppers are requests (web page loads, API calls) and the cashiers are servers running the same program.",
+        "A **load balancer** sits in front of a group of servers and picks one for each request or connection. Simple ones take turns (*round robin*); smarter ones send work to whichever server has the fewest requests in progress, or the fastest recent responses. It also runs **health checks**, regularly poking each server, and stops sending traffic to any that fail to answer.",
+        "Load balancing happens at several layers. Some balancers only look at network addresses and pass raw connections through very quickly (**layer 4**). Others understand the web request itself, so they can route `/images` to one group and `/api` to another, retry failures, or terminate encryption (**layer 7**). Big sites stack several: DNS sends you to a region, a layer-4 balancer spreads connections, and a layer-7 proxy picks the final server."
+      ],
+      "diagram": {
+        "caption": "Layers of load balancing from the internet to a server.",
+        "steps": [
+          { "label": "DNS / Anycast", "detail": "Pick region or PoP" },
+          { "label": "L4 balancer", "detail": "Hash connections, ~millions pps" },
+          { "label": "L7 proxy", "detail": "HTTP routing, TLS, retries" },
+          { "label": "Service instances", "detail": "Healthy pool of backends" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "L4 load balancer", "role": "Forwards TCP/UDP flows by hashing the 5-tuple to a backend; often runs in-kernel with XDP/eBPF or on routers via ECMP, as in Google Maglev or Meta Katran." },
+          { "name": "L7 reverse proxy", "role": "Terminates HTTP/TLS and routes per request by path, header or weight; examples include Envoy, NGINX, HAProxy and cloud ALBs." },
+          { "name": "Balancing algorithm", "role": "Chooses a backend: round robin, least outstanding requests, power-of-two-choices, consistent hashing for stickiness, or latency-aware (EWMA)." },
+          { "name": "Health checking and outlier detection", "role": "Active probes plus passive signals (error rates, timeouts) eject bad hosts from rotation and re-admit them gradually." },
+          { "name": "Service discovery", "role": "Keeps the backend list current as instances scale, via DNS, Consul, Kubernetes Endpoints or Envoy's xDS control plane." }
+        ],
+        "flow": [
+          "A client resolves the service name; GeoDNS or anycast routing directs it to the nearest healthy region or point of presence.",
+          "Routers spread packets across L4 balancer nodes using ECMP, and each L4 node consistently hashes the flow to a backend or L7 proxy so all packets of a connection go to the same place.",
+          "The L7 proxy terminates TLS, parses the HTTP request and selects a route based on host, path or headers.",
+          "Within that route's pool, the algorithm (for example least-request with power-of-two-choices) picks a healthy backend.",
+          "The proxy forwards the request, enforcing timeouts, retry budgets and circuit breakers, and records latency and status for outlier detection.",
+          "With direct server return, the backend's response can bypass the L4 layer entirely, saving the balancer bandwidth."
+        ],
+        "tradeoffs": [
+          { "choice": "L4 balancing", "pro": "Very fast, protocol-agnostic, scales to millions of packets per second per core", "con": "Cannot route by URL, retry individual requests or balance long-lived multiplexed connections fairly" },
+          { "choice": "L7 balancing", "pro": "Per-request routing, retries, observability, canaries", "con": "More CPU per request and more latency; the proxy becomes a critical dependency" },
+          { "choice": "Centralized balancer", "pro": "Simple for clients, one place for policy", "con": "Extra hop and a potential bottleneck or single point of failure" },
+          { "choice": "Client-side balancing (gRPC, sidecar mesh)", "pro": "No extra hop, per-client load awareness", "con": "Every client needs discovery logic and consistent configuration" }
+        ],
+        "numbers": [
+          { "metric": "Katran (XDP L4 LB) throughput", "value": "~millions of packets/s per server" },
+          { "metric": "Envoy added latency per hop (p50)", "value": "~0.1-1 ms" },
+          { "metric": "Maglev lookup table size", "value": "65,537 entries (prime) per service" },
+          { "metric": "Typical health-check interval", "value": "~5-10 s with 2-3 failure threshold" },
+          { "metric": "Power-of-two-choices max load (n servers)", "value": "~log log n vs log n / log log n for random" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Power-of-two-choices is the quiet workhorse. Picking two backends at random and sending to the less loaded one gives exponentially better worst-case load than random assignment, without the herding problem of 'always pick the global least loaded', where every balancer with slightly stale data stampedes onto the same idle server. Envoy's least_request and Finagle's P2C use it. Latency-aware variants (peak EWMA) handle heterogeneous hardware and noisy neighbors better than counts of outstanding requests.",
+          "Consistent hashing in L4 balancers must survive balancer and backend changes. Google's Maglev builds a fixed-size permutation table so each backend gets nearly equal share and adding or removing a backend remaps only a small fraction of flows; it also keeps a connection-tracking table so existing flows stick even when the hash changes. Without both, a deploy that changes the backend set can reset thousands of live TCP connections.",
+          "Long-lived connections break naive balancing. HTTP/2 and gRPC multiplex many requests on one connection, so an L4 balancer that pins connections leaves new backends idle after a scale-up. The fixes are L7 (per-request) balancing, client-side balancing with periodic connection recycling (max connection age), or both. Retries are another trap: without retry budgets (for example capping retries at 10-20% of requests) and jittered backoff, a partial outage amplifies into a retry storm that takes down healthy capacity."
+        ],
+        "failureModes": [
+          { "name": "Retry storms", "description": "A slow backend causes timeouts; clients and proxies retry at every layer, multiplying load until the whole service collapses. Fix: retry budgets, retries at one layer only, exponential backoff with jitter, and circuit breakers." },
+          { "name": "Health-check flapping", "description": "Checks that are too aggressive or that test only '/healthz' (not real dependencies) eject servers under load or keep sick ones in. Fix: combine active checks with passive outlier detection, use hysteresis, and cap the fraction of hosts that can be ejected." },
+          { "name": "Uneven load from connection pinning", "description": "After scale-out, new pods sit idle because clients keep long-lived HTTP/2 connections to old ones. Fix: per-request L7 balancing, max connection age, and client-side balancing that refreshes endpoints." }
+        ],
+        "realSystems": [
+          { "name": "Google Maglev", "note": "Software L4 balancer on commodity servers behind ECMP, with consistent hashing and connection tracking; described in an NSDI 2016 paper." },
+          { "name": "Envoy", "note": "CNCF L7 proxy used in Istio and many service meshes, with xDS dynamic config, P2C least-request balancing, outlier detection and retry budgets." },
+          { "name": "AWS Elastic Load Balancing", "note": "Network Load Balancer (L4) and Application Load Balancer (L7) as managed services, scaling transparently across availability zones." }
+        ],
+        "questions": [
+          { "q": "Design the load balancing tier for a global API serving 1 million requests per second.", "a": "Use anycast or GeoDNS to route users to the nearest of several regions. In each region, run ECMP across a fleet of L4 balancers (Maglev or Katran style) using consistent hashing with connection tracking, which fan out to an autoscaled pool of L7 proxies like Envoy. The proxies handle TLS, routing, P2C least-request balancing, outlier detection and retry budgets. Make every tier N+2 redundant and able to drain a region by withdrawing anycast routes." },
+          { "q": "Why might least-connections balancing perform badly with many load balancers?", "a": "Each balancer sees only its own view of outstanding requests and often stale data, so many of them can pick the same apparently idle server simultaneously and overload it, the herding effect. Power-of-two-choices avoids this by randomizing among candidates while still preferring less loaded ones. Combining it with latency-aware scoring handles heterogeneous backends." },
+          { "q": "How do you deploy a new version behind a load balancer without dropping requests?", "a": "Bring up new instances, wait for readiness checks, then shift traffic gradually using weighted routing (canary). To remove old instances, mark them draining so the balancer stops sending new requests while in-flight ones finish, and close idle keep-alive connections. Monitor error rates and latency during the shift with automatic rollback." }
+        ]
+      },
+      "related": [ "caching", "partitioning", "serving-fleet", "dns", "tcp-ip" ]
+    },
+    {
+      "id": "caching",
+      "title": "Caching",
+      "gist": "A cache keeps copies of frequently used data somewhere faster and closer, so most requests skip the slow trip to the original source.",
+      "overview": [
+        "Think of a chef who keeps salt, oil and garlic on the counter instead of walking to the pantry every time. The pantry has everything, but the counter has what is used constantly, within arm's reach. A **cache** is that counter: a small, fast store holding copies of popular data so the system rarely has to visit the slow database or a faraway server.",
+        "Caches are everywhere: inside your CPU, in your browser, in content delivery networks, and in in-memory stores like Redis that sit in front of databases. When the data you want is in the cache it is a **hit** and comes back in well under a millisecond; when it is not, it is a **miss** and you pay the full trip, then usually store the answer for next time.",
+        "The hard part is that the cache is a copy, and copies go out of date. If a product's price changes in the database, the cache may still hold the old price. Systems handle this with expiry times (*TTLs*), by deleting cache entries when data changes, or by accepting a little staleness. And because space is limited, the cache must decide what to throw away, often the item **least recently used**."
+      ],
+      "diagram": {
+        "caption": "A read in a cache-aside setup.",
+        "steps": [
+          { "label": "App request", "detail": "Read key user:42" },
+          { "label": "Check cache", "detail": "Redis or Memcached, ~0.2 ms" },
+          { "label": "Hit: return", "detail": "Most requests end here" },
+          { "label": "Miss: query DB", "detail": "~2-20 ms round trip" },
+          { "label": "Populate cache", "detail": "Set with TTL, then return" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Cache store", "role": "An in-memory key-value system such as Redis, Valkey or Memcached, holding serialized values with optional TTLs, sharded across nodes." },
+          { "name": "Caching pattern", "role": "Cache-aside (app reads cache, falls back to DB and fills cache), read-through, write-through (writes update cache and DB together) or write-back (cache absorbs writes, flushes later)." },
+          { "name": "Eviction policy", "role": "Decides what to drop when memory is full: LRU, LFU, or modern admission-aware schemes like W-TinyLFU (Caffeine) and S3-FIFO." },
+          { "name": "Invalidation mechanism", "role": "Keeps copies fresh via TTLs, explicit deletes on write, or change streams (CDC) that delete or update cache keys when the database changes." },
+          { "name": "Client library and sharding", "role": "Maps keys to cache nodes with consistent hashing, handles timeouts, and may add a small in-process near-cache for the hottest keys." }
+        ],
+        "flow": [
+          "The application computes a cache key from the request, for example `product:123:v2`.",
+          "It hashes the key to a cache node and issues a GET; on a hit it deserializes and returns the value in well under a millisecond.",
+          "On a miss it reads from the database, which might take several to tens of milliseconds.",
+          "It writes the value back to the cache with a TTL, often with random jitter so many keys do not expire at the same instant.",
+          "When the data is updated, the writer updates the database first and then deletes (rather than sets) the cache key, so the next reader refills it with fresh data.",
+          "When memory fills, the eviction policy drops cold keys; metrics like hit ratio and eviction rate tell operators whether the cache is sized correctly."
+        ],
+        "tradeoffs": [
+          { "choice": "Cache-aside", "pro": "Simple, cache failures degrade to slower reads, only caches what is used", "con": "First read is slow and there are race windows that can leave stale data" },
+          { "choice": "Write-through", "pro": "Cache stays fresh on every write", "con": "Write latency goes up and you cache data that may never be read" },
+          { "choice": "Write-back", "pro": "Absorbs write bursts with very low latency", "con": "Risk of data loss if the cache fails before flushing" },
+          { "choice": "Long TTLs", "pro": "Higher hit rate, less database load", "con": "More staleness and slower recovery from bad data" }
+        ],
+        "numbers": [
+          { "metric": "Redis GET latency in same datacenter", "value": "~0.1-0.5 ms" },
+          { "metric": "Single Redis instance throughput", "value": "~100k-1M ops/s (pipelined, multithreaded I/O)" },
+          { "metric": "Main memory reference vs SSD read", "value": "~100 ns vs ~16-100 us" },
+          { "metric": "Typical production hit ratio target", "value": "~90-99%" },
+          { "metric": "Meta memcache/TAO scale", "value": "~billions of requests/s across fleet" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Hit ratio is nonlinear in its effect. Going from 90% to 99% hit ratio cuts database load by 10x, not 10%, which is why small cache tuning wins can be enormous, and why a cache outage or a cold restart can instantly overload a database sized for the cached workload. Production systems warm caches before shifting traffic, replicate cache pools across zones, and treat the cache as load-bearing capacity rather than an optional optimization.",
+          "Stampedes and races are the classic bugs. When a hot key expires, thousands of concurrent requests miss at once and all hit the database (thundering herd). Fixes include request coalescing (single-flight), leases as in Meta's memcache paper where only the lease holder may refill a key, probabilistic early expiration (XFetch), and serving stale while revalidating in the background. The delete-after-write pattern also has a race: a slow reader can fetch old data, the writer deletes the key, then the reader writes the stale value back. Leases or versioned values close that window.",
+          "Licensing shifted the ecosystem: in 2024 Redis moved away from the BSD license, prompting the Linux Foundation fork Valkey (backed by AWS, Google and others), which most cloud managed services adopted; Redis 8 (2025) then added an AGPL option. Technically, modern eviction research such as S3-FIFO and SIEVE shows that simple FIFO-based designs with quick demotion can match or beat LRU with less locking, and Caffeine's W-TinyLFU remains the standard for in-process JVM caches."
+        ],
+        "failureModes": [
+          { "name": "Thundering herd on expiry", "description": "A popular key expires and a flood of misses overwhelms the database. Fix: request coalescing, leases, TTL jitter and stale-while-revalidate." },
+          { "name": "Hot key", "description": "One key (a celebrity profile, a viral product) receives so much traffic that its single cache shard saturates. Fix: local near-caches, key replication with random suffixes, and read replicas for the hot shard." },
+          { "name": "Stale data after write race", "description": "Interleaved reads and writes leave an old value cached indefinitely, so users see stale data until TTL. Fix: delete rather than set on write, use versioned keys or leases, keep TTLs as a backstop, or invalidate from CDC streams." }
+        ],
+        "realSystems": [
+          { "name": "Meta memcache and TAO", "note": "Massive look-aside memcache tier with leases and regional invalidation via the MySQL replication stream; TAO is a graph-aware caching layer for the social graph." },
+          { "name": "Redis / Valkey", "note": "The default in-memory cache and data-structure server; Valkey is the Linux Foundation fork used by AWS ElastiCache and Google Memorystore." },
+          { "name": "Caffeine", "note": "High-performance Java in-process cache using W-TinyLFU admission, near-optimal hit ratios with low overhead." }
+        ],
+        "questions": [
+          { "q": "Design a cache for a product catalog read 500k times per second with prices updated a few times a day.", "a": "Use cache-aside with a sharded Redis or Valkey cluster replicated across zones, plus a small in-process near-cache with a short TTL for the hottest items. On price updates, write the database and publish an invalidation via CDC that deletes the cache keys, keeping TTLs of minutes to hours as a backstop. Protect against stampedes with request coalescing and TTL jitter, and warm the cache before failovers or deploys." },
+          { "q": "Your cache cluster restarts and the database falls over. What happened and how do you prevent it?", "a": "The database was sized for the cached miss rate, maybe 1-5% of traffic, and a cold cache sent close to 100% of reads to it. Prevent it by replicating the cache so a node loss does not cold-start it, warming caches from snapshots or by replaying traffic before taking full load, rate-limiting misses with request coalescing, and shedding load at the edge during recovery." },
+          { "q": "When would you choose write-back caching?", "a": "When write latency and write absorption matter more than durability of the newest writes, such as counters, view tallies, or session updates where losing a few seconds is acceptable. Pair it with replication of the cache and periodic flushing to bound loss. Avoid it for money or anything that must survive a crash." }
+        ]
+      },
+      "related": [ "partitioning", "replication", "kv-cache", "cdn", "change-data-capture" ]
+    },
+    {
+      "id": "replication",
+      "title": "Replication",
+      "gist": "Replication keeps copies of the same data on several machines, so the system survives crashes and can serve more reads, at the cost of keeping copies in agreement.",
+      "overview": [
+        "If you write your only copy of an important document on one notebook and lose it, it is gone. So you photocopy it and keep copies in different places. **Replication** does the same for data: every change is copied to several servers, often in different buildings or regions, so losing one machine loses nothing.",
+        "The tricky part is keeping copies in sync. The most common setup has one **leader** that accepts all changes and streams them to **followers**, like a teacher dictating notes to a class. If the leader waits for followers to confirm before telling you 'saved', your data is safe but slower (*synchronous*). If it says 'saved' immediately and copies later (*asynchronous*), it is fast, but a crash at the wrong moment can lose the last few changes.",
+        "Other designs let several machines accept writes at once (**multi-leader** or **leaderless**), which helps when users are spread across the world, but then two people might change the same thing at the same time in different places, and the system needs rules for resolving those conflicts."
+      ],
+      "diagram": {
+        "caption": "Single-leader replication of one write.",
+        "steps": [
+          { "label": "Client write", "detail": "UPDATE balance, to leader" },
+          { "label": "Leader log", "detail": "Append to WAL / binlog" },
+          { "label": "Ship to followers", "detail": "Stream log records" },
+          { "label": "Acknowledge", "detail": "Sync, semi-sync or async" },
+          { "label": "Followers apply", "detail": "Serve reads, ready to promote" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Replication log", "role": "An ordered record of changes, such as PostgreSQL WAL, MySQL binlog or a Raft log, that followers replay to reach the same state." },
+          { "name": "Leader (primary)", "role": "Serializes writes, assigns their order, and decides when a write is committed based on follower acknowledgments." },
+          { "name": "Followers (replicas)", "role": "Apply the log, serve reads that tolerate some lag, and are candidates for promotion on leader failure." },
+          { "name": "Failover manager", "role": "Detects leader failure and promotes a follower, using tools like Patroni with etcd, Orchestrator, or built-in consensus as in CockroachDB." },
+          { "name": "Conflict resolution (multi-leader / leaderless)", "role": "Merges concurrent writes using last-writer-wins timestamps, version vectors, application merge logic or CRDTs." }
+        ],
+        "flow": [
+          "A client sends a write to the leader, which validates it and appends it to its local log.",
+          "The leader streams the log record to followers over long-lived connections.",
+          "Depending on mode, the leader acknowledges the client immediately (async), after one follower confirms (semi-sync), or after a quorum persists it (sync or consensus).",
+          "Followers apply records in order; the gap between the leader's latest position and a follower's applied position is replication lag.",
+          "Read traffic can go to followers; clients needing read-your-writes either read from the leader or wait until the follower reaches their write's log position.",
+          "If the leader fails, a follower with the most up-to-date log is promoted, clients are redirected, and the old leader is fenced so it cannot accept writes if it comes back."
+        ],
+        "tradeoffs": [
+          { "choice": "Synchronous replication", "pro": "No acknowledged write is lost on leader failure", "con": "Write latency includes the slowest required replica; a slow replica stalls writes" },
+          { "choice": "Asynchronous replication", "pro": "Lowest write latency, leader unaffected by replica speed", "con": "Failover can lose recently acknowledged writes; replicas serve stale reads" },
+          { "choice": "Multi-leader / multi-region writes", "pro": "Local write latency for users everywhere and tolerance of region partitions", "con": "Write conflicts that need resolution and harder invariants" },
+          { "choice": "Leaderless quorums (Dynamo-style)", "pro": "High availability with no failover step", "con": "Weaker consistency semantics and repair overhead (read repair, anti-entropy)" }
+        ],
+        "numbers": [
+          { "metric": "Same-region cross-AZ round trip", "value": "~0.5-2 ms" },
+          { "metric": "US East to US West round trip", "value": "~60-70 ms" },
+          { "metric": "Typical async replica lag (healthy)", "value": "~ms to 1 s" },
+          { "metric": "Spanner TrueTime uncertainty bound", "value": "~1-7 ms" },
+          { "metric": "Quorum rule for N=3 replicas", "value": "W + R > N, e.g. W=2, R=2" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Replication lag creates user-visible anomalies that the CAP theorem's slogan hides. Read-your-writes (a user does not see their own post), monotonic reads (refreshing goes back in time when hitting a laggier replica), and consistent prefix (seeing an answer before its question) are distinct guarantees, each fixable with different techniques: sticky routing, waiting for a log sequence number, or causal tokens. PACELC is the more useful framing: even without partitions, you are trading latency against consistency on every request.",
+          "Failover is where data gets lost. With async replication, promoting a follower discards whatever it had not received, and if the old leader rejoins it must roll back those writes, which can collide with things like auto-increment keys reused by the new leader (GitHub's 2012 MySQL incident exposed exactly this). Split brain, where two nodes both believe they are leader, requires fencing: epoch or term numbers checked by storage, STONITH, or leases with bounded clock drift. This is why many modern systems use consensus (Raft or Paxos) for replication itself rather than bolting failover onto async streaming.",
+          "Leaderless systems such as Cassandra and DynamoDB's original Dynamo design use sloppy quorums, hinted handoff, read repair and Merkle-tree anti-entropy. W + R > N gives overlap but not linearizability: concurrent writes, sloppy quorums and last-writer-wins clocks can still lose updates. CRDTs (used in Riak, Redis Enterprise active-active, and local-first apps via Automerge and Yjs) avoid conflicts entirely for data types whose merges are commutative, associative and idempotent."
+        ],
+        "failureModes": [
+          { "name": "Split brain", "description": "A network partition makes a follower promote itself while the old leader is still serving writes, so the two diverge. Fix: quorum-based leader election, fencing tokens checked by storage, and leases with clock-drift margins." },
+          { "name": "Lost writes on async failover", "description": "The leader crashes after acknowledging writes that never reached followers; the promoted follower does not have them. Fix: semi-sync or quorum commit for critical data, and measuring the recovery point objective explicitly." },
+          { "name": "Replica lag spikes", "description": "A long transaction, schema migration or slow disk makes a replica fall minutes behind, so reads are stale and failover would lose data. Fix: monitor lag, remove lagging replicas from read pools, and throttle heavy operations." }
+        ],
+        "realSystems": [
+          { "name": "PostgreSQL streaming replication", "note": "WAL shipping with async or synchronous standbys; often managed by Patroni using etcd for leader election." },
+          { "name": "Amazon Aurora", "note": "Replicates storage, not the database: writes go to 6 copies across 3 AZs with a 4/6 write quorum and 3/6 read quorum." },
+          { "name": "Google Spanner", "note": "Paxos-replicated shards with TrueTime timestamps for externally consistent multi-region transactions." },
+          { "name": "Apache Cassandra 5.0", "note": "Leaderless, tunable consistency per query (ONE, QUORUM, ALL) with multi-datacenter replication." }
+        ],
+        "questions": [
+          { "q": "Design replication for a payments database that must never lose a confirmed transaction and must survive a region outage.", "a": "Use consensus-based replication with replicas in at least three regions (or two plus a witness), committing each transaction only after a majority persists it, so any single region can fail without data loss. Place the leader near most writers to keep commit latency acceptable, accepting ~tens of milliseconds for the cross-region quorum. Use fencing via terms, run regular failover drills, and keep async replicas for analytics." },
+          { "q": "A user updates their profile and immediately sees the old one. Why, and how do you fix it?", "a": "The read probably went to an async follower that had not yet applied the write. Fix with read-your-writes: route that user's reads to the leader for a short window after a write, or return the write's log position and have reads wait until the replica reaches it. Sticky sessions to one replica also prevent monotonic-read violations." },
+          { "q": "When would you choose leaderless replication over single-leader?", "a": "When availability and write latency matter more than strong consistency, for example shopping carts, sensor data, or user activity, especially across many datacenters. Leaderless designs avoid failover pauses and let any replica accept writes. You accept tunable, mostly eventual consistency and design data models that tolerate or merge concurrent updates." }
+        ]
+      },
+      "related": [ "consensus", "partitioning", "checkpointing", "lsm-btree", "change-data-capture" ]
+    },
+    {
+      "id": "consensus",
+      "title": "Consensus: Raft & Paxos",
+      "gist": "Consensus lets a group of servers agree on one sequence of decisions, even if some crash or messages are lost, as long as a majority is still alive.",
+      "overview": [
+        "Imagine five friends trying to agree on a restaurant by text message, where messages can be delayed and someone's phone might die mid-conversation. They need a rule so they never end up at two different restaurants. A simple rule: a choice counts only once a **majority** (three of five) has agreed to it. Any two majorities always share at least one person, so two conflicting choices can never both win.",
+        "Consensus algorithms like **Paxos** and **Raft** formalize that idea for computers. Raft, designed in 2014 to be easier to understand, elects a **leader** that proposes entries to a shared log, such as 'set x = 5'. An entry is committed once a majority has stored it. If the leader dies, the others hold an election, and the rules guarantee the new leader already has every committed entry.",
+        "This shared, agreed log becomes the backbone of reliable systems. If every server applies the same log in the same order, they all end up in the same state, a technique called **state machine replication**. That is how Kubernetes keeps its configuration in etcd, how Kafka now manages its metadata, and how databases like CockroachDB and Spanner keep replicas in agreement."
+      ],
+      "diagram": {
+        "caption": "Raft committing one log entry with 5 servers.",
+        "steps": [
+          { "label": "Client command", "detail": "Sent to current leader" },
+          { "label": "Leader appends", "detail": "Entry at index i, term t" },
+          { "label": "AppendEntries RPC", "detail": "Replicate to 4 followers" },
+          { "label": "Majority persists", "detail": "3 of 5 fsync'd" },
+          { "label": "Commit and apply", "detail": "State machine, reply client" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Replicated log", "role": "An ordered sequence of entries, each tagged with an index and the term in which it was created; it is the single source of truth." },
+          { "name": "Leader election", "role": "Followers that hear no heartbeat within a randomized election timeout become candidates and request votes; a candidate winning a majority in a term becomes leader." },
+          { "name": "Log replication", "role": "The leader sends AppendEntries RPCs carrying new entries plus the previous index and term, so followers reject inconsistent logs and are repaired." },
+          { "name": "Commit rule", "role": "An entry is committed once stored on a majority, and the leader only directly commits entries from its own current term." },
+          { "name": "State machine and snapshots", "role": "Each node applies committed entries in order to its state, such as a key-value store, and periodically snapshots so the log can be truncated." }
+        ],
+        "flow": [
+          "In steady state, the leader sends heartbeats (empty AppendEntries) every ~50-100 ms to assert leadership.",
+          "A client sends a command to the leader, which appends it to its log and sends it to all followers in parallel.",
+          "Each follower checks that its log matches at the previous index and term, appends the entry, fsyncs it, and replies.",
+          "Once a majority, including the leader, has persisted the entry, the leader advances the commit index, applies the entry and replies to the client.",
+          "Followers learn the new commit index on the next message and apply the entry too.",
+          "If followers stop hearing heartbeats, one times out, increments the term, votes for itself and requests votes; nodes only vote for candidates whose logs are at least as up to date, guaranteeing the new leader holds all committed entries.",
+          "Membership changes (adding or removing servers) go through the log as special entries using joint consensus or one-at-a-time changes so two majorities can never form."
+        ],
+        "tradeoffs": [
+          { "choice": "Larger cluster (5 or 7 nodes)", "pro": "Tolerates 2 or 3 failures", "con": "More replication traffic and slightly slower commits; elections take longer" },
+          { "choice": "Short election timeout", "pro": "Faster failover after leader loss", "con": "Spurious elections under GC pauses or network jitter" },
+          { "choice": "Linearizable reads via log or ReadIndex", "pro": "Reads are guaranteed up to date", "con": "Extra round trip to a quorum per read or batch" },
+          { "choice": "Leader leases for local reads", "pro": "Fast reads served by leader alone", "con": "Correctness depends on bounded clock drift" }
+        ],
+        "numbers": [
+          { "metric": "Failures tolerated with 2f+1 nodes", "value": "f (3 nodes: 1, 5 nodes: 2)" },
+          { "metric": "etcd default heartbeat / election timeout", "value": "100 ms / 1000 ms" },
+          { "metric": "etcd recommended max database size", "value": "~8 GB (default quota 2 GB)" },
+          { "metric": "Commit latency in one region", "value": "~1-10 ms (dominated by fsync and RTT)" },
+          { "metric": "Commit latency across US regions", "value": "~50-100 ms" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Paxos and Raft are closer than their reputations. Multi-Paxos with a stable leader is essentially Raft; Raft's contribution was decomposing the problem and adding the restriction that only up-to-date candidates can win, which removes Paxos's need to fill gaps from other replicas. FLP impossibility says no deterministic algorithm can guarantee termination in a fully asynchronous network with even one crash, so both guarantee safety always and liveness only when the network is well-behaved enough for timeouts to work. Byzantine fault tolerant protocols (PBFT, HotStuff, used in blockchains) handle lying nodes but need 3f+1 replicas.",
+          "Implementations hide many subtle bugs. Classic ones include committing entries from previous terms by counting replicas (Raft paper Figure 8), not persisting currentTerm and votedFor before replying, disrupted clusters where a partitioned node keeps incrementing its term and forces elections when it rejoins (fixed by PreVote and CheckQuorum), and ignoring disk corruption, which Raft assumes cannot happen. Jepsen testing has found linearizability violations in many production systems, frequently around reads served by stale leaders.",
+          "Performance comes from batching and pipelining, not from the algorithm. Production implementations batch many client commands into one AppendEntries and one fsync, pipeline multiple in-flight batches, and run thousands of independent Raft groups (multi-Raft) so each shard has its own leader and throughput scales with shard count, as in CockroachDB, TiKV and YugabyteDB. Flexible Paxos showed only election and replication quorums need to intersect, not all majorities, enabling designs like smaller write quorums with larger election quorums."
+        ],
+        "failureModes": [
+          { "name": "Election storms", "description": "GC pauses, overloaded disks or flapping networks make followers time out repeatedly, so leadership churns and no writes complete. Fix: PreVote, CheckQuorum, randomized and tuned timeouts, and dedicated fast disks for the log." },
+          { "name": "Stale reads from a deposed leader", "description": "An old leader in a minority partition keeps answering reads from its local state, returning stale data. Fix: ReadIndex (confirm leadership with a quorum before reading) or leader leases with conservative clock bounds." },
+          { "name": "Losing quorum", "description": "Two of three nodes fail or are partitioned, so the cluster stops accepting writes entirely. Fix: spread replicas across failure domains (zones), alert on reduced redundancy, and document manual disaster recovery from snapshots." }
+        ],
+        "realSystems": [
+          { "name": "etcd", "note": "Raft-based key-value store that holds all Kubernetes cluster state; its fsync latency directly affects API server responsiveness." },
+          { "name": "Apache Kafka KRaft", "note": "Kafka 4.0 (2025) removed ZooKeeper entirely; cluster metadata now lives in a Raft-replicated log managed by controller nodes." },
+          { "name": "Google Chubby and Spanner", "note": "Chubby is a Paxos-based lock service; Spanner runs a Paxos group per data split for synchronous replication." },
+          { "name": "CockroachDB and TiKV", "note": "Multi-Raft databases with one Raft group per range or region, rebalanced automatically." }
+        ],
+        "questions": [
+          { "q": "Why does Raft need a majority, and why use 5 nodes instead of 4?", "a": "Any two majorities overlap in at least one node, which guarantees that a new leader has seen every committed entry and that two conflicting decisions cannot both commit. With 4 nodes a majority is 3, so you still tolerate only 1 failure, the same as 3 nodes but with more cost. 5 nodes tolerate 2 failures, which is why odd sizes are standard." },
+          { "q": "Design a distributed lock service using consensus.", "a": "Run a 3- or 5-node Raft cluster storing locks as keys with owner and lease expiry. Clients acquire a lock via a linearizable compare-and-set and keep it alive with heartbeats; on expiry the lock is released. Every grant returns a monotonically increasing fencing token (for example the Raft index), and protected resources reject operations with an older token, so a paused client that lost its lease cannot do damage." },
+          { "q": "How would you speed up a Raft-based store bottlenecked at 5,000 writes per second?", "a": "First batch and pipeline: group many writes into each AppendEntries and fsync, and allow multiple in-flight batches. Put the log on low-latency NVMe with power-loss protection. If one log is still the bottleneck, partition the keyspace into many Raft groups with leaders spread across nodes, so throughput scales with shards, and serve reads via ReadIndex or leases to keep them off the log." }
+        ]
+      },
+      "related": [ "replication", "partitioning", "message-queues", "containers-vms", "file-systems" ]
+    },
+    {
+      "id": "partitioning",
+      "title": "Sharding & Partitioning",
+      "gist": "Sharding splits a dataset too big for one machine into pieces spread across many machines, so storage and traffic grow by simply adding servers.",
+      "overview": [
+        "A library that outgrows its building might split the collection: authors A to F in one building, G to M in another, and so on. Each building is smaller and quicker to search, and you can always open another one. **Sharding**, also called **partitioning**, does this for data: each server holds only a slice, and together they hold everything.",
+        "The key decision is how to split. Splitting by **range** (A to F, G to M) keeps neighbors together, which is great for queries like 'all orders from last week', but popular ranges can overload one server. Splitting by **hash** scrambles keys evenly across servers, like dealing cards, which balances load well but scatters related items, so range queries must ask every server.",
+        "Sharding gives scale but takes away convenience. Queries that span shards, transactions that touch several, and moving data when you add servers all become harder. Good designs choose a partition key that keeps most operations inside a single shard, such as putting all of one customer's data together."
+      ],
+      "diagram": {
+        "caption": "Routing a key to its shard.",
+        "steps": [
+          { "label": "Request key", "detail": "customer_id = 8812" },
+          { "label": "Partition function", "detail": "Hash or range lookup" },
+          { "label": "Shard map", "detail": "Shard to node mapping" },
+          { "label": "Owning node", "detail": "Serves read or write" },
+          { "label": "Rebalancer", "detail": "Splits, moves hot shards" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Partition key", "role": "The attribute used to place data, such as user_id or tenant_id; it determines which operations stay on one shard." },
+          { "name": "Partition function", "role": "Hash partitioning (modulo, consistent hashing, jump hash, rendezvous) or range partitioning with split points." },
+          { "name": "Shard map / metadata service", "role": "Authoritative mapping of shards to nodes, stored in a consensus system such as etcd, ZooKeeper or a meta-range, cached by routers." },
+          { "name": "Router", "role": "A proxy or smart client that looks up the shard and forwards requests, for example Vitess VTGate, MongoDB mongos or a Cassandra driver." },
+          { "name": "Rebalancer", "role": "Splits large or hot shards and moves them between nodes in the background, copying data then cutting over atomically." }
+        ],
+        "flow": [
+          "The application issues a query that includes the partition key.",
+          "The router applies the partition function to find the shard, then consults its cached shard map to find the node.",
+          "Single-shard queries go straight to that node; queries without the key are scattered to all shards and the results gathered and merged.",
+          "Writes touching multiple shards either use a distributed transaction protocol (two-phase commit, often over consensus) or are redesigned to be single-shard or asynchronous.",
+          "When a shard grows beyond a threshold (for example ~512 MB in CockroachDB, configurable) or gets hot, the system splits it and may move one half to a less loaded node.",
+          "During a move, data is copied and kept in sync, then ownership flips in the shard map; routers with stale maps receive a redirect and refresh."
+        ],
+        "tradeoffs": [
+          { "choice": "Hash partitioning", "pro": "Even distribution, avoids hot ranges on sequential keys", "con": "Range scans must hit every shard; related data scatters" },
+          { "choice": "Range partitioning", "pro": "Efficient range scans and locality", "con": "Hotspots on monotonically increasing keys like timestamps" },
+          { "choice": "Many small shards per node", "pro": "Fine-grained rebalancing and fast recovery", "con": "More metadata and per-shard overhead" },
+          { "choice": "Few large shards", "pro": "Less overhead, simpler", "con": "Rebalancing moves huge chunks; slow recovery" }
+        ],
+        "numbers": [
+          { "metric": "Keys moved when adding 1 node to N (consistent hashing)", "value": "~1/(N+1) of keys" },
+          { "metric": "Keys moved with naive hash mod N to N+1", "value": "~N/(N+1), nearly all" },
+          { "metric": "CockroachDB default range size", "value": "~512 MB" },
+          { "metric": "DynamoDB per-partition limits", "value": "~3,000 RCU and 1,000 WCU" },
+          { "metric": "Virtual nodes per server (Cassandra 4+ default)", "value": "16 tokens" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Choosing the partition key is the most consequential and least reversible decision. Multi-tenant SaaS usually shards by tenant so that every query and transaction for a customer is local, but whales (one tenant with 1000x the data) break even distribution, so systems need tenant-to-shard maps that can give a big tenant its own shard. Social graphs are the hard case: no key keeps a user's friends together, so systems like Meta's TAO accept cross-shard fan-out and lean heavily on caching.",
+          "Hotspots come from access patterns, not just data size. Sequential IDs or timestamps under range partitioning send all inserts to the last shard, which is why Spanner and Bigtable guides recommend hashed prefixes or UUIDv4 keys, and why DynamoDB adds adaptive capacity and automatic splitting for hot partitions. Celebrity keys under hash partitioning still land on one shard; mitigations include key salting with scatter reads, caching, and dedicated replicas.",
+          "Resharding live systems is an engineering project in itself. The standard pattern is: create target shards, backfill a snapshot, stream changes via CDC until caught up, verify with checksums, briefly block writes or use per-key ownership flips, cut over routing, and keep the old shards for rollback. Vitess automates this with VReplication and MoveTables. Consistent hashing variants differ in subtle ways: jump consistent hash needs no memory but only supports numbered buckets, rendezvous hashing supports weights and arbitrary node removal, and Maglev hashing optimizes for even load and fast lookup."
+        ],
+        "failureModes": [
+          { "name": "Hot partition", "description": "One shard receives a disproportionate share of traffic (a viral item, sequential keys), throttling or saturating while others idle. Fix: better keys, salting, automatic splitting, caching hot keys and adaptive capacity." },
+          { "name": "Scatter-gather tail latency", "description": "Queries without the partition key fan out to hundreds of shards; the slowest one sets the latency, so p99 explodes. Fix: secondary indexes partitioned by the query attribute, denormalization, hedged requests and limiting fan-out." },
+          { "name": "Stale shard map during migration", "description": "A router with an outdated map writes to the old owner after cutover, losing or duplicating data. Fix: epoch-versioned ownership checked by storage nodes, redirects on mismatch, and fencing of old owners." }
+        ],
+        "realSystems": [
+          { "name": "Vitess", "note": "Sharding middleware for MySQL, originally built at YouTube, used by Slack, GitHub and PlanetScale; supports online resharding." },
+          { "name": "Amazon DynamoDB", "note": "Hash-partitioned key-value store with automatic splitting and adaptive capacity for hot partitions." },
+          { "name": "Google Bigtable and Spanner", "note": "Range-partitioned into tablets or splits that split and move automatically based on size and load." },
+          { "name": "Apache Cassandra", "note": "Consistent hashing ring with virtual nodes; the partition key determines placement and replication." }
+        ],
+        "questions": [
+          { "q": "Design the sharding scheme for a multi-tenant SaaS database with 100,000 tenants, a few of them huge.", "a": "Shard by tenant_id so every query and transaction is single-shard, using a directory (tenant to shard map) rather than pure hashing so tenants can be moved individually. Pack many small tenants per shard, and give the largest tenants dedicated shards or further split them by a secondary key. Store the directory in a consensus-backed metadata service with versioning, and use CDC-based online moves for rebalancing." },
+          { "q": "Why is hash mod N a bad partition function, and what would you use instead?", "a": "When N changes, almost every key maps to a different server, so adding one node forces moving nearly all data and wipes caches. Consistent hashing with virtual nodes, rendezvous hashing or a fixed large number of logical shards mapped to nodes all limit movement to roughly 1/N of keys. Fixed logical shards (for example 4,096) are simplest operationally because rebalancing just reassigns whole shards." },
+          { "q": "How do you support queries by email when users are sharded by user_id?", "a": "Build a global secondary index partitioned by email that maps email to user_id, maintained asynchronously via CDC or synchronously within a distributed transaction if uniqueness must be strict. Lookups become two single-shard reads instead of a fan-out to every shard. Accept index lag or use transactional writes depending on whether email uniqueness must be enforced immediately." }
+        ]
+      },
+      "related": [ "replication", "consensus", "load-balancing", "lsm-btree", "data-parallelism" ]
+    },
+    {
+      "id": "message-queues",
+      "title": "Message Queues & Logs",
+      "gist": "Message queues and logs let services hand off work or events through a durable middleman, so senders and receivers need not be running at the same pace.",
+      "overview": [
+        "Think of a restaurant's order ticket rail. Waiters clip orders onto the rail and go back to customers; cooks pull tickets when they are ready. Waiters do not stand around waiting for the kitchen, and a rush of orders simply makes the rail longer instead of making waiters drop plates. A **message queue** is that rail for software.",
+        "There are two main flavors. A classic **queue** (RabbitMQ, Amazon SQS) hands each message to one worker and deletes it once done, like a to-do list shared by a team. A **log** (Apache Kafka, Redpanda) keeps every message in order for days or forever, like a newspaper archive: many different readers can each read at their own pace, and a new reader can start from the beginning.",
+        "This decoupling makes systems sturdier and easier to grow. A slow email service will not slow down checkout; a new analytics team can subscribe to order events without touching the order system. The catch is that messages may arrive twice or out of order after failures, so receivers must be built to cope."
+      ],
+      "diagram": {
+        "caption": "Events flowing through a partitioned log.",
+        "steps": [
+          { "label": "Producers", "detail": "Publish keyed events" },
+          { "label": "Partitioned topic", "detail": "Ordered, replicated append-only log" },
+          { "label": "Retention", "detail": "Days, or tiered to S3" },
+          { "label": "Consumer groups", "detail": "Each tracks its own offset" },
+          { "label": "Side effects", "detail": "DB writes, emails, analytics" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Broker", "role": "Server that stores messages durably and serves producers and consumers; Kafka brokers persist to append-only segment files and replicate partitions." },
+          { "name": "Topic and partitions", "role": "A named stream split into partitions; order is guaranteed within a partition, and messages with the same key go to the same partition." },
+          { "name": "Consumer group and offsets", "role": "Consumers in a group divide partitions among themselves; each commits the offset of the last processed message so it can resume after a crash." },
+          { "name": "Acknowledgment and redelivery", "role": "Queues use per-message acks with visibility timeouts and redelivery; dead-letter queues capture messages that repeatedly fail." },
+          { "name": "Replication and metadata", "role": "Each partition has a leader and in-sync replicas; Kafka 4.x stores cluster metadata in its built-in KRaft Raft quorum." }
+        ],
+        "flow": [
+          "A producer serializes an event (often Avro or Protobuf with a schema registry), picks a partition by hashing the key, and batches it with others.",
+          "The partition leader appends the batch to its log and followers replicate it; with acks=all the producer is acknowledged once all in-sync replicas have it.",
+          "Consumers in a group are assigned partitions and fetch batches sequentially from their last committed offset.",
+          "Each consumer processes messages and writes results or side effects, then commits its new offset.",
+          "If a consumer crashes, its partitions are reassigned and the replacement resumes from the last committed offset, possibly reprocessing a few messages.",
+          "Old segments are deleted after the retention period or compacted to keep only the latest value per key, and with tiered storage they move to object storage."
+        ],
+        "tradeoffs": [
+          { "choice": "Log (Kafka-style)", "pro": "Replayable, many independent consumers, very high throughput, ordering per partition", "con": "Parallelism capped by partition count; per-message retries and priorities are awkward" },
+          { "choice": "Queue (SQS / RabbitMQ-style)", "pro": "Per-message acks, retries, delays, and elastic worker pools", "con": "Messages vanish after processing, so no replay; ordering is weaker or costly" },
+          { "choice": "At-least-once delivery", "pro": "Nothing is lost", "con": "Duplicates require idempotent consumers" },
+          { "choice": "Exactly-once (transactions)", "pro": "Clean semantics for read-process-write pipelines within the system", "con": "Extra latency and complexity; does not extend to external side effects automatically" }
+        ],
+        "numbers": [
+          { "metric": "Kafka throughput per broker (modern NVMe)", "value": "~hundreds of MB/s to ~1 GB/s" },
+          { "metric": "Kafka end-to-end latency (p99, tuned)", "value": "~5-50 ms" },
+          { "metric": "LinkedIn Kafka scale", "value": "~7+ trillion messages/day" },
+          { "metric": "SQS standard queue throughput", "value": "Nearly unlimited; FIFO ~300 msg/s per group (3,000 batched, higher in high-throughput mode)" },
+          { "metric": "Typical Kafka retention", "value": "~7 days default (log.retention.hours=168)" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Exactly-once is a property of a whole pipeline, not of a queue. Kafka provides idempotent producers (sequence numbers per partition deduplicate retries) and transactions that atomically write output records and consumer offsets, giving exactly-once for Kafka-to-Kafka processing as used by Kafka Streams and Flink. Once a consumer calls an external API or database, you are back to at-least-once and need idempotency keys, an outbox table, or storing the offset in the same transaction as the side effect.",
+          "Ordering and parallelism fight each other. Order holds only within a partition, so you choose the key to group events that must be ordered (all events for an order_id), and parallelism is bounded by partition count. Hot keys create skewed partitions and lag. Consumer rebalances historically paused the whole group; cooperative incremental rebalancing and Kafka 4.0's new consumer group protocol (KIP-848) move assignment to the broker and reduce stop-the-world pauses. Kafka 4.0 also previews share groups (KIP-932), queue-style consumption with per-message acks on top of the log.",
+          "The architecture is shifting toward object storage. Tiered storage (KIP-405, GA in Kafka 3.9) offloads old segments to S3, and diskless designs such as WarpStream, AutoMQ and the KIP-1150 proposal write directly to object storage, trading ~hundreds of milliseconds of latency for elimination of cross-AZ replication costs, which on AWS can dominate Kafka bills. Redpanda reimplements the Kafka protocol in C++ with a thread-per-core design and Raft per partition for lower tail latency."
+        ],
+        "failureModes": [
+          { "name": "Consumer lag spiral", "description": "Consumers fall behind (slow downstream, hot partition) and lag grows until data ages out of retention and is lost unprocessed. Fix: monitor lag per partition, autoscale consumers up to the partition count, add partitions ahead of time and alert well before retention." },
+          { "name": "Poison message", "description": "One malformed message makes the consumer crash on every retry, blocking its partition forever. Fix: bounded retries, dead-letter topics, schema validation at produce time, and skip-and-alert logic." },
+          { "name": "Duplicate side effects", "description": "A consumer performs an action (charging a card, sending an email) then crashes before committing its offset, so the replacement repeats it. Fix: idempotency keys stored with the side effect, transactional outbox and inbox patterns, and dedup tables." }
+        ],
+        "realSystems": [
+          { "name": "Apache Kafka 4.x", "note": "The standard distributed log, ZooKeeper-free since 4.0 (2025) with KRaft, tiered storage and the new consumer group protocol." },
+          { "name": "Amazon SQS and SNS", "note": "Managed queue and pub/sub services; SQS standard is at-least-once with best-effort ordering, FIFO queues add ordering and dedup." },
+          { "name": "RabbitMQ 4.x", "note": "AMQP broker with flexible routing; quorum queues (Raft-based) are now the recommended durable queue type." },
+          { "name": "Redpanda and WarpStream", "note": "Kafka-compatible alternatives: Redpanda is a thread-per-core C++ broker, WarpStream (acquired by Confluent) is diskless on object storage." }
+        ],
+        "questions": [
+          { "q": "Design the order-processing pipeline for an e-commerce site so that payment, inventory and email services are decoupled and nothing is lost.", "a": "The order service writes the order and an outbox row in one database transaction; a CDC relay publishes the outbox event to a Kafka topic keyed by order_id with acks=all and replication factor 3. Payment, inventory and email each consume in their own consumer group, process idempotently using the event id, and commit offsets after side effects. Failures go to retry and dead-letter topics, and consumer lag is monitored with alerts." },
+          { "q": "When would you choose SQS over Kafka?", "a": "Choose SQS-style queues for independent task processing where each job is handled once, you want per-message retries and visibility timeouts, elastic workers and zero operations, and you do not need replay or many independent readers. Choose Kafka when events are a shared stream consumed by several systems, need ordering per key, replay for reprocessing, or very high throughput." },
+          { "q": "How many partitions should a Kafka topic have?", "a": "Size for peak throughput and consumer parallelism: if a consumer handles 20 MB/s and you need 400 MB/s, you need at least 20 partitions, and you add headroom because adding partitions later changes key-to-partition mapping and breaks per-key ordering. Avoid going excessively high, since each partition costs metadata, file handles and recovery time. Tens to low hundreds per topic is common." }
+        ]
+      },
+      "related": [ "stream-processing", "change-data-capture", "consensus", "io-models", "training-data-pipeline" ]
+    }
+  ]
+}

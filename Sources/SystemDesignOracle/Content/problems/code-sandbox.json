@@ -1,0 +1,174 @@
+{
+  "id": "code-sandbox",
+  "title": "Untrusted Code Execution Service",
+  "domain": "security",
+  "prompt": "Design a service that runs untrusted user-submitted code (like an online judge or AI code-execution tool) safely at scale. Cover isolation, resource limits, networking, and abuse.",
+
+  "gist": "Run each job in a disposable microVM (Firecracker or gVisor) from a warm pool, with cgroup limits, no network by default, an egress proxy when allowed, and abuse detection plus quotas around it.",
+
+  "overview": [
+    "Running a stranger's code is running an attacker's code. A submission might try to read other users' data, break out to the host machine, mine cryptocurrency, attack other websites, or simply loop forever. The service must still start each job in well under a second, because online judges and AI coding tools run millions of short programs a day.",
+    "The core decision is the **isolation boundary**. Ordinary containers share the host's Linux kernel, so one kernel bug can let code escape. Instead we run each job inside a **microVM** (like AWS Firecracker) or a user-space kernel (like gVisor), so the attacker must break through a much smaller, hardened layer before reaching the real host. Inside, the job runs as an unprivileged user with a read-only base image and a throwaway scratch disk.",
+    "Every job gets hard limits on CPU time, memory, processes, disk and wall-clock time, enforced by the host, and is killed when it exceeds them. Networking is off by default; when a use case needs it (installing packages for an AI agent), traffic goes through a proxy that allows only approved destinations and rates.",
+    "Around the sandbox sits the rest of the service: a queue and scheduler that keep a pool of pre-booted sandboxes ready so jobs start fast, quotas per account, and abuse detection that spots crypto-mining, spam or scanning and shuts it down. Every sandbox is destroyed after use, so nothing from one job can leak into the next."
+  ],
+  "diagram": {
+    "caption": "Jobs go through admission and a scheduler into single-use microVMs on hardened hosts.",
+    "steps": [
+      { "label": "API & admission", "detail": "auth, quotas, size checks" },
+      { "label": "Queue & scheduler", "detail": "per-tenant fairness, priorities" },
+      { "label": "Warm pool", "detail": "snapshot-restored microVMs" },
+      { "label": "Sandbox", "detail": "Firecracker/gVisor, cgroups, seccomp" },
+      { "label": "Egress proxy", "detail": "deny by default, allowlist" },
+      { "label": "Results & teardown", "detail": "capped output, destroy VM" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Accept code plus language/runtime, input files and limits; return stdout, stderr, exit status, resource usage and verdict (judge mode: compare against test cases).",
+      "Support many runtimes (Python, C++, Java, Go, Rust, Node, etc.) with pinned toolchain versions.",
+      "Support short stateless runs (judge) and longer stateful sessions (AI code interpreter with files persisted across calls in one session).",
+      "Optional, policy-controlled network access (e.g. package installs) per tenant or session.",
+      "Per-tenant quotas, rate limits and audit logs of every execution."
+    ],
+    "nonFunctional": [
+      "Security: no escape to host, no cross-tenant data access, no lateral movement into internal networks; assume every job is hostile.",
+      "Latency: sandbox ready in < 150 ms p95 from a warm pool; end-to-end overhead < 300 ms beyond the user's own runtime.",
+      "Accurate, reproducible limits for judging (CPU time measured consistently, low noise from neighbours).",
+      "Scale to tens of thousands of concurrent sandboxes and bursts of 10× during contests or agent spikes.",
+      "Cost-efficient packing: high density of small VMs per host without noisy-neighbour effects on timing."
+    ],
+    "estimates": [
+      { "metric": "Executions", "value": "50M runs/day ≈ 580/s avg, ~5K/s peak during contests or agent bursts" },
+      { "metric": "Concurrency", "value": "5K/s × ~2 s average duration ≈ 10K concurrent sandboxes; AI sessions add ~20K long-lived" },
+      { "metric": "Memory footprint", "value": "30K sandboxes × ~512 MB limit (~200 MB typical resident) ≈ 6 TB resident across fleet" },
+      { "metric": "Host count", "value": "Bare-metal 96-core / 768 GB hosts at ~300 sandboxes each → 30K ÷ 300 ≈ 100 hosts + 50% headroom" },
+      { "metric": "MicroVM overhead", "value": "Firecracker boots in ~125 ms with < 5 MB VMM memory; snapshot restore in ~10–30 ms" },
+      { "metric": "Output caps", "value": "Stdout/stderr capped at ~1–10 MB per run; 50M × ~10 KB avg ≈ 500 GB/day stored" }
+    ]
+  },
+  "stages": [
+    {
+      "name": "Threat Model",
+      "summary": "Decide what attackers want and which boundaries must hold, because every later choice follows from it.",
+      "points": [
+        "Assume code is actively malicious and may include kernel exploits, side-channel attacks, fork bombs, and attempts to reach cloud metadata endpoints.",
+        "Assets to protect: the host and its credentials, other tenants' code and data, internal networks and services, and third parties on the internet.",
+        "Defence in depth: at least two independent boundaries between user code and the host (e.g. guest kernel + VMM + seccomp + unprivileged host process + jailer).",
+        "Hosts run nothing else sensitive: no cloud credentials with broad scope, no access to production networks, separate accounts/VPCs.",
+        "Plan for breach: sandboxes are single-use, hosts are regularly rotated, and detection assumes escape attempts will happen."
+      ],
+      "deepDive": [
+        "The attack surface of a standard container is the entire Linux syscall interface of a shared kernel, hundreds of syscalls and a steady stream of privilege-escalation CVEs. A microVM reduces the surface to a minimal virtual device model (Firecracker exposes only virtio-net, virtio-block, a serial console and a few others) plus KVM; gVisor reimplements syscalls in a memory-safe user-space kernel and itself uses only a small set of host syscalls under seccomp. Either way the attacker needs a chained exploit rather than a single kernel bug.",
+        "Side channels on shared hardware (Spectre-class attacks, cache timing) are a residual risk for multi-tenant density. For high-sensitivity tenants, pin sandboxes to dedicated cores or hosts, disable SMT sharing between tenants, and keep hosts patched with current microcode and kernel mitigations."
+      ]
+    },
+    {
+      "name": "Isolation",
+      "summary": "Run each job in a single-use microVM or gVisor sandbox launched from an immutable, minimal image.",
+      "points": [
+        "Firecracker microVMs (or Cloud Hypervisor/Kata) per job or per session: separate guest kernel, minimal device model, KVM hardware isolation.",
+        "The VMM itself runs under a jailer: its own unprivileged user, chroot, namespaces, cgroups and a strict seccomp filter, so a VMM bug still lands in a cage.",
+        "Inside the guest: run code as a non-root user, read-only root filesystem with language toolchains, and a small writable tmpfs/overlay scratch disk.",
+        "One job, one sandbox: never reuse a sandbox across tenants; destroy and recreate rather than clean.",
+        "gVisor as an alternative where nested virtualisation is unavailable or density matters more; plain containers only for trusted internal workloads."
+      ],
+      "deepDive": [
+        "Firecracker's design point is exactly this workload: AWS built it for Lambda and Fargate to run untrusted multi-tenant code with VM-grade isolation and container-like density. Its VMM is written in Rust, exposes a handful of emulated devices, and boots a guest to user space in about 125 ms, with thousands of microVMs per host. The cost is needing KVM, which means bare-metal instances or nested virtualisation support from the cloud provider.",
+        "gVisor (used by Google for Cloud Run and App Engine sandboxes) intercepts guest syscalls in its Sentry, a user-space kernel written in Go, so it needs no hardware virtualisation and starts in tens of milliseconds. The trade-off is syscall-heavy workloads run slower and some syscalls or filesystem behaviours differ from Linux, which matters for judges that must behave exactly like a reference machine."
+      ]
+    },
+    {
+      "name": "Resource Limits",
+      "summary": "Bound every resource a job can consume, enforced outside the guest, with accurate accounting for judging.",
+      "points": [
+        "cgroups v2 on the host per sandbox: CPU quota (e.g. 1 vCPU), memory max with OOM kill, pids.max to stop fork bombs, and io.max for disk bandwidth.",
+        "Separate CPU-time limit (measured via cgroup usage) from wall-clock timeout, so sleeping or blocked jobs are also killed.",
+        "Disk quota on the scratch volume (e.g. 1 GB) and output caps on stdout/stderr streamed through a bounded pipe.",
+        "For judging fairness, pin sandboxes to dedicated physical cores with SMT disabled or isolated, and measure user+sys CPU time, not wall time.",
+        "Kill escalation: SIGTERM, then SIGKILL, then destroy the VM; the host enforces limits even if the guest kernel is compromised."
+      ],
+      "deepDive": [
+        "Limits enforced inside the guest are advisory to an attacker who controls the guest. The authoritative limits are the VMM's configured vCPUs and memory plus host cgroups around the VMM process, and host-side timers that destroy the VM. Inside the guest, an agent applies finer limits (rlimits, per-process cgroups) mostly for good error messages, such as reporting 'memory limit exceeded' rather than a generic crash.",
+        "Judges care about reproducible timing. Noisy neighbours, CPU frequency scaling and SMT siblings can make the same solution vary by 20–30%. Competitive programming platforms reduce noise by fixing CPU frequency, pinning one job per physical core, warming caches consistently, and rerunning near-limit submissions."
+      ]
+    },
+    {
+      "name": "Networking",
+      "summary": "Default to no network; when access is needed, force all traffic through an egress proxy with allowlists, rate limits and logging.",
+      "points": [
+        "Judge mode: no network interface at all inside the microVM, removing an entire class of abuse.",
+        "Session mode with network: a tap device per VM attached to an isolated network namespace whose only route is to an egress proxy.",
+        "Block link-local and private ranges: cloud metadata (169.254.169.254), RFC1918, and internal service CIDRs, at the host firewall, not just in the proxy.",
+        "Allowlist package registries (PyPI, npm, crates.io mirrors) or a curated internal mirror; cap bandwidth and connection rates per sandbox.",
+        "Log destination, bytes and duration per sandbox for abuse analysis and incident response."
+      ],
+      "deepDive": [
+        "SSRF to the cloud metadata service is one of the most damaging real-world sandbox mistakes: if user code can reach the instance metadata endpoint, it can steal the host's credentials. Blocking it requires host-level firewall rules (nftables/iptables in the host namespace) and IMDSv2-style hop limits, because a guest that controls its own networking will ignore any guest-side policy.",
+        "An internal package mirror is both a security and a performance win: it removes arbitrary internet access, protects against typosquatting by curating packages, and makes installs fast and reproducible. For AI agents that genuinely need the open web, route through a proxy that enforces domain policy, strips credentials, applies rate limits and attributes traffic to the tenant."
+      ]
+    },
+    {
+      "name": "Scheduling & Warm Pools",
+      "summary": "Hide startup cost with pools of pre-booted or snapshot-restored sandboxes, and schedule jobs fairly across tenants.",
+      "points": [
+        "Per-runtime warm pools of booted microVMs, or Firecracker snapshots restored copy-on-write in tens of milliseconds, sized from recent demand.",
+        "Queue per tenant with weighted fair scheduling so one contest or agent burst cannot starve others; priority lanes for interactive sessions.",
+        "Bin-pack sandboxes onto hosts by memory and CPU; keep headroom for bursts and drain hosts gracefully for patching.",
+        "Session affinity for stateful AI sessions: route calls to the same sandbox, with idle timeout (~5–30 min) and optional snapshot to object storage for resume.",
+        "Autoscale the host fleet on queue depth and pool depletion, with bare-metal capacity reserved for predictable peaks such as contests."
+      ],
+      "deepDive": [
+        "Snapshot restore changes the economics: boot once, load the language runtime and common libraries (a Python interpreter with numpy and pandas imported), snapshot memory, then restore that snapshot for each job. Startup drops from seconds to tens of milliseconds. The security catch is that restored clones share identical memory state, including RNG seeds and ASLR layout, so the guest must reseed randomness on restore (Firecracker documents VMGenID support for this).",
+        "Pool sizing is a queueing problem: with arrival rate λ per runtime and acceptable wait, keep enough idle sandboxes to cover λ × refill time at peak. Over-provisioning wastes memory; under-provisioning makes users pay cold-start latency. Predictive refill from recent rates plus a floor per runtime works well."
+      ]
+    },
+    {
+      "name": "Abuse Prevention",
+      "summary": "Stop people using free compute for mining, spam, attacks or hosting illegal content, without hurting legitimate users.",
+      "points": [
+        "Account-level controls: verified accounts, per-tenant concurrency and CPU-hour quotas, stricter limits for new or free accounts.",
+        "Runtime signals: sustained 100% CPU with crypto-like instruction patterns, known mining pool domains, high outbound connection fan-out, port scanning.",
+        "Static checks on submissions and installed packages for known malware hashes and miners; throttle or block repeat offenders.",
+        "Short maximum lifetimes for networked sessions and egress bandwidth caps make the service unattractive for proxies and DDoS.",
+        "Incident response: automatically kill and quarantine sandboxes, snapshot evidence, ban accounts, and feed signals back into scoring."
+      ],
+      "deepDive": [
+        "Free compute attracts crypto-mining within days of launch; CI providers and notebook services have repeatedly had to restrict free tiers because of it. The most effective controls are economic and identity-based (verification, quotas, no network for anonymous users) rather than detection alone, because detection is a cat-and-mouse game with obfuscated miners. Network-off-by-default removes most incentive, since a miner or spam bot that cannot reach the internet is worthless."
+      ]
+    }
+  ],
+  "tradeoffs": [
+    { "choice": "MicroVM (Firecracker) vs container", "pro": "Hardware-virtualised boundary with a tiny device model; strong multi-tenant isolation.", "con": "Needs KVM/bare metal, more memory overhead, more complex image and networking plumbing." },
+    { "choice": "gVisor vs microVM", "pro": "No hardware virtualisation needed; fast start; memory-safe syscall layer.", "con": "Syscall-heavy code is slower; compatibility gaps with Linux behaviour." },
+    { "choice": "Single-use sandboxes vs reuse", "pro": "No state leaks between jobs; simple security story.", "con": "Higher startup cost, mitigated by warm pools and snapshots." },
+    { "choice": "No network vs proxied network", "pro": "No network eliminates exfiltration, SSRF and most abuse.", "con": "AI agents and package installs need it; proxy adds latency and policy upkeep." },
+    { "choice": "Dense packing vs dedicated cores", "pro": "Dense packing cuts cost per run.", "con": "Noisy neighbours hurt judging accuracy and widen side-channel exposure." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Sandbox escape", "description": "A kernel or VMM exploit lets code reach the host. Layered defences (jailer, seccomp, unprivileged VMM, no host credentials), rapid patching, and host rotation limit damage; detection watches for unexpected host syscalls and processes." },
+      { "name": "Metadata/SSRF credential theft", "description": "User code reaches the cloud metadata endpoint or internal services and steals credentials. Block at the host firewall, give hosts minimal IAM roles, and isolate sandbox hosts in a separate network." },
+      { "name": "Resource exhaustion", "description": "Fork bombs, memory balloons or disk fills degrade a host for all tenants. Enforce pids, memory, disk and I/O limits on the host side with kill-on-exceed." },
+      { "name": "State leakage between runs", "description": "Reused sandboxes or shared caches expose one tenant's files or secrets to another. Single-use VMs, per-tenant scratch volumes and wiping or destroying all writable state." },
+      { "name": "Warm pool depletion", "description": "A burst drains pools and users hit multi-second cold starts or queue timeouts. Predictive refill, per-tenant fair queueing and reserved capacity for interactive traffic." }
+    ],
+    "realSystems": [
+      { "name": "AWS Lambda / Firecracker", "note": "Firecracker microVMs isolate untrusted multi-tenant functions, with snapshot-based fast start (Lambda SnapStart)." },
+      { "name": "Google gVisor", "note": "User-space kernel sandbox behind Cloud Run, App Engine and many AI code-execution sandboxes." },
+      { "name": "E2B and AI code interpreters", "note": "Firecracker-based sandboxes for AI agents with stateful sessions, filesystem and controlled network, launched in ~hundreds of ms." },
+      { "name": "Codeforces / Judge0 / IOI judges", "note": "Online judges using isolate/cgroups-based or container sandboxes with strict CPU-time and memory accounting for reproducible verdicts." }
+    ],
+    "questions": [
+      { "q": "Why not just use Docker with a seccomp profile?", "a": "Containers share the host kernel, so any reachable kernel vulnerability is a direct escape. Seccomp narrows syscalls but still leaves a large surface that languages and runtimes need. For hostile multi-tenant code, a microVM or gVisor adds a second, much smaller boundary; containers are fine inside that boundary for packaging." },
+      { "q": "How do you make startup under 100 ms?", "a": "Pre-boot per-runtime microVMs, or restore from a memory snapshot with copy-on-write pages, attach a fresh scratch disk and network config, and inject the code through a vsock agent. Reseed RNGs and refresh identifiers after restore." },
+      { "q": "How do you measure CPU time fairly for an online judge?", "a": "Use cgroup CPU accounting (user + sys) of the job, pin to an isolated physical core with SMT siblings idle, fix CPU frequency, and rerun submissions close to the limit to reduce false time-limit verdicts." },
+      { "q": "An AI agent needs pip install. How do you allow it safely?", "a": "Give the session a network interface whose only route is an egress proxy that allows a package mirror (or curated registries), blocks private and metadata ranges at the host firewall, rate-limits bandwidth and logs all requests per tenant." },
+      { "q": "How do you detect crypto-mining?", "a": "Combine signals: sustained full CPU with no output, connections to known pool domains or stratum protocol patterns, binaries matching miner hashes, and account risk scores. Mostly prevent it with quotas, identity checks and no network for untrusted tiers." }
+    ]
+  },
+
+  "related": [ "isolation-sandboxing", "containers-vms", "threat-modeling", "syscalls-kernel", "cpu-scheduling", "secrets-management" ]
+}

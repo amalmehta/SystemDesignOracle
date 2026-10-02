@@ -1,0 +1,460 @@
+{
+  "id": "autonomous-vehicles",
+  "name": "Autonomous Vehicles",
+  "symbol": "car",
+  "summary": "How a self-driving car turns photons and laser pulses into steering and braking, safely, many times a second. It is a real-time robotics system and a planet-scale data and ML system bolted together.",
+  "topics": [
+    {
+      "id": "av-stack",
+      "title": "The Autonomy Stack",
+      "gist": "A self-driving car repeats one loop many times a second: sense the world, work out what is where, guess what others will do, choose a path, steer.",
+      "overview": [
+        "Think of a careful human driver. Your eyes and ears take in the scene, your brain spots the cyclist and the red light, you guess the cyclist might swerve, you decide to slow and drift left, and your hands and feet make it happen. A self-driving car does the same thing, except each of those jobs is a separate piece of software running on a computer in the trunk, and the whole loop repeats roughly 10 to 30 times every second.",
+        "The classic design is a **pipeline**: *perception* (what objects are around me?), *localization* (exactly where am I on the map?), *prediction* (where will everyone be in a few seconds?), *planning* (what path should I take?), and *control* (how much steering, throttle and brake?). Each stage hands a tidy summary to the next, which makes the system easier to test and debug.",
+        "Since about 2023 a second camp has grown: **end-to-end** systems, where one large neural network goes from camera pixels almost straight to a driving path, learned from millions of hours of human driving. Tesla's FSD v12 onward and Wayve work this way. Most companies that run cars with nobody behind the wheel, such as Waymo, use a hybrid: big learned models inside a structure that still has clear stages and hard safety checks around them."
+      ],
+      "diagram": {
+        "caption": "The sense-think-act loop, repeated ~10-30 times per second.",
+        "steps": [
+          { "label": "Sensors", "detail": "Cameras, lidar, radar, IMU, GNSS" },
+          { "label": "Perception", "detail": "Detect and track objects" },
+          { "label": "Localization", "detail": "Pose on HD map, ~10 cm" },
+          { "label": "Prediction", "detail": "Future paths of other agents" },
+          { "label": "Planning", "detail": "Pick a safe, comfortable trajectory" },
+          { "label": "Control", "detail": "Steering, throttle, brake commands" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Sensor suite", "role": "Cameras for color and semantics, lidar for precise 3D range, radar for velocity and bad weather, plus IMU, wheel odometry and GNSS. Waymo's 6th-gen driver uses 13 cameras, 4 lidars and 6 radars." },
+          { "name": "Perception", "role": "Neural networks fuse sensor data into a bird's-eye-view picture of tracked objects (vehicles, pedestrians, cyclists), drivable space, lanes and traffic-light states." },
+          { "name": "Localization", "role": "Matches live lidar and camera data against a prior map, fused with IMU and odometry, to know the car's pose to about 10 cm and 0.1 degree." },
+          { "name": "Prediction", "role": "Forecasts several likely future trajectories, with probabilities, for every nearby agent over the next ~5-8 seconds." },
+          { "name": "Planning", "role": "Generates and scores candidate trajectories for safety, legality, progress and comfort, then picks one, re-planning every cycle." },
+          { "name": "Control and drive-by-wire", "role": "Tracks the chosen trajectory with a controller such as MPC and sends commands over CAN or automotive Ethernet to redundant steering and braking actuators." }
+        ],
+        "flow": [
+          "Sensors capture a frame: cameras at ~30 fps, lidar spinning at 10-20 Hz, radar at ~20 Hz, IMU at 100-1000 Hz, all hardware-timestamped against a shared clock (PTP).",
+          "Raw data is time-synchronized and motion-compensated, so a lidar sweep that took 100 ms is corrected for the car's own movement during it.",
+          "Perception networks produce a fused 3D scene: object boxes with velocity, occupancy of free space, lane geometry and signal states.",
+          "Localization aligns the scene to the HD map, giving the precise pose and letting the stack read map priors such as lane connectivity and speed limits.",
+          "Prediction rolls every tracked agent forward into several possible futures with probabilities.",
+          "The planner proposes many candidate trajectories, rejects any that collide with predicted futures or break rules, and chooses the lowest-cost one.",
+          "The controller converts the trajectory into steering-angle and acceleration commands at ~50-100 Hz, while a separate safety monitor watches for faults and can trigger a fallback stop."
+        ],
+        "tradeoffs": [
+          { "choice": "Modular pipeline", "pro": "Each stage is testable, interpretable and can carry hand-written safety rules", "con": "Information is lost at each hand-off and errors compound; hard to optimize the whole thing jointly" },
+          { "choice": "End-to-end network", "pro": "Learns subtle driving behavior directly from data and improves with scale", "con": "Hard to explain, verify or patch a specific failure; needs enormous curated data" },
+          { "choice": "Lidar plus HD maps", "pro": "Precise geometry and strong priors make driverless operation achievable today", "con": "Costly sensors and maps that must be built and maintained per city" },
+          { "choice": "Camera-only", "pro": "Cheap hardware that can ship on millions of consumer cars", "con": "Depth must be inferred; harder in glare, darkness and heavy rain" }
+        ],
+        "numbers": [
+          { "metric": "End-to-end reaction latency (sensor to actuator)", "value": "~100-200 ms" },
+          { "metric": "Distance covered in 100 ms at 65 mph", "value": "~2.9 m" },
+          { "metric": "Raw sensor data rate per robotaxi", "value": "~1-4 GB/s before compression" },
+          { "metric": "NVIDIA DRIVE Thor compute", "value": "~1,000 INT8 TOPS (~2,000 FP4 TFLOPS)" },
+          { "metric": "Waymo paid rides (2025-26)", "value": "~hundreds of thousands per week" },
+          { "metric": "Planner replan rate", "value": "~10-20 Hz" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The interfaces between modules are the real design decisions. Passing only boxes from perception to planning throws away uncertainty and anything that is not a box (debris, a dangling cable, a hand signal). Modern stacks pass richer intermediates: occupancy grids with per-cell probability, learned scene embeddings, and multi-modal predictions. This is the middle ground between the strict pipeline and pure end-to-end, and it is why papers like UniAD (CVPR 2023) train perception, prediction and planning jointly with planning as the final loss while keeping inspectable intermediate outputs.",
+          "Timing is a first-class correctness property. Every message carries a capture timestamp, and every consumer must reason about how stale its inputs are. A planner using a 150 ms old object list at 30 m/s is planning against a world that has moved 4.5 m. Production stacks run deterministic schedulers on fixed periods, budget each node's worst-case execution time, and use the same scheduler in simulation replay so results are reproducible bit-for-bit.",
+          "Driverless deployments add a layer the demo videos hide: the operational design domain (ODD) and remote assistance. The ODD defines where and when the car may drive (city geofence, weather, speeds). When the car is unsure, for example a police officer waving traffic through a red light, it stops safely and asks a remote assistant for a hint, such as 'that lane is fine to use'. The assistant never joysticks the car; the onboard stack remains responsible for safe motion, which keeps the system robust to network latency and outages."
+        ],
+        "failureModes": [
+          { "name": "Compounding hand-off errors", "description": "A missed detection in perception becomes an invisible agent in prediction and a collision path in planning. Fix: pass uncertainty and occupancy, not just boxes, and add an independent geometric collision check on raw lidar." },
+          { "name": "Stale inputs under load", "description": "A slow perception frame makes the planner act on an outdated world, causing late braking or jerky motion. Fix: explicit latency budgets, timestamp checks that reject stale data, and extrapolation of tracks to plan time." },
+          { "name": "Out-of-ODD situations", "description": "Construction zones, flooded roads or unusual emergency scenes fall outside what the system was validated for, leading to stalls or poor choices. Fix: ODD monitors that detect the condition, minimal-risk maneuvers, and remote assistance." }
+        ],
+        "realSystems": [
+          { "name": "Waymo Driver (6th gen)", "note": "Modular-but-learned stack with lidar, cameras, radar and HD maps; runs fully driverless robotaxi service in Phoenix, San Francisco, Los Angeles, Austin, Atlanta and more." },
+          { "name": "Tesla FSD (v13/v14)", "note": "Camera-only, largely end-to-end neural network on the HW4/AI4 computer; supervised in consumer cars and running a small unsupervised robotaxi pilot in Austin since mid-2025." },
+          { "name": "Wayve", "note": "UK startup betting on embodied-AI end-to-end driving that generalizes across cities and vehicle platforms without HD maps." },
+          { "name": "Aurora Driver", "note": "Driverless heavy trucks on Texas highways since 2025, using long-range FirstLight FMCW lidar for highway stopping distances." }
+        ],
+        "questions": [
+          { "q": "Design the high-level software architecture for a Level 4 robotaxi. Where would you put the safety guarantees?", "a": "Use a staged pipeline (perception, localization, prediction, planning, control) with learned models inside each stage and rich interfaces such as occupancy and multi-modal predictions. Wrap the planner output in an independent, simpler safety layer that checks the trajectory against raw sensor occupancy and kinematic limits and can command a minimal-risk stop. Run the safety monitor on separate, lockstep, ASIL-D hardware with its own power, and define an ODD monitor that triggers fallback when conditions exceed what was validated." },
+          { "q": "Your end-to-end driving model occasionally runs a red light in simulation. How do you fix it without retraining from scratch?", "a": "First mine the fleet and simulation logs for all similar scenarios and add them, plus targeted synthetic variants, to the training set with higher weight; fine-tune and re-evaluate on a held-out red-light suite. In parallel add a rule-based guard that vetoes trajectories crossing a stop line on a confidently detected red, so the fix is verifiable today. Track the metric in regression testing so later model versions cannot silently regress." },
+          { "q": "How would you size the latency budget for the whole stack at highway speed?", "a": "At 30 m/s every 100 ms is 3 m of travel, and stopping distance is roughly v squared over 2a, about 64 m at 7 m/s squared. Allocate, for example, ~30 ms sensor capture and transport, ~50 ms perception, ~20 ms prediction, ~30 ms planning and ~20 ms control and actuation, keeping total under ~150 ms with margin. Then verify worst-case, not average, latency and ensure sensors see far enough (250 m+ lidar or radar) to cover reaction plus braking distance." }
+        ]
+      },
+      "related": [ "perception", "prediction-planning", "av-safety", "cpu-scheduling", "llm-inference-basics" ]
+    },
+    {
+      "id": "perception",
+      "title": "Perception: Seeing the Road",
+      "gist": "Perception turns raw camera images, laser points and radar echoes into a live 3D map of every car, person, lane and traffic light around the vehicle.",
+      "overview": [
+        "Imagine trying to drive with three different senses that each see the world differently. Cameras are like your eyes: rich color and detail, great for reading signs and traffic lights, but bad at telling exactly how far away something is. Lidar is like tapping everything with millions of invisible laser canes: it gives precise distance but no color. Radar is like a bat's echo: coarse, but it sees through fog and directly measures how fast things are moving.",
+        "Perception's job is to combine these into one consistent picture. Today that is mostly done by neural networks that look at all the sensors together and draw a **bird's-eye view**, a top-down map around the car, like a video game minimap. On that map they place labeled boxes for each car, pedestrian and cyclist, mark which areas are free to drive, and trace the lanes.",
+        "It is not enough to see things once; the system also **tracks** them over time, giving each object an identity and a speed, so it knows that the pedestrian it saw a second ago is the same one now stepping off the curb. Newer systems also predict an *occupancy grid*, which marks any space that is filled, even by objects the network has never seen before, like a mattress fallen off a truck."
+      ],
+      "diagram": {
+        "caption": "From raw sensors to a tracked bird's-eye-view scene.",
+        "steps": [
+          { "label": "Raw sensors", "detail": "Images, point clouds, radar returns" },
+          { "label": "Per-sensor encoders", "detail": "CNN or ViT feature extraction" },
+          { "label": "BEV fusion", "detail": "Lift and merge into top-down grid" },
+          { "label": "Task heads", "detail": "Boxes, occupancy, lanes, lights" },
+          { "label": "Tracking", "detail": "IDs, velocity, history over time" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Camera backbone", "role": "A CNN or vision transformer (for example RegNet or ViT variants) extracts features from each of 8-13 surround cameras, usually at 1-8 megapixels." },
+          { "name": "Lidar encoder", "role": "Turns a point cloud of ~1-5 million points per second into features using voxel or pillar networks such as PointPillars or sparse 3D convolutions." },
+          { "name": "BEV view transformer", "role": "Lifts 2D image features into 3D using predicted depth (Lift-Splat-Shoot) or attention queries over a BEV grid (BEVFormer), then fuses them with lidar and radar features." },
+          { "name": "Detection and occupancy heads", "role": "Predict 3D boxes with class, size, heading and velocity (CenterPoint-style), plus a dense occupancy grid and semantic map elements like lanes and crosswalks." },
+          { "name": "Multi-object tracker", "role": "Associates detections across frames with Kalman filters and learned matching, smoothing velocity and keeping identities through brief occlusions." }
+        ],
+        "flow": [
+          "Each sensor frame arrives with a hardware timestamp; images are rectified and lidar sweeps are motion-compensated to a common reference time.",
+          "Per-sensor encoders run on the GPU or accelerator and produce feature maps.",
+          "Camera features are projected into a bird's-eye-view grid, typically ~100-200 m across at ~0.2-0.5 m resolution, using calibrated camera intrinsics and extrinsics.",
+          "Lidar and radar features are rasterized into the same grid and fused, often via concatenation plus convolution (BEVFusion) or cross-attention.",
+          "Temporal fusion mixes in features from the previous few frames, warped by ego-motion, so the model sees motion and handles short occlusions.",
+          "Task heads output 3D boxes, occupancy, lanes and traffic-light states, which the tracker associates with existing tracks.",
+          "The tracked object list and occupancy grid are published to prediction and planning, usually within ~30-60 ms of capture."
+        ],
+        "tradeoffs": [
+          { "choice": "Early fusion of raw features", "pro": "Network learns cross-sensor cues and handles disagreements gracefully", "con": "One sensor failure can degrade everything; harder to diagnose" },
+          { "choice": "Late fusion of per-sensor detections", "pro": "Independent pipelines give redundancy and easier debugging", "con": "Loses complementary information, worse at long range and on small objects" },
+          { "choice": "Object boxes", "pro": "Compact and easy for downstream planning to reason about", "con": "Cannot represent unknown or irregular shapes" },
+          { "choice": "Dense occupancy", "pro": "Captures anything solid, including never-seen objects", "con": "Heavier to compute and harder to use for intent prediction" }
+        ],
+        "numbers": [
+          { "metric": "Automotive lidar range (Luminar Iris, Hesai AT128)", "value": "~200-250 m at 10% reflectivity" },
+          { "metric": "Lidar point rate (Hesai AT128)", "value": "~1.5 million points/s" },
+          { "metric": "Automotive camera resolution", "value": "~1-8 MP at ~30 fps" },
+          { "metric": "Perception latency budget", "value": "~30-60 ms per frame" },
+          { "metric": "nuScenes 3D detection NDS (top 2025 models)", "value": "~0.75-0.80" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Calibration is the silent dependency. BEV projection assumes camera intrinsics and extrinsics known to fractions of a degree; a 0.5 degree yaw error displaces an object at 100 m by nearly 1 m. Fleets run online calibration that continuously refines extrinsics from lidar-camera edge alignment and flags sensors that have been knocked. Rolling-shutter cameras add another wrinkle: rows are captured over ~20-30 ms, so fast-moving objects and the car's own motion skew the image unless each row is compensated.",
+          "Long-tail recall drives everything. Benchmarks like nuScenes or Waymo Open measure average precision on common classes, but driverless safety is decided by rare cases: a child partly hidden by a parked van, a pedestrian in a dinosaur costume, a tire bouncing across lanes. That is why production stacks combine learned occupancy and open-vocabulary or vision-language models for unknown objects with a geometric safety net that treats any dense cluster of lidar returns above the ground plane as an obstacle, regardless of class.",
+          "Radar is having a renaissance. 4D imaging radars (for example Arbe Phoenix, Continental ARS540) add elevation and dense point output, giving ~1 degree angular resolution and direct Doppler velocity at 300 m in rain and fog. Learned radar-camera fusion narrows the gap with lidar for much lower cost, which is why consumer L2+ and L3 systems increasingly pair cameras with imaging radar rather than lidar."
+        ],
+        "failureModes": [
+          { "name": "Phantom braking", "description": "A false positive, often from an overpass, shadow, or radar reflection off a manhole cover, makes the car brake hard for nothing and risks being rear-ended. Fix: require temporal consistency and cross-sensor agreement before high-severity actions, and mine phantom events from the fleet for retraining." },
+          { "name": "Missed or late detection of rare objects", "description": "Unusual objects or poses (fallen ladder, person lying on the road) are not in training data and go undetected. Fix: class-agnostic occupancy, geometric lidar obstacle checks, and active learning loops that hunt for these cases." },
+          { "name": "Sensor degradation", "description": "Mud, rain droplets, sun glare or a failed sensor silently reduce perception range. Fix: blockage detection per sensor, cleaning systems (Waymo uses wipers and air jets), and degrading the ODD or speed when coverage drops." }
+        ],
+        "realSystems": [
+          { "name": "Tesla occupancy network", "note": "Camera-only volumetric occupancy and flow prediction introduced at AI Day 2022, now folded into the end-to-end FSD network." },
+          { "name": "BEVFusion (MIT, NVIDIA)", "note": "Influential open architecture fusing camera and lidar in a shared BEV space; widely used as a baseline and in NVIDIA DriveOS reference stacks." },
+          { "name": "Waymo perception", "note": "Fuses lidar, camera and radar with learned models trained on Waymo's own fleet data and the public Waymo Open Dataset; uses cleaning systems to keep sensors clear." }
+        ],
+        "questions": [
+          { "q": "Should a robotaxi perception system fuse sensors early or late?", "a": "Use primarily mid-level fusion in a shared BEV feature space, because it captures complementary strengths (camera semantics, lidar geometry, radar velocity) and performs best on benchmarks. Keep an independent late path, such as a simple lidar geometric obstacle detector, as a redundancy check that survives failures of the learned fusion. Train with sensor dropout so the fused model degrades gracefully if one modality is missing." },
+          { "q": "How would you detect objects your network has never seen before?", "a": "Predict class-agnostic occupancy and flow so anything solid is represented even without a label. Add a geometric check on lidar points above the estimated ground surface, and use an uncertainty or out-of-distribution score to flag unfamiliar regions for conservative planning. Feed flagged scenes back into the data engine for labeling so the long tail shrinks over time." },
+          { "q": "Perception latency spikes to 120 ms on some frames. What do you do?", "a": "Profile to find the cause: variable point count, NMS on crowded scenes, memory allocation, or contention with another model on the same accelerator. Make the work bounded with fixed-size tensors, capped detections and pre-allocated buffers, and run on a deterministic schedule. Downstream, have consumers check timestamps and extrapolate tracks so a late frame is handled safely rather than silently." }
+        ]
+      },
+      "related": [ "localization-fusion", "av-data-engine", "tensor-cores", "quantization", "vector-search" ]
+    },
+    {
+      "id": "localization-fusion",
+      "title": "Localization & Sensor Fusion",
+      "gist": "Localization answers 'exactly where am I?' to within a hand's width, by blending GPS, motion sensors and matching what the car sees against a detailed map.",
+      "overview": [
+        "Your phone's GPS is happy if it knows you are somewhere on the right block. A self-driving car needs to know which lane it is in and where its bumper is to within about 10 centimeters, every fraction of a second, even in tunnels and between skyscrapers where GPS is useless.",
+        "It solves this like a sailor using several clues at once. *Dead reckoning* from wheel speed and an inertial sensor (IMU) says 'I've moved 3 meters forward and turned slightly', which is smooth but slowly drifts. *GPS* gives an absolute fix that does not drift but jumps around. And *map matching* compares what the lidar and cameras see, such as curbs, poles and building edges, against a pre-built high-definition map, like recognizing landmarks on a street you know well.",
+        "A mathematical blender called a **filter** (usually a Kalman filter) combines these, trusting each source according to how reliable it is right now. The result is a pose: position, heading and tilt, updated hundreds of times a second, that every other part of the car relies on."
+      ],
+      "diagram": {
+        "caption": "Fusing relative and absolute clues into one precise pose.",
+        "steps": [
+          { "label": "IMU + wheels", "detail": "Smooth motion, drifts over time" },
+          { "label": "GNSS / RTK", "detail": "Absolute fix, cm to meters" },
+          { "label": "Map matching", "detail": "Lidar/camera vs HD map" },
+          { "label": "Fusion filter", "detail": "Error-state Kalman filter" },
+          { "label": "Vehicle pose", "detail": "~10 cm, 100+ Hz output" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "IMU", "role": "Accelerometers and gyroscopes sampled at 100-1000 Hz; integrated to propagate the pose between slower updates. Automotive MEMS units drift roughly tenths of a degree per hour." },
+          { "name": "GNSS receiver with RTK/PPP", "role": "Multi-band GPS, Galileo, BeiDou and GLONASS; with real-time kinematic or precise point positioning corrections reaches ~2-10 cm in open sky, but degrades badly in urban canyons." },
+          { "name": "HD map", "role": "A prior map with ~5-10 cm accuracy containing lanes, curbs, signs, poles and a lidar intensity or geometry layer used for matching." },
+          { "name": "Scan matcher", "role": "Aligns the live lidar sweep (and sometimes camera features) to the map with algorithms like NDT or ICP, producing an absolute pose measurement and its covariance." },
+          { "name": "State estimator", "role": "An error-state extended Kalman filter or factor-graph smoother that fuses all inputs, estimating pose, velocity and IMU biases with uncertainty." }
+        ],
+        "flow": [
+          "Between measurements, the filter integrates IMU accelerations and rotation rates to predict the new pose, and its uncertainty grows.",
+          "Wheel odometry and steering angle provide velocity constraints that slow drift, after correcting for tire slip.",
+          "When a GNSS fix arrives (~10 Hz), the filter checks it against the prediction and blends it in if consistent, rejecting outliers such as multipath reflections off buildings.",
+          "Each lidar sweep (~10 Hz) is matched against the map near the predicted pose; the resulting pose and covariance correct the filter, shrinking uncertainty.",
+          "The filter publishes a smooth pose at 100+ Hz for control, and a map-relative pose for planning, along with uncertainty so consumers know how much to trust it.",
+          "Integrity monitors compare independent estimates (map-matching versus GNSS versus odometry) and raise an alert if they disagree beyond thresholds."
+        ],
+        "tradeoffs": [
+          { "choice": "HD prior maps", "pro": "Centimeter localization and rich priors such as lane graphs and signal positions", "con": "Expensive to build and keep fresh; city-by-city scaling" },
+          { "choice": "Mapless / online mapping", "pro": "Scales anywhere roads exist, no map maintenance", "con": "Lower precision and fewer priors; perception must infer lanes and rules live" },
+          { "choice": "Kalman filter", "pro": "Cheap, constant-time, well understood for real-time use", "con": "Linearization errors and difficulty revisiting past estimates" },
+          { "choice": "Factor graph smoother", "pro": "More accurate by optimizing over a window of history", "con": "More compute and variable latency" }
+        ],
+        "numbers": [
+          { "metric": "Required lateral localization accuracy", "value": "~10 cm" },
+          { "metric": "RTK GNSS accuracy (open sky)", "value": "~2-5 cm" },
+          { "metric": "Plain GNSS accuracy (urban canyon)", "value": "~5-30 m errors possible" },
+          { "metric": "IMU sample rate", "value": "~100-1000 Hz" },
+          { "metric": "Lidar scan-match update rate", "value": "~10-20 Hz" },
+          { "metric": "Time-sync accuracy across sensors (PTP / gPTP)", "value": "~1 microsecond" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Time synchronization is part of localization. At 30 m/s a 10 ms timestamp error is a 30 cm position error, larger than the whole accuracy budget. Vehicles distribute time with IEEE 802.1AS gPTP over automotive Ethernet, disciplined by GNSS pulse-per-second, and trigger cameras so their exposure aligns with the lidar's rotation over that sector. Sensor extrinsics must also be estimated and monitored online, because a lidar mount that shifts 0.2 degrees shows up as a consistent localization bias.",
+          "Covariance honesty matters more than accuracy. A filter that is confidently wrong is worse than one that admits uncertainty, because planners and safety monitors use the covariance to decide how close to drive to curbs and whether to trust lane assignment. Production systems tune for consistency (normalized estimation error squared near its expected value), use chi-square gating to reject outlier measurements, and maintain protection levels in the aviation sense: a bound the error will not exceed with probability like 1 - 10^-7 per hour.",
+          "Maps are a distributed data system. A city map is tens to hundreds of gigabytes, tiled and versioned, and must be updated when roads change. Fleets detect map-reality mismatches (a new lane paint, a closed street) from onboard perception, upload change reports, and push validated tile updates. Localization must tolerate stale maps by weighting stable features such as poles and building facades over volatile ones such as parked cars and vegetation."
+        ],
+        "failureModes": [
+          { "name": "GNSS multipath in urban canyons", "description": "Signals bouncing off glass towers produce confident but meters-off fixes that pull the filter sideways. Fix: multi-constellation receivers, chi-square gating, and trusting map matching over GNSS downtown." },
+          { "name": "Map staleness", "description": "Construction or repainting changes the world so scan matching locks onto the wrong features or fails. Fix: weight stable features, detect map-change events, degrade gracefully to perception-based lane keeping, and refresh tiles quickly." },
+          { "name": "Degenerate geometry", "description": "Long featureless tunnels, highways next to open fields or snow-covered roads give scan matching nothing to grip along the direction of travel, so longitudinal error grows. Fix: rely on IMU and wheel odometry along-track, use radar or lidar intensity features, and inflate covariance honestly." }
+        ],
+        "realSystems": [
+          { "name": "Waymo", "note": "Builds and maintains its own HD maps of each service area with mapping vehicles, and uses them as a strong localization and behavioral prior." },
+          { "name": "Mobileye REM", "note": "Crowdsources lightweight road-geometry maps from cameras on millions of consumer cars, sending ~10 KB/km, which scales mapping without lidar fleets." },
+          { "name": "Tesla FSD", "note": "Avoids HD maps, relying on standard navigation maps plus online perception of lanes and road structure from cameras." }
+        ],
+        "questions": [
+          { "q": "How would you keep a robotaxi localized in a 2 km tunnel with no GNSS?", "a": "Propagate with the IMU and wheel odometry, which drift slowly over a minute or two if biases are well estimated before entry. Use lidar scan matching against the mapped tunnel walls for lateral and heading corrections, and features like lights, signs or radar reflectors for along-track corrections. Inflate covariance honestly so the planner keeps margins, and use lane-line perception to hold lateral position even if absolute position drifts." },
+          { "q": "Would you build your AV around HD maps or go mapless?", "a": "For a driverless robotaxi in a defined service area, HD maps reduce risk because they give centimeter localization and rich priors, and the mapping cost is amortized over a dense fleet. For a consumer system that must work everywhere, go mapless or use light crowdsourced maps and invest in strong online mapping in perception. Many teams converge on a hybrid: online mapping primary, with maps as a prior that can be overridden when reality disagrees." },
+          { "q": "Your localizer occasionally jumps 40 cm laterally for one frame. How do you debug and contain it?", "a": "Log all inputs with timestamps and replay offline to see which measurement caused it: a bad scan match, a GNSS outlier or a timestamp glitch. Add or tighten innovation gating so single inconsistent measurements are rejected, and check the scan matcher's convergence score. Downstream, rate-limit pose corrections fed to the controller so a jump becomes a smooth correction rather than a steering jerk." }
+        ]
+      },
+      "related": [ "perception", "av-stack", "av-safety", "replication", "stream-processing" ]
+    },
+    {
+      "id": "prediction-planning",
+      "title": "Prediction & Planning",
+      "gist": "Prediction guesses what everyone nearby will do in the next few seconds; planning picks the car's own path that stays safe and smooth against all those guesses.",
+      "overview": [
+        "Driving is a social game. When you see a car with its blinker on, a pedestrian looking at their phone near a crosswalk, or a cyclist glancing over their shoulder, you instantly imagine a few possible futures: they might merge, they might step out, they might swerve. Good drivers keep several possibilities in mind at once and pick an action that works out well in all of them.",
+        "**Prediction** is the car's version of that intuition. For every nearby road user it produces a handful of likely future paths for the next ~5-8 seconds, each with a probability, like 'this car goes straight (70%) or turns right (30%)'. It uses the map (lanes and crosswalks), recent motion and learned patterns of how people actually behave.",
+        "**Planning** then decides what the car itself should do. It sketches many candidate paths, from 'brake gently and wait' to 'nudge around the double-parked truck', scores each on safety, following the rules, making progress and comfort, and picks the best. It throws away its plan and makes a fresh one about 10-20 times a second, so it can react as the world changes, just like a driver constantly adjusting."
+      ],
+      "diagram": {
+        "caption": "From observed agents to a chosen, smooth trajectory.",
+        "steps": [
+          { "label": "Scene context", "detail": "Tracks, map, signals, ego state" },
+          { "label": "Multi-modal prediction", "detail": "K futures per agent with probabilities" },
+          { "label": "Candidate generation", "detail": "Sampled or learned ego trajectories" },
+          { "label": "Cost and constraints", "detail": "Collision, rules, progress, comfort" },
+          { "label": "Optimize and select", "detail": "Refine best, check feasibility" },
+          { "label": "Trajectory out", "detail": "~8 s path to controller" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Scene encoder", "role": "Encodes agents' histories and the map as vectors or tokens (VectorNet-style polylines) and lets them attend to each other with a transformer to capture interactions." },
+          { "name": "Trajectory decoder", "role": "Outputs K (often 6) future trajectories per agent with probabilities and uncertainty, as in MultiPath++ or Wayformer, or autoregressively as motion tokens in MotionLM." },
+          { "name": "Behavior or route layer", "role": "Decides high-level intent: follow the route, change lanes, yield, nudge, or pull over, often combining learned scoring with explicit traffic rules." },
+          { "name": "Trajectory generator", "role": "Produces candidate ego paths via lattices, sampling in Frenet coordinates along the lane, or a learned planner that proposes trajectories directly." },
+          { "name": "Optimizer and safety checker", "role": "Refines the best candidate with MPC or iLQR under vehicle dynamics limits, and verifies collision-free motion against predictions and raw occupancy." }
+        ],
+        "flow": [
+          "Prediction receives tracked agents with ~1-2 s of history, the local map and traffic-light states.",
+          "The scene encoder builds a joint representation; the decoder emits multiple futures per agent, ideally consistent with each other (two cars do not both take the same gap).",
+          "The planner generates hundreds to thousands of candidate ego trajectories over a ~5-8 s horizon.",
+          "Each candidate is scored: hard constraints (no collision, stay in drivable area, obey signals) prune it, and soft costs (time-to-collision, jerk, lateral acceleration, progress, courtesy) rank survivors.",
+          "The planner considers how others will react to the ego car (for example, a merge that causes a gap to open), either by conditioning predictions on the ego plan or by game-theoretic or tree search.",
+          "The best trajectory is smoothed with an optimizer respecting steering rate and acceleration limits, and published with a timestamp.",
+          "The cycle repeats at ~10-20 Hz; consecutive plans are stitched so the car does not twitch when the choice changes slightly."
+        ],
+        "tradeoffs": [
+          { "choice": "Hand-tuned cost functions", "pro": "Interpretable and easy to enforce rules and comfort limits", "con": "Hundreds of weights to tune; brittle in novel interactions" },
+          { "choice": "Learned (imitation) planner", "pro": "Captures natural, human-like driving and subtle social cues", "con": "Copies human mistakes, struggles off-distribution, needs a safety wrapper" },
+          { "choice": "Marginal predictions per agent", "pro": "Simple and fast", "con": "Can produce inconsistent futures and ignores reactions to ego" },
+          { "choice": "Joint or ego-conditioned prediction", "pro": "Models interaction such as yielding and negotiation", "con": "Combinatorially expensive; harder to evaluate" }
+        ],
+        "numbers": [
+          { "metric": "Prediction horizon", "value": "~5-8 s" },
+          { "metric": "Modes predicted per agent", "value": "~6 (Waymo Open Motion benchmark standard)" },
+          { "metric": "Planning cycle rate", "value": "~10-20 Hz" },
+          { "metric": "Comfortable longitudinal deceleration", "value": "~2-3 m/s^2 (emergency ~7-9 m/s^2)" },
+          { "metric": "Comfortable lateral acceleration", "value": "~2 m/s^2" },
+          { "metric": "Typical minADE@6 on Waymo Open Motion (8 s)", "value": "~0.5-0.6 m" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Prediction metrics can be deceptive. minADE and minFDE reward having at least one mode close to the truth, so a model can score well by spraying diverse guesses while assigning probabilities badly. What planning really needs is calibrated probabilities and good coverage of dangerous low-probability modes, which is why benchmarks added mAP and soft-mAP, and why production teams evaluate prediction by its effect on planning outcomes in closed-loop simulation rather than in isolation.",
+          "The interaction problem is the heart of urban planning. If the car assumes others ignore it, it freezes at busy merges (the 'frozen robot' problem); if it assumes they will always yield, it is dangerously assertive. Approaches include ego-conditioned prediction (predict others given each candidate ego plan), contingency planning (one trajectory that shares a common prefix and branches for different futures, so the car commits only to what is safe in all of them), and Monte Carlo tree search over joint actions. Waymo's MotionLM framed joint multi-agent motion as language modeling over discrete motion tokens.",
+          "Learned planners need closed-loop evaluation. A planner trained by imitation on logs performs well open-loop (matching human moves on recorded data) but suffers covariate shift: small deviations take it into states never seen in training, and errors compound. nuPlan's 2023 results famously showed a simple rule-based planner (PDM-Closed) beating many learned ones in closed loop. Modern stacks therefore train with closed-loop simulation, reinforcement learning fine-tuning and reactive simulated agents, and keep rule-based checks as a backstop."
+        ],
+        "failureModes": [
+          { "name": "Frozen robot at merges", "description": "Over-conservative prediction makes every gap look unsafe, so the car waits forever at unprotected left turns or zipper merges, blocking traffic. Fix: interaction-aware or ego-conditioned prediction, contingency planning and calibrated assertiveness tuned from fleet data." },
+          { "name": "Mode collapse in prediction", "description": "The model predicts only the most common behavior and misses rare but dangerous ones such as a sudden U-turn or a pedestrian darting out. Fix: diversity-promoting losses, rare-event oversampling and an independent worst-case reachability check." },
+          { "name": "Plan oscillation", "description": "The planner flips between two similar-cost options each cycle, such as nudging left or right of an obstacle, producing wobbly motion. Fix: hysteresis and consistency costs relative to the previous plan, and trajectory stitching." }
+        ],
+        "realSystems": [
+          { "name": "Waymo MotionLM and Wayformer", "note": "Published transformer-based motion forecasting architectures; MotionLM treats multi-agent futures as sequences of discrete motion tokens." },
+          { "name": "nuPlan (Motional)", "note": "Large-scale closed-loop planning benchmark that exposed the gap between open-loop imitation scores and real closed-loop driving." },
+          { "name": "Tesla FSD v12+", "note": "Replaced roughly 300,000 lines of hand-written C++ planning code with neural networks trained on fleet video, outputting driving directly." }
+        ],
+        "questions": [
+          { "q": "How would you design planning for an unprotected left turn across busy traffic?", "a": "Predict oncoming vehicles with multi-modal, calibrated futures and conditional responses to the ego car creeping forward. Use contingency planning: creep into a position that is safe whether or not a gap opens, then commit to the turn only when a gap is safe in all likely futures with a time-to-collision margin. Add explicit right-of-way rules and a timeout strategy (re-route) to avoid freezing indefinitely." },
+          { "q": "Your learned planner scores great on logged data but drives poorly in simulation. Why, and what do you do?", "a": "That is covariate shift: open-loop imitation never sees the consequences of its own small errors, so in closed loop it drifts into unseen states and compounds mistakes. Train and evaluate closed-loop with reactive simulated agents, add data augmentation that perturbs the ego state and teaches recovery, and consider RL fine-tuning against a safety-weighted reward. Keep a rule-based safety checker that vetoes infeasible or colliding outputs." },
+          { "q": "How do you evaluate a prediction model before deploying it?", "a": "Report standard metrics (minADE, minFDE, miss rate, mAP) sliced by agent type and scenario, plus probability calibration. More importantly, run the full stack in closed-loop simulation over a large regression suite and compare safety and comfort outcomes against the current model. Check specific high-risk slices like jaywalkers and cut-ins, then shadow-deploy on the fleet to compare its predictions with what actually happened." }
+        ]
+      },
+      "related": [ "av-stack", "perception", "av-safety", "speculative-decoding", "training-loop" ]
+    },
+    {
+      "id": "av-safety",
+      "title": "Safety, Redundancy & Real-Time Compute",
+      "gist": "A self-driving car must keep working safely when parts fail, so it duplicates critical hardware, checks itself constantly, and always has a plan to stop safely.",
+      "overview": [
+        "Airplanes do not have one engine, one hydraulic system and one computer; they have backups, and the backups are designed so a single failure cannot take everything down. A car with nobody in the driver's seat needs the same thinking, because there is no human to grab the wheel when something breaks.",
+        "So driverless cars carry **redundancy**: two or more computers, duplicate power supplies, backup steering and braking, and overlapping sensors so losing one camera does not leave a blind spot. A separate, simpler watchdog computer double-checks the main brain and can take over to perform a **minimal-risk maneuver**, such as pulling over or stopping in lane with hazard lights on.",
+        "The computers also have to be on time, not just correct. An answer that arrives half a second late is a wrong answer at 60 mph. That is why the software runs on **real-time** operating systems and schedulers that guarantee critical tasks finish within strict deadlines, a bit like a train timetable rather than a city bus that shows up whenever."
+      ],
+      "diagram": {
+        "caption": "Layered defenses from main compute to safe stop.",
+        "steps": [
+          { "label": "Primary compute", "detail": "Full stack on GPU SoCs" },
+          { "label": "Safety monitor", "detail": "Independent checks on plan, health" },
+          { "label": "Fallback compute", "detail": "Simple stack, separate power" },
+          { "label": "Redundant actuators", "detail": "Dual steering, brakes, power" },
+          { "label": "Minimal-risk maneuver", "detail": "Pull over or stop safely" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Primary AV computer", "role": "High-performance SoCs such as NVIDIA DRIVE Thor, Orin, or custom chips (Tesla AI4, Mobileye EyeQ6) running the full perception-to-planning stack." },
+          { "name": "Safety island / monitor", "role": "Lockstep CPU cores certified to ASIL-D (for example Arm Cortex-R52 or Infineon AURIX) that check heartbeats, plausibility of plans and hardware health, and own the decision to fall back." },
+          { "name": "Fallback system", "role": "A secondary, simpler compute path with its own sensors and power that can execute a minimal-risk maneuver if the primary fails." },
+          { "name": "Redundant drive-by-wire", "role": "Dual-wound steering motors, two brake systems (for example an electronic booster plus ESC), and duplicated low-voltage power networks so no single fault removes control." },
+          { "name": "Real-time OS and middleware", "role": "QNX, safety-certified Linux variants or AUTOSAR Adaptive with deterministic scheduling, memory isolation and time-triggered communication between nodes." }
+        ],
+        "flow": [
+          "At design time, a hazard analysis (HARA under ISO 26262) assigns each function an ASIL level from A to D based on severity, exposure and controllability.",
+          "Critical functions are decomposed across redundant, independent channels so that a single hardware fault or software bug cannot disable them.",
+          "At runtime, every node publishes heartbeats and health; the safety monitor checks deadlines, sensor coverage, temperatures and plan plausibility, such as whether the trajectory is collision-free and within dynamic limits.",
+          "If a fault is detected, the system classifies it: degrade (lower speed, reduce ODD), recover (restart a process within milliseconds), or fall back.",
+          "On fallback, the backup path takes control and executes a minimal-risk maneuver using a precomputed safe-stop trajectory that is refreshed every cycle.",
+          "Events are logged and uploaded; fleet operations may dispatch a recovery team, and engineering triages the fault in the data engine."
+        ],
+        "tradeoffs": [
+          { "choice": "Full duplicate stacks", "pro": "Maximum independence and fault tolerance", "con": "Doubles cost, power and weight, and common-mode bugs can still hit both" },
+          { "choice": "Simple fallback stack", "pro": "Small enough to verify thoroughly, diverse from the primary", "con": "Can only perform limited maneuvers such as stopping in lane" },
+          { "choice": "General-purpose Linux plus GPU", "pro": "Rich ecosystem, fast development of ML-heavy software", "con": "Hard to prove worst-case timing and certify" },
+          { "choice": "Certified RTOS and lockstep MCUs", "pro": "Provable timing and ASIL-D fault detection", "con": "Limited compute and slower development" }
+        ],
+        "numbers": [
+          { "metric": "ASIL-D random hardware failure target", "value": "< 10 FIT (~1 failure per 10^8 hours)" },
+          { "metric": "NVIDIA DRIVE Orin compute", "value": "~254 INT8 TOPS" },
+          { "metric": "Typical AV compute power draw", "value": "~200-1,000 W" },
+          { "metric": "Human US fatal crash rate", "value": "~1.3 per 100 million vehicle miles" },
+          { "metric": "Waymo rider-only miles (through 2025)", "value": "~100+ million" },
+          { "metric": "Safety monitor reaction time", "value": "~10-100 ms" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Three standards frame AV safety and they cover different things. ISO 26262 handles functional safety: failures of hardware and software that does not behave as specified. ISO 21448 (SOTIF) covers hazards from systems working as designed but insufficiently, such as a perception network that simply misses a pedestrian in rare lighting. UL 4600 is a goal-based standard for the overall safety case of a fully autonomous product. Machine-learned components fit poorly into ISO 26262's V-model, so in practice their safety argument rests on SOTIF-style statistical evidence, massive scenario coverage and runtime monitors with simpler, verifiable logic.",
+          "Proving safety statistically is brutally expensive. RAND's 2016 analysis showed that demonstrating a fatality rate better than humans with confidence needs hundreds of millions to billions of miles. Companies therefore combine real-world miles with simulation, scenario-based testing and comparisons on more frequent events like injury crashes. Waymo has published peer-reviewed analyses with Swiss Re showing roughly 80-90% fewer injury-causing and property-damage claims than human benchmarks over tens of millions of rider-only miles.",
+          "Real-time guarantees on GPU-heavy stacks are hard. GPUs are throughput machines with opaque scheduling, shared caches and memory bandwidth, so one model's spike can delay another. Teams use static partitioning (NVIDIA MIG-like isolation or dedicated DLA accelerators for safety-relevant nets), fixed-shape models with bounded execution time, CUDA graphs to remove launch jitter, and measured worst-case execution time with margin. Common-mode failures are the deepest risk: if primary and fallback share a sensor, a clock or a software library, a single bug can defeat redundancy, so diversity of design is as important as duplication."
+        ],
+        "failureModes": [
+          { "name": "Common-mode failure", "description": "A shared component (power rail, time source, library, or map) fails and takes down both primary and backup. Fix: diverse designs, separate power and clocks, independent sensors for fallback, and analysis like FMEA and dependent failure analysis." },
+          { "name": "Deadline overrun cascades", "description": "One node runs late, its consumers use stale data or skip cycles, and the whole stack degrades. Fix: WCET budgets, deadline monitoring, priority-based scheduling and well-defined behavior on missed deadlines." },
+          { "name": "Unsafe fallback behavior", "description": "Stopping in lane is safe on a quiet street but dangerous on a highway or a rail crossing. Fix: context-aware minimal-risk maneuvers precomputed each cycle and validated, such as continuing past the crossing before stopping." }
+        ],
+        "realSystems": [
+          { "name": "NVIDIA DRIVE Thor and DriveOS", "note": "Blackwell-based automotive SoC with a built-in safety island, shipping in 2025-26 vehicles; DriveOS is ASIL-D certified middleware." },
+          { "name": "Waymo 6th-gen hardware", "note": "Redundant compute, power and actuation on Zeekr and Hyundai Ioniq 5 platforms, designed for fully rider-only operation." },
+          { "name": "Mercedes DRIVE PILOT", "note": "First internationally certified SAE Level 3 system (Germany 2022, Nevada and California 2023), with redundant steering, braking and power, up to ~95 km/h in Germany." }
+        ],
+        "questions": [
+          { "q": "Design the redundancy architecture for a driverless robotaxi. What must never be a single point of failure?", "a": "Compute, power, steering, braking, time synchronization and enough sensing to perform a safe stop must all be redundant and independent. Use a primary high-performance computer plus an independent fallback with its own power and a subset of sensors covering the forward and side zones. An ASIL-D safety monitor arbitrates, and actuators accept commands from either channel. Validate with FMEA and fault injection to confirm no single fault leaves the car uncontrollable." },
+          { "q": "How do you make a GPU-based perception model meet hard real-time deadlines?", "a": "Bound its work: fixed input shapes, capped detections, static memory, and precompiled TensorRT engines run via CUDA graphs. Isolate it from other workloads with dedicated accelerator partitions or priority streams, and measure worst-case execution time under adversarial load with margin. Monitor deadlines at runtime and define what downstream nodes do if a frame is late, such as using extrapolated tracks." },
+          { "q": "How would you argue that your AV is safer than a human driver?", "a": "Combine evidence: real-world rider-only miles compared against matched human benchmarks for crash types with enough frequency to be statistically meaningful, such as injury crashes. Add scenario-based testing and simulation covering rare but critical events, with coverage metrics for the ODD. Wrap it in a structured safety case (UL 4600 style) showing hazards, mitigations and runtime monitors, and keep monitoring after deployment." }
+        ]
+      },
+      "related": [ "av-stack", "localization-fusion", "cpu-scheduling", "replication", "threat-modeling" ]
+    },
+    {
+      "id": "av-data-engine",
+      "title": "The Data Engine & Simulation",
+      "gist": "Self-driving improves by collecting tricky moments from the fleet, labeling them, retraining models, and proving each new version in simulation before it reaches real roads.",
+      "overview": [
+        "No team can write rules for every strange thing that happens on a road. Instead they build a **data engine**: a loop where the cars themselves find the moments they struggled with, those moments are sent back to headquarters, turned into training examples, and used to teach the next version of the software. It is like a student who keeps a notebook of every question they got wrong and studies exactly those.",
+        "The second half is **simulation**, a video game version of the world where new software can drive millions of miles overnight. Engineers replay real recorded drives, change them ('what if that car had braked harder?'), or generate entirely new scenarios, and check that the new version behaves at least as well as the old one before it is allowed onto real streets.",
+        "Together these make self-driving more like a software and data company than a car company. The hard parts are finding the rare, interesting moments in an ocean of boring driving, labeling them accurately, and making simulations realistic enough that passing in sim means passing in the real world."
+      ],
+      "diagram": {
+        "caption": "The continuous improvement loop from fleet to fleet.",
+        "steps": [
+          { "label": "Fleet triggers", "detail": "Disengagements, disagreements, rare events" },
+          { "label": "Upload and index", "detail": "Petabytes, searchable by scenario" },
+          { "label": "Auto + human labels", "detail": "Offline models, then QA" },
+          { "label": "Train models", "detail": "Thousands of GPUs, days" },
+          { "label": "Simulate and evaluate", "detail": "Millions of scenarios, regression gates" },
+          { "label": "Staged rollout", "detail": "Shadow, then canary, then fleet" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Onboard triggers", "role": "Small classifiers and rules that flag interesting moments: driver takeovers, hard braking, model disagreement, low confidence or a requested scenario type, and save surrounding sensor data." },
+          { "name": "Data lake and scenario search", "role": "Petabyte-to-exabyte storage of drive logs indexed by metadata and embeddings so engineers can query, for example, 'cyclists at night in rain' or 'similar to this clip'." },
+          { "name": "Auto-labeling pipeline", "role": "Large offline models that see the whole clip, past and future, produce high-quality 3D labels far more cheaply than humans, with humans auditing and correcting." },
+          { "name": "Training infrastructure", "role": "GPU or TPU clusters (Tesla's Cortex with tens of thousands of H100-class GPUs, Waymo on Google TPUs) training perception and driving models on millions of clips." },
+          { "name": "Simulator", "role": "Log replay, reactive agent simulation and sensor simulation using neural rendering or game engines, run at massive scale to evaluate every release candidate." }
+        ],
+        "flow": [
+          "Cars on the road run triggers continuously; when one fires, ~10-60 s of sensor data around the event is saved and uploaded over Wi-Fi or cellular.",
+          "Logs land in the data lake, are decoded, indexed and embedded so they are searchable by scenario, location and model behavior.",
+          "Engineers or automated miners pull a targeted dataset, for example 50,000 clips of construction-zone lane shifts.",
+          "Offline auto-labelers produce 3D boxes, tracks, lanes and future trajectories, and humans review a sample for quality.",
+          "Models are retrained or fine-tuned on the new mix and evaluated on fixed benchmark sets, sliced by scenario.",
+          "The full stack is evaluated in closed-loop simulation on a regression suite of millions of scenarios; any regression on safety-critical metrics blocks release.",
+          "The candidate runs in shadow mode on the fleet (computing but not acting) and then in a gradual canary rollout while metrics are watched."
+        ],
+        "tradeoffs": [
+          { "choice": "Log replay simulation", "pro": "Perfectly realistic sensor data from real drives", "con": "Other agents do not react when the ego car behaves differently" },
+          { "choice": "Reactive agent simulation", "pro": "Agents respond to the ego car, enabling closed-loop testing", "con": "Simulated agents may behave unlike real humans" },
+          { "choice": "Neural / generative sensor simulation", "pro": "Can create new viewpoints, weather and rare events photorealistically", "con": "Artifacts and hallucinations can fool or mis-train models" },
+          { "choice": "Human labeling", "pro": "High quality on ambiguous cases", "con": "Costs ~dollars per frame and does not scale to billions" }
+        ],
+        "numbers": [
+          { "metric": "Waymo simulated miles", "value": "~20+ billion cumulative" },
+          { "metric": "Data per robotaxi per day (raw)", "value": "~1-20 TB, mostly discarded" },
+          { "metric": "Tesla Cortex training cluster (Austin)", "value": "~50k-100k H100-class GPUs" },
+          { "metric": "Waymo Open Dataset Perception", "value": "~2,000 scenes, 20 s each" },
+          { "metric": "Fleet upload bandwidth constraint", "value": "~GB per car per day over LTE" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The bottleneck is not storing data but finding the right data. A fleet collects overwhelmingly boring highway miles; the value is in rare events, and naive uniform sampling under-represents them by orders of magnitude. Mining relies on embedding search over clips (CLIP-like vision-language models), active learning that selects examples where model ensembles disagree, and scenario taxonomies so coverage can be measured. Tesla's 'shadow mode' and trigger campaigns made this famous: push a new trigger to the fleet and get thousands of matching examples within days.",
+          "Simulation realism is a stack of problems. Sensor realism (does the rendered lidar have the same noise, dropouts and reflections?) matters for perception testing; behavioral realism (do simulated drivers merge and hesitate like humans?) matters for planning testing. Neural reconstruction methods such as NeRFs and 3D Gaussian splatting turn real drive logs into editable 3D scenes so engineers can move the ego car or insert actors, and generative world models such as Wayve GAIA-2, NVIDIA Cosmos and Waymo's world-model work synthesize new driving video. The sim-to-real gap must itself be measured, by checking that sim outcomes predict real-world outcomes on paired scenarios.",
+          "Release engineering resembles a large distributed systems problem. A full regression run might be millions of scenarios each needing GPU inference and simulation, run on tens of thousands of cloud machines, which must be deterministic so a regression can be bisected to a commit. Evaluation must also avoid overfitting: if the same scenario suite is used to tune and to gate releases, it stops measuring generalization, so teams keep held-out suites and refresh them continuously with new fleet data."
+        ],
+        "failureModes": [
+          { "name": "Label noise and drift", "description": "Auto-labelers or vendors produce systematically wrong labels, such as boxes too small for trucks, which the model then learns. Fix: QA sampling with gold sets, label-model ensembles, and monitoring per-class label statistics over time." },
+          { "name": "Sim-to-real gap", "description": "The new software passes simulation but behaves differently on real roads because simulated agents or sensors are unrealistic. Fix: measure correlation between sim and real outcomes, use log-based neural reconstruction, and require shadow and canary stages." },
+          { "name": "Regression hidden by averages", "description": "Aggregate metrics improve while a rare but important slice, like school-bus interactions, gets worse. Fix: slice-based gates on safety-critical scenario categories and explicit per-slice regression thresholds." }
+        ],
+        "realSystems": [
+          { "name": "Waymo SimulationCity and Waymax", "note": "Large-scale simulation that synthesizes full trips; Waymax is an open-sourced JAX accelerator-based simulator for behavior research." },
+          { "name": "Tesla data engine", "note": "Fleet triggers and shadow mode across millions of cars feed auto-labeling and training of the end-to-end FSD network." },
+          { "name": "NVIDIA Omniverse and Cosmos", "note": "Physically based sensor simulation and generative world foundation models used by OEMs to create synthetic driving data." },
+          { "name": "Applied Intuition", "note": "Commercial simulation, validation and data tooling used by many automakers and trucking companies." }
+        ],
+        "questions": [
+          { "q": "Design a system to find 10,000 examples of 'pedestrian partially occluded by a parked car, at night' from a fleet's logs.", "a": "Index all uploaded clips with per-frame embeddings from a vision-language model plus structured metadata (time of day, weather, detected agent types, occlusion estimates from perception). Run a text or example-image query against a vector index, then filter with metadata and rank by model uncertainty. If there are not enough, push an onboard trigger to the fleet for that scenario. Send candidates for auto-labeling plus human verification before adding them to training." },
+          { "q": "How do you decide whether a new driving-model release can go to the fleet?", "a": "Gate on offline metrics per slice, then on closed-loop simulation over a large regression suite with no statistically significant regression on safety-critical metrics like collisions, near-misses and rule violations. Next, run in shadow mode to compare its decisions with the current model on live data, followed by a staged canary rollout with automatic rollback triggers. Keep held-out scenario suites to avoid overfitting the gate." },
+          { "q": "Your fleet produces 5 PB of raw data per day. What do you keep?", "a": "Keep very little raw data by default: triggered event windows at full fidelity, a small random sample for unbiased statistics, and compact summaries such as detections, poses and telemetry for everything else. Compress and tier storage, with hot recent data and cold archives in object storage with lifecycle policies. Make retention scenario-driven so rare events are kept indefinitely while routine miles expire." }
+        ]
+      },
+      "related": [ "training-data-pipeline", "object-storage", "vector-search", "batch-processing", "perception" ]
+    }
+  ]
+}

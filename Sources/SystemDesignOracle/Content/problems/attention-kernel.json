@@ -1,0 +1,184 @@
+{
+  "id": "attention-kernel",
+  "title": "A Fused Attention Kernel for Long Sequences",
+  "domain": "gpu",
+  "prompt": "Design a fused attention kernel for a modern datacenter GPU that reaches a high fraction of peak throughput for long sequences. Explain the memory traffic, tiling, and how you would verify and tune it.",
+
+  "gist": "Never materialize the N×N score matrix: tile Q, K, V into on-chip memory, use online softmax, overlap async loads, tensor-core matmuls and exponentials with warp specialization, then verify against a high-precision reference and autotune.",
+
+  "overview": [
+    "Attention compares every token with every other token, so for a 32k-token sequence the score matrix has a billion entries per head. The textbook implementation writes that matrix to GPU main memory (HBM), reads it back for the softmax, writes the probabilities, and reads them again. The GPU spends its time moving data instead of doing math, and long sequences may not even fit.",
+    "A fused kernel (the FlashAttention approach) does the whole computation in one pass. It loads a block of queries into the fast on-chip memory of one streaming multiprocessor, then streams blocks of keys and values past it. For each block it computes scores with the tensor cores, updates a running softmax (keeping a running maximum and sum so it can rescale earlier partial results), and accumulates the output. The big matrix only ever exists one small tile at a time.",
+    "Reaching a high fraction of peak on Hopper or Blackwell GPUs then becomes a pipelining problem: keep the tensor cores busy every cycle by loading the next tile while computing the current one, and hiding the slow exponential math behind matrix multiplies. Specialized warps take dedicated jobs (some only load data, others only compute), much like an assembly line.",
+    "Correctness is checked against a high-precision reference on many shapes, masks and edge cases, and performance is tuned by sweeping tile sizes and pipeline depths while profiling where cycles go."
+  ],
+
+  "diagram": {
+    "caption": "One thread block's life: stream K/V tiles past a resident Q tile.",
+    "steps": [
+      { "label": "Load Q tile", "detail": "128 × d into shared memory via TMA" },
+      { "label": "Stream K/V tiles", "detail": "double/triple-buffered async loads" },
+      { "label": "S = Q·Kᵀ", "detail": "tensor-core GEMM into registers" },
+      { "label": "Online softmax", "detail": "running max m, sum l; rescale O" },
+      { "label": "O += P·V", "detail": "second GEMM, FP32 accumulate" },
+      { "label": "Write O and logsumexp", "detail": "one HBM write per row" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "Compute softmax(Q·Kᵀ / √d + mask)·V for batch × heads × sequence N up to 128k+, head dims 64/128/256, in BF16/FP16 and FP8.",
+      "Support causal masks, sliding-window / local attention, variable-length (packed) sequences, and grouped-query / multi-query attention.",
+      "Provide a backward pass for training, saving only the output O and per-row logsumexp L.",
+      "Expose a stable API with a fallback path for unsupported shapes."
+    ],
+    "nonFunctional": [
+      "Throughput: ≥70% of dense tensor-core peak for long sequences on H100 (FlashAttention-3 reaches ~740 of 989 TFLOPS BF16 forward), with similar targets on Blackwell.",
+      "Memory: O(N·d) HBM footprint, never O(N²).",
+      "Accuracy: error versus an FP64 reference no worse than a standard FP16/BF16 non-fused attention; FP8 within agreed tolerance.",
+      "Robustness: no NaN/Inf on fully masked rows or large logits; deterministic mode available for training reproducibility."
+    ],
+    "estimates": [
+      { "metric": "Attention FLOPs (forward)", "value": "4 × N² × d per head: N=32k, d=128 → 4 × 1.07e9 × 128 ≈ 5.5e11 FLOPs per head (halve for causal)" },
+      { "metric": "Naive score matrix size", "value": "N² × 2 bytes = 32k² × 2 ≈ 2.1 GB per head per batch element" },
+      { "metric": "H100 ridge point", "value": "989 TFLOPS ÷ 3.35 TB/s ≈ 295 FLOPs/byte; naive attention sits near ~64 FLOPs/byte (memory-bound), fused is compute-bound" },
+      { "metric": "Shared memory budget", "value": "Q 128×128×2 B = 32 KB + K,V tiles 2 × 32 KB × 2 stages = 128 KB → 160 KB of 228 KB per SM" },
+      { "metric": "Exponential bottleneck", "value": "H100 MUFU ~3.9 TFLOPS exp vs 989 TFLOPS matmul: per score 512 matmul FLOPs (d=128) vs 1 exp → exp costs ~half the matmul time unless overlapped" }
+    ]
+  },
+
+  "stages": [
+    {
+      "name": "Roofline and memory traffic",
+      "summary": "Show why naive attention is memory-bound and set the target: HBM traffic of O(N·d), compute-bound on tensor cores.",
+      "points": [
+        "**Naive**: write S (N²), read S for softmax, write P (N²), read P for P·V; ~4 × N² × 2 bytes of traffic per head, far more than the 4 × N × d of Q, K, V and O.",
+        "**Arithmetic intensity**: per score element ~4d = 512 FLOPs vs ~8 bytes moved → ~64 FLOPs/byte, below the H100 ridge of ~295, so naive runs at a fraction of peak.",
+        "**Fused**: read Q, K, V and write O; each Q tile of Br rows re-reads all of K and V once, giving intensity ≈ Br FLOPs/byte from HBM's view (≈128), and L2 reuse across thread blocks working on the same head pushes effective intensity well above the ridge.",
+        "**Target metric**: report TFLOPS = 4·B·H·N²·d ÷ time (÷2 for causal) against the dense tensor-core peak for that dtype, not memory bandwidth.",
+        "**Second bottleneck**: once memory is solved, the special-function unit computing exp and the non-matmul FLOPs (max, scale, rescale) become the limit; the design must hide them."
+      ],
+      "deepDive": [
+        "The I/O complexity result from the FlashAttention paper is that with SRAM of size M, the fused algorithm does Θ(N²·d²/M) HBM accesses, which is optimal up to constants, versus Θ(N·d + N²) for the naive one. Practically, schedule thread blocks so all Q tiles of one (batch, head) run concurrently on different SMs: they read the same K/V tiles at about the same time, so K/V come from the 50 MB L2 rather than HBM, and HBM traffic approaches the ideal of reading Q, K, V once."
+      ]
+    },
+    {
+      "name": "Algorithm: online softmax",
+      "summary": "Compute softmax incrementally over K/V blocks with a running max and sum, so partial results can be rescaled exactly.",
+      "points": [
+        "For each query row keep **m** (running max), **ℓ** (running sum of exp) and **O** (unnormalized output) in registers.",
+        "For each K/V tile j: S = Q·Kⱼᵀ × scale; m_new = max(m, rowmax(S)); P = exp(S − m_new); ℓ = e^(m−m_new)·ℓ + rowsum(P); O = e^(m−m_new)·O + P·Vⱼ.",
+        "At the end O ← O / ℓ and store **L = m + log ℓ** (logsumexp) for the backward pass.",
+        "Fold the 1/√d scale and log2(e) into one multiply and use exp2, which maps directly to the hardware instruction.",
+        "Fully masked rows (m = −∞) need explicit handling to avoid exp(−∞ − (−∞)) = NaN."
+      ],
+      "deepDive": [
+        "Rescaling O every tile costs extra non-matmul FLOPs. FlashAttention-2 delays normalization to the end; FlashAttention-4 on Blackwell goes further and only rescales when the running max grows by more than a threshold (e.g. a factor of 2^8), which is still exact after the final division because the same stale max is used consistently. Numerically, keeping m, ℓ and O in FP32 while S and P go through BF16/FP16 or FP8 for the second GEMM is what makes the result match a reference within normal precision error."
+      ]
+    },
+    {
+      "name": "Tiling and the memory hierarchy",
+      "summary": "Size tiles so Q, K and V blocks fit in shared memory and the accumulators fit in registers, with enough pipeline stages to hide latency.",
+      "points": [
+        "**Grid**: one thread block (CTA) per (batch, head, Q tile of Br=128 rows); persistent kernels launch one CTA per SM and pull tiles from a scheduler.",
+        "**Tiles**: Br × Bc = 128 × 128 for d=128 (smaller Bc or Br for d=256); Q tile stays resident, K/V tiles stream with 2–3 stages of buffering.",
+        "**Registers**: S and O accumulators are 128 × 128 FP32 each; split across two consumer warpgroups (64 rows each) that is ~64 + 64 floats per thread, under the 255-register limit without spilling.",
+        "**Shared memory layout**: swizzled layouts matched to the tensor-core instruction descriptors to avoid bank conflicts; P is kept in registers (Hopper) or tensor memory (Blackwell) rather than round-tripping through shared memory.",
+        "**GQA/MQA**: pack the query heads that share one K/V head into the same CTA so each K/V tile is loaded once for several heads."
+      ],
+      "deepDive": [
+        "Tile size is a three-way balance: larger Br increases reuse of each K/V tile (higher intensity), larger Bc amortizes softmax bookkeeping, but both raise register and shared-memory pressure and reduce the number of tiles available to fill 132 SMs. For short sequences or decode (one query token), tiles leave SMs idle, so a split-K variant (FlashDecoding) partitions the K/V sequence across CTAs and combines partial (m, ℓ, O) results with a small reduction kernel."
+      ]
+    },
+    {
+      "name": "Pipelining on Hopper and Blackwell",
+      "summary": "Use asynchronous copies and asynchronous tensor-core instructions with warp specialization so loads, GEMMs and softmax overlap.",
+      "points": [
+        "**TMA** (Tensor Memory Accelerator) issues bulk asynchronous tile copies from HBM into shared memory with a single thread, freeing registers and warps; mbarriers signal completion.",
+        "**Warp specialization**: a producer warp only issues TMA loads; two or more consumer warpgroups run WGMMA (Hopper) or tcgen05.mma (Blackwell); setmaxnreg moves registers from producers to consumers.",
+        "**Ping-pong scheduling**: while warpgroup A does softmax for its tile, warpgroup B runs its GEMMs, then they swap, keeping tensor cores busy during exp.",
+        "**Intra-warpgroup overlap**: issue the next S = Q·Kᵀ GEMM asynchronously before doing softmax on the current S, then wait.",
+        "**Blackwell specifics**: accumulators live in 256 KB of tensor memory (TMEM) per SM, 2-CTA MMA instructions share operands across a pair of SMs, and part of exp can be emulated with polynomial FMAs to offload the saturated MUFU.",
+        "**FP8**: double tensor-core throughput; requires per-block scaling, in-register layout transposes for V, and incoherent processing (e.g. Hadamard rotation) to limit outlier error."
+      ],
+      "deepDive": [
+        "The reason all this is needed: Hopper tensor cores deliver ~989 TFLOPS dense BF16 but only ~3.9 TFLOPS of exponentials, so with d=128 the exp work is about half the GEMM time. If they ran serially, peak would cap near 65%. Overlapping them across warpgroups and within a warpgroup is how FlashAttention-3 moved from ~35% (FlashAttention-2 on H100) to ~75% of peak. On Blackwell the tensor cores roughly doubled again while exp throughput did not, which is why FA4 and cuDNN kernels add software exp and conditional rescaling."
+      ]
+    },
+    {
+      "name": "Masking, variants and backward pass",
+      "summary": "Make masks nearly free by skipping whole tiles, balance causal work, and implement a backward that recomputes rather than stores P.",
+      "points": [
+        "**Causal**: skip tiles entirely above the diagonal, apply the elementwise mask only on diagonal tiles; this halves FLOPs.",
+        "**Load balance**: causal Q tiles near the end have ~N/Bc K tiles, those at the start ~1; schedule the longest tiles first (or pair long and short) in the persistent scheduler to avoid a tail.",
+        "**Variable length**: take cumulative sequence-length offsets so packed batches without padding are supported; sliding window simply bounds the K-tile loop.",
+        "**Backward**: recompute S and P from Q, K and saved L; compute dV += Pᵀ·dO, dP = dO·Vᵀ, dS = P ⊙ (dP − D) with D = rowsum(dO ⊙ O), dK += dSᵀ·Q, dQ += dS·K; ~2.5× forward FLOPs.",
+        "**dQ accumulation**: parallelize over K/V tiles and accumulate dQ with FP32 atomics (fast, non-deterministic) or a separate pass (deterministic, slower); expose both.",
+        "**Extensions** via a template or DSL (FlexAttention-style score-mod and block-mask hooks) so ALiBi, soft-capping or document masks reuse the same kernel."
+      ],
+      "deepDive": [
+        "Block-sparse masks generalize causal skipping: precompute, for each (Q tile, K tile), whether it is fully masked, fully visible, or partial, and pass that table to the kernel. Fully masked tiles cost nothing, fully visible tiles skip mask math, and only partial tiles do elementwise work. This is how document masking for packed pretraining and sliding-window attention reach nearly the same per-FLOP efficiency as dense attention."
+      ]
+    },
+    {
+      "name": "Verification",
+      "summary": "Prove correctness against a high-precision reference across shapes, masks and adversarial values before tuning anything.",
+      "points": [
+        "**Reference**: plain PyTorch attention in FP64 (or FP32) on the same inputs; compare the fused BF16 output's max and mean error to the error of a plain BF16 attention against the same reference, and require it to be no worse.",
+        "**Shape sweep**: sequence lengths that are not tile multiples (1, 127, 129, 4,097), head dims 64/128/256, batch 1 and large, GQA ratios, varlen batches with empty sequences.",
+        "**Mask sweep**: causal, sliding window, document masks, fully masked rows, causal with N_q ≠ N_k (decode).",
+        "**Adversarial values**: large logits (scale × 100), all-equal scores, Inf/NaN propagation rules, denormals, and FP8 saturation.",
+        "**Backward**: check dQ, dK, dV against autograd of the reference; run a short training run and compare loss curves with the baseline.",
+        "**Tools**: compute-sanitizer for races and out-of-bounds accesses; repeated runs to confirm determinism in deterministic mode."
+      ],
+      "deepDive": [
+        "Bugs in fused kernels are often silent and shape-dependent: an off-by-one in the last partial tile, a race between the producer overwriting a buffer and a consumer still reading it, or a masked row producing NaN only when an entire tile is masked. Property-based fuzzing over random shapes and masks, run in CI on every change, catches these far better than a handful of hand-picked tests. End-to-end checks matter too: a kernel within tolerance per call can still bias training slightly, so compare a few-thousand-step loss curve against the reference implementation."
+      ]
+    },
+    {
+      "name": "Tuning and benchmarking",
+      "summary": "Autotune per architecture and shape class, and use the profiler to explain every lost percent.",
+      "points": [
+        "**Autotune** Br, Bc, pipeline stages, number of consumer warpgroups and register split per (arch, dtype, d, causal) and cache the best config; compile specialized variants rather than branching at runtime.",
+        "**Profile with Nsight Compute**: tensor pipe utilization, issue stalls (waiting on barriers vs MUFU), shared-memory bank conflicts, register spills and achieved occupancy.",
+        "**Benchmark properly**: warm up, lock clocks or report under real power limits, flush L2 between runs where relevant, and sweep N from 512 to 128k so short-sequence regressions are visible.",
+        "**Compare** against cuDNN fused attention, FlashAttention-2/3/4 and vendor libraries on identical shapes.",
+        "**Track in CI**: a performance regression suite on the target GPUs, failing a change that loses more than ~2% on key shapes."
+      ],
+      "deepDive": [
+        "Expected results give a sanity check: FlashAttention-2 reaches ~70% of A100 peak but only ~35% on H100 because it does not use WGMMA or TMA; FlashAttention-3 reaches ~740 TFLOPS BF16 (~75%) and ~1.2 PFLOPS FP8 on H100 for long sequences with d=128; Blackwell kernels (cuDNN, FlashAttention-4) push well over 1 PFLOPS BF16 forward. If a design is far below these at N ≥ 8k, the profiler usually points at serialization of softmax and GEMM or at shared-memory bank conflicts."
+      ]
+    }
+  ],
+
+  "tradeoffs": [
+    { "choice": "Hand-written CUDA/CUTLASS vs a DSL (Triton, CuTe DSL, ThunderKittens)", "pro": "Hand-written CUTLASS/CuTe reaches the highest fraction of peak and uses every new hardware feature first.", "con": "Far more engineering time and harder to extend; Triton or FlexAttention gets 80–90% of the speed with much faster iteration." },
+    { "choice": "Larger tiles vs smaller tiles", "pro": "Larger tiles raise arithmetic intensity and amortize softmax bookkeeping.", "con": "More register and shared-memory pressure, spills, and fewer tiles to fill all SMs for short sequences." },
+    { "choice": "Atomic dQ accumulation vs deterministic reduction", "pro": "Atomics are faster and simpler to parallelize.", "con": "Non-deterministic results across runs, which complicates debugging and reproducibility." },
+    { "choice": "FP8 vs BF16", "pro": "~2× tensor-core throughput and half the memory traffic.", "con": "Larger numerical error, sensitivity to outliers, extra scaling logic; often limited to inference or the forward pass." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "NaNs on fully masked rows", "description": "When every score in a row is masked, the running max stays −∞ and exp(−∞ + ∞) yields NaN. Guard the max and define the output (zero) for empty rows." },
+      { "name": "Register spills", "description": "A slightly larger tile or head dim pushes accumulators past the register file, spilling to local memory and halving throughput. Check ptxas output and profiler spill counters." },
+      { "name": "Pipeline races", "description": "A producer overwrites a shared-memory stage before consumers finish with it; produces rare, data-dependent errors. Correct mbarrier phase tracking and compute-sanitizer runs catch it." },
+      { "name": "Tail effects and imbalance", "description": "Causal masking or uneven varlen batches leave SMs idle at the end of the grid; persistent scheduling with longest-first ordering fixes it." }
+    ],
+    "realSystems": [
+      { "name": "FlashAttention 1–4 (Dao et al.)", "note": "The IO-aware tiled algorithm; v2 improved parallelism, v3 added Hopper warp specialization and FP8, v4 targets Blackwell tensor memory and software exp." },
+      { "name": "NVIDIA cuDNN fused attention and CUTLASS/CuTe", "note": "Vendor-tuned kernels and the template library most hand-written kernels build on." },
+      { "name": "PyTorch FlexAttention and Triton", "note": "Compiler-generated fused attention from user-defined score and mask functions, trading a little speed for flexibility." },
+      { "name": "FlashInfer and FlashDecoding", "note": "Serving-oriented kernels with split-K over the KV sequence and paged KV caches for decode." }
+    ],
+    "questions": [
+      { "q": "Why does tiling help if the FLOP count is the same?", "a": "Attention's FLOPs are unchanged, but the naive version is memory-bound: it moves O(N²) bytes through HBM. Tiling keeps scores on-chip, so HBM traffic drops to roughly reading Q, K, V and writing O, and the kernel becomes limited by tensor-core throughput instead." },
+      { "q": "How does the backward pass avoid storing the N×N probability matrix?", "a": "It saves only the output and per-row logsumexp. During backward it recomputes S and P tile by tile from Q and K, which costs extra FLOPs but far less time than reading an N² matrix from HBM." },
+      { "q": "Your kernel hits 45% of peak on H100. Where do you look?", "a": "Profile issue stalls: if warps wait on MUFU or barriers, softmax and GEMMs are serialized, so add ping-pong warpgroups and intra-warpgroup overlap. Check that WGMMA and TMA are used, look for spills and bank conflicts, and confirm enough pipeline stages to hide load latency." },
+      { "q": "What changes for decode, where there is one query token?", "a": "The Q·Kᵀ GEMM degenerates to a matrix-vector product, so the kernel is memory-bound on reading the KV cache. Split the KV sequence across many CTAs (split-K), combine partial softmax results, pack GQA query heads together, and optimize for bandwidth (paged KV, quantized KV) rather than tensor-core FLOPs." },
+      { "q": "How do you test that an FP8 attention is accurate enough?", "a": "Compare against an FP64 reference across realistic activation distributions including outliers, report error relative to a BF16 baseline, and run end-to-end model evals (perplexity, task scores); kernel-level error alone can hide systematic bias." }
+    ]
+  },
+
+  "related": [ "kernel-optimization", "gpu-memory-hierarchy", "tensor-cores", "gpu-architecture", "kv-cache", "mixed-precision" ]
+}

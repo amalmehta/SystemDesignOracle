@@ -1,0 +1,170 @@
+{
+  "id": "single-node-kv-server",
+  "title": "A Million-Request-per-Second Key-Value Server on One Machine",
+  "domain": "os",
+  "prompt": "Design an in-memory key-value server that handles ~1 million requests per second on a single machine. Cover threading, I/O model, memory management, and tail latency.",
+
+  "gist": "Shared-nothing thread-per-core: each pinned core owns a shard of the keyspace, its own event loop (epoll or io_uring), hash table and allocator, so requests never take locks and tail latency stays bounded.",
+
+  "overview": [
+    "A million requests per second sounds like a lot, but a modern 32-core server has a budget of about 32 microseconds of CPU per request, which is plenty for a hash-table lookup that takes well under one microsecond. The real enemies are overheads around the lookup: system calls, locks shared between threads, memory allocation, and rare slow operations that make some requests wait far longer than average.",
+    "The design gives each CPU core its own slice of the data and its own network connections, and lets it run a tight loop: wait for network events, read requests, look up keys in its private hash table, write responses. Because no two cores touch the same data, there are no locks and caches stay hot. When a request needs a key owned by another core, it is passed through a small lock-free queue instead of shared memory.",
+    "Memory is managed with per-core allocators and size classes so that allocation is fast and fragmentation is visible and controllable. When memory fills, an approximate LRU or LFU policy evicts old keys, and expired keys are cleaned up a little at a time.",
+    "Tail latency (the slowest 1 in 1,000 requests) is designed for explicitly: no operation is allowed to run for long on an event loop, big deletions and rehashing happen incrementally, the OS is tuned so interrupts and other processes do not steal the cores, and latency is measured correctly under fixed load."
+  ],
+
+  "diagram": {
+    "caption": "Thread-per-core request path inside one machine.",
+    "steps": [
+      { "label": "NIC with RSS", "detail": "hashes flows to per-core RX queues" },
+      { "label": "Per-core event loop", "detail": "epoll / io_uring, pinned thread" },
+      { "label": "Parse and batch", "detail": "RESP/memcache protocol, pipelined" },
+      { "label": "Shard lookup", "detail": "own shard locally, else SPSC hop to owner" },
+      { "label": "Hash table + allocator", "detail": "per-core, incremental resize" },
+      { "label": "Batched response", "detail": "one writev/send per loop iteration" }
+    ]
+  },
+
+  "requirements": {
+    "functional": [
+      "GET, SET (with TTL), DELETE, INCR and multi-key MGET/MSET over TCP with a Redis- or memcached-compatible protocol, with pipelining.",
+      "Keys up to ~250 bytes, values up to ~1 MB (typical ~100–1,000 bytes).",
+      "Memory limit with eviction policy (LRU/LFU approximation) and TTL expiry.",
+      "Optional point-in-time snapshot or append-only log for warm restarts."
+    ],
+    "nonFunctional": [
+      "Throughput: sustain ≥1M requests/s (target 2M+ for headroom) at ~80/20 read/write.",
+      "Latency: server-side p50 < 50 µs, p99 < 300 µs, p99.9 < 1 ms at 1M req/s; end-to-end in-datacenter p99 under ~1 ms.",
+      "Memory efficiency: < ~60 bytes overhead per item; fragmentation ratio under ~1.3.",
+      "Predictability: no multi-millisecond pauses from GC, rehashing, snapshots or large deletes."
+    ],
+    "estimates": [
+      { "metric": "CPU budget", "value": "32 cores ÷ 1M req/s = 32 µs of core time per request; a hash lookup is ~0.1–0.5 µs" },
+      { "metric": "Kernel networking cost", "value": "~3–5 µs per small request/response via the kernel TCP stack → 1M req/s ≈ 3–5 cores just for networking (less with pipelining)" },
+      { "metric": "Network bandwidth", "value": "1M req/s × ~600 B average response + headers ≈ 0.6–0.8 GB/s ≈ 5–6 Gb/s; a 25/100 GbE NIC is ample" },
+      { "metric": "Memory", "value": "100M items × (32 B key + 500 B value + ~50 B overhead) ≈ 58 GB; fits in a 128–256 GB box" },
+      { "metric": "Packet rate", "value": "~1M requests + ~1M responses ≈ 2M packets/s unpipelined, spread across 16+ RX queues ≈ 125k pps per queue" }
+    ]
+  },
+
+  "stages": [
+    {
+      "name": "API and protocol",
+      "summary": "Use a simple, pipelinable binary-or-text protocol and push clients toward batching, which is the cheapest throughput win available.",
+      "points": [
+        "**Protocol**: Redis RESP or memcached meta protocol for client compatibility; length-prefixed values so the parser never scans payload bytes.",
+        "**Pipelining**: clients send many requests without waiting; the server processes everything in its receive buffer and replies with one send, amortizing syscalls ~10–50×.",
+        "**Persistent connections** with client-side connection pools; connection setup (TCP + optional TLS) is far more expensive than a request.",
+        "**Bounded operations only**: no unbounded commands (KEYS *, huge range scans) on the hot path; provide cursor-based SCAN and size limits.",
+        "**Key routing hint**: optionally expose which core owns which hash slot so smart clients can connect directly to the owner and avoid cross-core hops."
+      ],
+      "deepDive": [
+        "TLS matters in 2026 since many deployments require encryption in transit. Kernel TLS (kTLS) or NIC TLS offload keeps the crypto off the event loop's critical path; with AES-NI, software AES-GCM costs ~0.5–1 cycle per byte, small at 600-byte values, but the handshake on reconnect storms is the real hazard, so session resumption and connection pooling are essential."
+      ]
+    },
+    {
+      "name": "Threading model",
+      "summary": "Shared-nothing thread-per-core: one pinned thread per core owns a shard of the data and its connections, coordinating only through message queues.",
+      "points": [
+        "**Sharding**: hash(key) → one of N shards, one shard per core (e.g. 28 worker cores on a 32-core box, leaving cores for the OS, IRQs and background work).",
+        "**No locks on the hot path**: each shard's hash table, allocator and LRU are touched only by its own thread, so there is no contention and cache lines never bounce between cores.",
+        "**Cross-shard requests**: a connection lives on one core; if its key belongs to another shard, the request goes through a lock-free single-producer/single-consumer ring to the owner and the reply comes back the same way (~200–500 ns per hop).",
+        "**Multi-key ops**: MGET is split into per-shard sub-requests and gathered; atomic multi-key transactions need ordering across shards (e.g. Dragonfly's VLL-style scheduling) or are restricted to keys in the same hash slot.",
+        "**NUMA**: on dual-socket machines, keep each shard's memory, thread and NIC queue on the same socket; or run one process per socket."
+      ],
+      "deepDive": [
+        "The alternatives are a single-threaded server (Redis classic: simple and lock-free, but capped at ~100–200k ops/s per instance, so you run many instances), or a multi-threaded server with a shared, finely locked hash table (memcached: any thread serves any key, ~1M+ ops/s, but lock and cache-line contention grow with core count and hot keys hurt). Thread-per-core gets near-linear scaling but makes hot keys a single-core problem: one key at 500k req/s saturates its owner. Mitigations are client-side caching, read replicas of hot keys on several cores, or detecting hot keys and serving them from a small replicated read-mostly cache."
+      ]
+    },
+    {
+      "name": "I/O model",
+      "summary": "Non-blocking event loops, one per core, using epoll today or io_uring for fewer syscalls; reserve kernel bypass for when the kernel stack becomes the bottleneck.",
+      "points": [
+        "**RSS and SO_REUSEPORT**: the NIC hashes flows to per-core receive queues and each core has its own listening socket, so accepts and packets land on the core that owns the connection.",
+        "**epoll** (edge-triggered) per core: readiness notification then non-blocking read/write; simple and proven, ~2 syscalls per batch.",
+        "**io_uring**: submit and complete many operations with one syscall (or none with SQPOLL), multishot receive, provided buffer rings and registered buffers; cuts syscall overhead substantially at high request rates.",
+        "**Batching per loop iteration**: drain all ready sockets, process all parsed requests, then flush all responses with writev or batched sends.",
+        "**Busy polling** (SO_BUSY_POLL or polling the ring) trades CPU for lower latency by avoiding interrupt wake-ups; enable it on dedicated worker cores.",
+        "**Kernel bypass** (DPDK, AF_XDP with a userspace TCP stack, as in Seastar) can reach 5–10M+ ops/s per box but loses kernel tooling; not needed for 1M."
+      ],
+      "deepDive": [
+        "Where the time goes at 1M req/s unpipelined: each request costs roughly a receive syscall, TCP processing, the lookup, a send syscall and TCP transmit, about 3–5 µs of CPU total, of which the lookup is under 10%. That is why the protocol-level batching (pipelining) and syscall batching (io_uring) matter more than hash-table micro-optimizations. Interrupt moderation is another knob: too little coalescing burns CPU on interrupts, too much adds tens of microseconds of latency, so tune it with adaptive coalescing or busy polling."
+      ]
+    },
+    {
+      "name": "Data structures and memory management",
+      "summary": "Per-shard open-addressing hash tables that grow incrementally, and per-core allocators with size classes, eviction and expiry that never stall the loop.",
+      "points": [
+        "**Hash table**: cache-friendly open addressing or bucketized cuckoo / Swiss-table style with tag bytes, or a segmented extendible hash (Dragonfly's Dashtable) so growth splits one segment at a time instead of rehashing everything.",
+        "**Incremental resize**: if using a classic table, migrate a few buckets per operation (Redis-style), avoiding a 100M-entry rehash pause of hundreds of milliseconds.",
+        "**Allocator**: jemalloc or mimalloc with per-thread arenas, or memcached-style slab classes (sizes growing ×1.25); store small keys and values inline with the entry to save a pointer and a cache miss.",
+        "**Eviction**: approximate LRU by sampling a few keys and evicting the oldest, CLOCK bits, or LFU counters; a strict linked-list LRU costs 16 B/item and contended updates.",
+        "**Expiry**: lazy (check TTL on access) plus an active sweeper that samples a bounded number of keys per loop iteration, so expiry never blocks.",
+        "**Large frees**: deleting a 1 GB set is handed to a background thread (lazy free) instead of running on the event loop."
+      ],
+      "deepDive": [
+        "Fragmentation is the slow-burning memory problem: a workload whose value sizes shift over time leaves slabs or allocator runs half-empty, so RSS grows while logical data does not (memcached calls this slab calcification). Monitor the ratio of RSS to live bytes; fix it with slab rebalancing, active defragmentation that moves live items into dense pages a little at a time, or a log-structured memory design (as in RAMCloud) that compacts by copying. Also avoid transparent huge pages' background compaction stalls: use explicitly reserved huge pages for the arena or disable THP, and pre-fault memory at startup."
+      ]
+    },
+    {
+      "name": "Tail latency",
+      "summary": "Design out every source of multi-hundred-microsecond stalls and measure latency honestly under fixed offered load.",
+      "points": [
+        "**Bound work per iteration**: cap requests processed per connection per loop turn so one heavily pipelined client cannot starve others (head-of-line blocking).",
+        "**No blocking calls** on worker threads: no disk I/O, no DNS, no logging that can block; push those to helper threads.",
+        "**Isolate cores**: pin workers with isolcpus/nohz_full or cgroups, steer NIC IRQs to the matching cores, keep other processes and kernel threads off them.",
+        "**No GC pauses**: write in C, C++ or Rust; if using a managed runtime (Garnet in .NET), design for allocation-free hot paths.",
+        "**Memory stalls**: avoid page faults on the hot path (pre-fault, mlock), avoid swap entirely, and avoid fork-based snapshots that copy pages on write under load.",
+        "**Measure correctly**: use open-loop, fixed-rate load generators (wrk2, memtier with rate limiting) that avoid coordinated omission, and report p99/p99.9/max at stated throughput."
+      ],
+      "deepDive": [
+        "Tail latency compounds at the caller: a web request that fans out to 100 keys sees the server's p99 as its median. So a 1 ms stall that hits 0.1% of requests becomes visible to ~10% of pages. Common culprits in practice: a big DEL or EXPIRE of a huge key on the loop, a rehash, a THP compaction, a fork for snapshot (copying page tables for a 60 GB process takes ~10s of ms), and noisy neighbors on shared cores. Each needs either an incremental algorithm or isolation. Hedged requests on the client (send a duplicate after the p95 time) can cut the observed tail further at a few percent extra load."
+      ]
+    },
+    {
+      "name": "Durability and operations",
+      "summary": "Keep persistence off the critical path, restart quickly, and make the server observable without slowing it down.",
+      "points": [
+        "**Snapshots**: per-shard incremental snapshots (each core serializes its shard in small slices between requests, with versioning to capture a consistent point) avoid fork's copy-on-write memory doubling.",
+        "**Append-only log** (optional): per-shard log buffered in memory and written by a helper thread with group fsync every ~1 ms or 1 s depending on durability tier.",
+        "**Replication**: async replication to a replica machine for availability; failover handled by a controller or the client library.",
+        "**Warm restart**: load snapshot in parallel per shard; or keep data in shared memory so a process upgrade can reattach without reloading.",
+        "**Observability**: per-core counters (ops, bytes, queue depth, cross-shard hop rate), HDR latency histograms, hot-key sampling, memory and fragmentation stats, all lock-free and exported periodically."
+      ],
+      "deepDive": [
+        "Redis's classic fork-based snapshot relies on the kernel's copy-on-write, which is elegant but dangerous for tail latency: the fork itself pauses while page tables are copied, and under write-heavy load memory use can nearly double as pages are copied. Shared-nothing designs can instead snapshot each shard cooperatively, interleaving serialization with request processing, which keeps memory overhead small and pauses bounded at the cost of more code."
+      ]
+    }
+  ],
+
+  "tradeoffs": [
+    { "choice": "Thread-per-core shared-nothing vs shared hash table with locks", "pro": "Near-linear scaling, no lock contention, hot caches, predictable latency.", "con": "Cross-shard hops for multi-key ops, hot keys bottleneck one core, more complex code." },
+    { "choice": "epoll vs io_uring vs kernel bypass", "pro": "io_uring and bypass cut syscall and kernel-stack overhead, raising per-core throughput and lowering latency.", "con": "io_uring adds complexity and some security hardening restrictions; bypass loses kernel TCP, tooling and isolation and dedicates cores to polling." },
+    { "choice": "Approximate vs exact LRU", "pro": "Sampled LRU/CLOCK uses almost no extra memory and no shared list updates.", "con": "Slightly worse hit rate than exact LRU; sampling size tunes the trade." },
+    { "choice": "Fork-based vs cooperative per-shard snapshots", "pro": "Fork is simple and gives a consistent snapshot for free via copy-on-write.", "con": "Fork pauses and memory blow-up hurt tail latency; cooperative snapshots need more engineering." }
+  ],
+
+  "expert": {
+    "failureModes": [
+      { "name": "Hot key saturates one core", "description": "A celebrity key at hundreds of thousands of req/s pins its shard's core at 100% while others idle. Detect with sampling; mitigate with client-side caching, replicated hot-key caches or splitting the key." },
+      { "name": "Event-loop stalls", "description": "An O(N) command, a big delete, rehash or a blocking log write stalls every connection on that core for milliseconds. Bound work per operation and move heavy tasks to background threads." },
+      { "name": "Memory fragmentation and OOM", "description": "Changing value sizes leave memory fragmented; RSS exceeds the limit and the kernel OOM-kills the process. Track fragmentation, defragment actively, and set maxmemory with headroom." },
+      { "name": "Connection storms", "description": "After a network blip, thousands of clients reconnect at once (with TLS handshakes), starving request processing. Per-core accept rate limits, session resumption and client jittered backoff help." }
+    ],
+    "realSystems": [
+      { "name": "Redis / Valkey", "note": "Single-threaded command execution with optional I/O threads, incremental rehash, sampled LRU/LFU, fork-based snapshots; Valkey 8 added multi-threaded I/O for ~1M req/s per instance." },
+      { "name": "Memcached", "note": "Multi-threaded with a shared, striped-lock hash table, slab allocator and segmented LRU; the classic high-throughput cache." },
+      { "name": "Dragonfly", "note": "Shared-nothing thread-per-core with io_uring, Dashtable and cooperative snapshots; reports millions of ops/s on a single large instance." },
+      { "name": "Microsoft Garnet and MICA", "note": "Garnet uses the Tsavorite storage engine with batched networking in .NET; MICA (NSDI '14) showed tens of millions of ops/s with kernel bypass and EREW partitioning." }
+    ],
+    "questions": [
+      { "q": "Why not just use one thread like Redis?", "a": "One thread caps around 100–200k ops/s unpipelined because of syscalls and TCP processing, so 1M needs either many processes or a multi-core design. Thread-per-core keeps Redis's lock-free simplicity per shard while using all cores in one process with one memory pool and one endpoint." },
+      { "q": "Your p99.9 is 5 ms while p50 is 30 µs. How do you find the cause?", "a": "Correlate latency spikes in HDR histograms with events: rehashes, expiry sweeps, big deletes, snapshots, GC, THP compaction, IRQ storms, or a noisy neighbor on the core. Use off-CPU and scheduler tracing (perf sched, bpftrace runqlat), check per-core queue depths, and verify the load generator avoids coordinated omission." },
+      { "q": "How do you handle a multi-key MSET atomically across shards?", "a": "Either restrict atomic multi-key operations to keys in the same hash slot (Redis Cluster's hash tags), or coordinate: schedule the transaction on all involved shards in a global order (a transaction id), lock the involved keys logically on each shard, apply, then release, as Dragonfly does. The first is simpler and faster." },
+      { "q": "When would you move to kernel bypass?", "a": "When profiling shows the kernel network stack dominates CPU and you need several times more throughput or lower tail latency per box, for example 10M+ ops/s or sub-10 µs latency. The costs are a userspace TCP stack, dedicated polling cores, and losing standard tools and isolation." },
+      { "q": "How much memory overhead per key does your design add?", "a": "Roughly: hash entry with tag and pointer ~8–16 B, item header with TTL, LRU/LFU bits, sizes and flags ~16–24 B, plus allocator rounding ~10–20%. Inline small keys and values, use compact headers and 32-bit offsets within arenas to stay under ~50 B per item." }
+    ]
+  },
+
+  "related": [ "io-models", "processes-threads", "virtual-memory", "syscalls-kernel", "cpu-scheduling", "caching" ]
+}

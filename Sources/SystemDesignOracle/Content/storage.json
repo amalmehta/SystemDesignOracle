@@ -1,0 +1,383 @@
+{
+  "id": "storage",
+  "name": "Storage",
+  "symbol": "externaldrive",
+  "summary": "How data survives power loss, disk failure and scale: the physical devices, the file systems and index structures on top of them, and the redundancy schemes that keep petabytes durable. Every database and data platform inherits these limits.",
+  "topics": [
+    {
+      "id": "storage-devices",
+      "title": "SSDs, HDDs & NVMe",
+      "gist": "Hard drives store data on spinning magnetic platters, SSDs store it in flash memory chips, and NVMe is the fast interface that lets modern SSDs reach their full speed.",
+      "overview": [
+        "A **hard disk drive (HDD)** is like a record player: platters spin at 7,200 RPM and an arm moves a head to the right track. Reading data that is laid out in a line is fast, but jumping to a random spot means waiting for the arm to move and the platter to rotate, which takes several milliseconds. HDDs are slow at random access but very cheap per terabyte, so they still hold most of the world's cold data.",
+        "A **solid-state drive (SSD)** has no moving parts. It stores bits as electric charge in NAND flash cells, so any location can be read in tens of microseconds, roughly 100x faster than an HDD for random reads. The catch: flash can only be written in pages and erased in much larger blocks, and each cell wears out after a limited number of writes. The SSD's built-in controller hides all of this.",
+        "**NVMe** is the language a computer uses to talk to an SSD over the PCIe bus. Older drives used SATA, designed for spinning disks with a single queue of 32 commands. NVMe allows up to 64k queues each 64k deep, so many CPU cores can issue requests in parallel. That is why a single modern NVMe drive can do over a million operations per second."
+      ],
+      "diagram": {
+        "caption": "Latency of one random 4 KB read across the storage stack.",
+        "steps": [
+          { "label": "DRAM", "detail": "~100 ns" },
+          { "label": "Optane / CXL memory", "detail": "~300 ns to ~1 us" },
+          { "label": "NVMe SSD (TLC)", "detail": "~50-100 us" },
+          { "label": "SATA SSD", "detail": "~100-200 us" },
+          { "label": "HDD 7,200 RPM", "detail": "~5-10 ms seek + rotate" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "NAND flash (SLC to QLC)", "role": "Cells store 1 to 4 bits each; more bits per cell means cheaper and denser but slower writes and lower endurance. 3D NAND stacks 200-300+ layers (for example Micron G9, SK hynix 321-layer)." },
+          { "name": "Flash translation layer (FTL)", "role": "Controller firmware that maps logical block addresses to physical pages, writes out of place, runs garbage collection and wear leveling across blocks." },
+          { "name": "NVMe interface", "role": "PCIe-attached protocol with many submission/completion queue pairs, enabling ~1-3M IOPS per drive; PCIe 5.0 x4 gives ~14 GB/s, PCIe 6.0 doubles it." },
+          { "name": "HDD mechanics", "role": "Platters, heads and actuators; capacity grows via SMR (shingled tracks) and HAMR (heat-assisted, Seagate Mozaic 3+, 30-36 TB drives)." },
+          { "name": "Power-loss protection & caches", "role": "Enterprise SSDs have capacitors to flush their DRAM write cache on power failure, so they can acknowledge writes quickly yet safely; consumer drives often cannot." }
+        ],
+        "flow": [
+          "The application issues a read via read(), io_uring or SPDK; the kernel block layer or user-space driver builds an NVMe command.",
+          "The command is placed in a per-core submission queue in host memory and the driver writes a doorbell register on the SSD.",
+          "The controller fetches the command, looks up the logical address in its FTL mapping table (often cached in drive DRAM).",
+          "It reads the physical page from the right NAND die and plane (~50 us), applies LDPC error correction, and DMAs the data to host memory.",
+          "A completion entry is posted and an interrupt (or polling) tells the host the I/O is done.",
+          "For writes, data goes to a fresh erased page; the old page is marked invalid and later reclaimed by garbage collection, which copies valid pages and erases whole blocks."
+        ],
+        "tradeoffs": [
+          { "choice": "QLC SSD", "pro": "Cheapest flash per TB, 61-122 TB drives (Solidigm D5-P5336), great for read-heavy data", "con": "Low write endurance (~0.3-1 DWPD) and slow sustained writes once SLC cache fills" },
+          { "choice": "TLC NVMe SSD", "pro": "Balanced: ~1M+ random read IOPS, ~1-3 DWPD endurance", "con": "Several times the cost per TB of HDD" },
+          { "choice": "HDD", "pro": "~$15/TB, huge capacities, excellent sequential throughput (~250-300 MB/s)", "con": "~100-200 random IOPS per drive; IOPS per TB keeps falling as drives grow" },
+          { "choice": "Local NVMe vs network block storage (EBS)", "pro": "Local has lowest latency and highest IOPS", "con": "Ephemeral: data dies with the instance; network storage is durable and movable but adds ~0.5-1 ms" }
+        ],
+        "numbers": [
+          { "metric": "PCIe 5.0 NVMe SSD sequential read (Samsung PM1743, Micron 9550)", "value": "~13-14 GB/s" },
+          { "metric": "Enterprise NVMe random 4K read IOPS", "value": "~2-3 million" },
+          { "metric": "HDD random IOPS (7,200 RPM)", "value": "~100-200" },
+          { "metric": "Largest shipping HDD (2025-2026)", "value": "~30-36 TB HAMR" },
+          { "metric": "Largest QLC enterprise SSD", "value": "~122 TB" },
+          { "metric": "QLC NAND program/erase endurance", "value": "~1,000-3,000 cycles per cell" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Write amplification is the hidden tax of flash: because pages are written out of place and blocks erased in bulk, one host write can cause several NAND writes once the drive is full and garbage collection must copy live data. Random small writes to a nearly full drive are worst; overprovisioning (spare capacity, 7-28%), TRIM/discard, sequential write patterns and Zoned Namespaces (ZNS) or Flexible Data Placement (FDP, NVMe 2.0) reduce it. FDP lets the host tag writes by lifetime so the drive groups data that dies together, cutting WAF toward ~1 and is now deployed by Meta and Google.",
+          "Tail latency on SSDs is dominated by internal activity: a read can queue behind a program (~500 us-1 ms) or erase (~3-5 ms) on the same die, or behind garbage collection. Enterprise drives use program/erase suspend and die-level scheduling; systems add hedged reads across replicas. Durability semantics matter: fsync forces the device cache to flush, and drives without power-loss protection may lie or be very slow on flush, which is why databases benchmark radically differently on consumer and datacenter SSDs.",
+          "The hierarchy keeps changing. Intel discontinued Optane in 2022, leaving a gap between DRAM and NAND that CXL-attached memory (CXL 2.0/3.x expanders from Samsung, Micron, Astera) partly fills at ~200-400 ns. On the other end, HDDs survive because of $/TB for cold data, but their IOPS per TB is so low that big drives behave like tape for random workloads; hyperscalers use them almost only for large sequential erasure-coded chunks. Kernel bypass (SPDK) and io_uring with polling remove most host overhead so a single core can drive ~1M+ IOPS."
+        ],
+        "failureModes": [
+          { "name": "Write cliff / GC stalls", "description": "Once an SSD's free blocks run out, sustained writes trigger heavy garbage collection and throughput can drop 5-10x with p99 latency in tens of ms. Fix with overprovisioning, TRIM, sequential layouts, FDP/ZNS, and benchmarking at steady state, not fresh-out-of-box." },
+          { "name": "Lost writes on power failure", "description": "Drives that acknowledge writes from volatile cache without power-loss protection, or that ignore flushes, corrupt databases after a power cut. Use enterprise drives with PLP and verify fsync behavior." },
+          { "name": "Correlated failures from firmware bugs", "description": "Identical SSDs from the same batch fail together, as with HPE SAS SSD firmware that bricked drives after exactly 32,768 power-on hours. Mix vendors or batches across replicas and patch firmware promptly." }
+        ],
+        "realSystems": [
+          { "name": "AWS Nitro SSDs", "note": "AWS builds its own SSD controllers and FTL for EC2 instance storage and EBS io2, citing up to 60% lower latency and better tail consistency than off-the-shelf drives." },
+          { "name": "Backblaze drive stats", "note": "Publishes quarterly failure data on ~300k drives; annualized HDD failure rates are typically ~1-2%, varying widely by model." },
+          { "name": "Meta FDP deployment", "note": "Meta worked with vendors on Flexible Data Placement in NVMe and uses it in its caching tier (CacheLib) to drive write amplification close to 1, extending SSD life." }
+        ],
+        "questions": [
+          { "q": "A write-heavy database gets great benchmarks on new SSDs but p99 latency explodes after a week. Why?", "a": "Benchmarks on fresh drives run without garbage collection. Once the drive fills, out-of-place writes force GC that competes with foreground I/O, raising write amplification and stalls. Precondition drives before benchmarking, leave overprovisioning, enable TRIM, prefer sequential write patterns (LSM compaction), and pick drives with higher DWPD or use FDP." },
+          { "q": "Should a 10 PB archive with rare reads go on HDD or QLC SSD?", "a": "Usually HDD with erasure coding, because $/TB is still several times lower and the access pattern is large sequential reads. QLC wins when you need read IOPS, power density or rack space savings, and its TCO gap is narrowing. Model total cost including power, rack space and rebuild times, not just drive price." },
+          { "q": "Why did NVMe replace SATA/AHCI for SSDs?", "a": "AHCI had one queue of 32 commands and expensive register access designed for spinning disks, which bottlenecked flash that can serve millions of IOPS. NVMe offers up to 64k queues of 64k commands, per-core queues with no locking, and a lean command set over PCIe, cutting software overhead to a few microseconds." }
+        ]
+      },
+      "related": [ "file-systems", "lsm-btree", "erasure-coding", "io-models", "datacenter-networking" ]
+    },
+    {
+      "id": "file-systems",
+      "title": "File Systems",
+      "gist": "A file system turns a disk's flat array of blocks into named files and folders, and keeps that structure consistent even if power fails mid-write.",
+      "overview": [
+        "A disk is just a huge numbered list of blocks, each a few kilobytes. A **file system** is the librarian that organizes it: it keeps a catalog of which blocks belong to which file, which are free, what each file is called, who may open it and when it changed. Folders are simply special files that list names and point to the catalog entries, called *inodes*.",
+        "The hard part is crashes. Saving a file touches several places at once: the data blocks, the inode, the free-space map, the folder. If power fails halfway, the catalog could point to garbage. Modern file systems solve this with a **journal**, a diary where they first write down what they are about to change, or with **copy-on-write**, where they never overwrite live data and switch to the new version in one atomic step.",
+        "Applications must still be careful. When a program writes data, the operating system usually keeps it in memory (the *page cache*) and saves it to disk later for speed. Only calling `fsync` guarantees it is actually on disk. Many data-loss bugs in databases came down to this gap between written and durable."
+      ],
+      "diagram": {
+        "caption": "Path of a write() from application down to the device.",
+        "steps": [
+          { "label": "Application", "detail": "write(), then fsync() for durability" },
+          { "label": "VFS", "detail": "common Linux file interface" },
+          { "label": "Page cache", "detail": "dirty pages buffered in RAM" },
+          { "label": "File system", "detail": "ext4/XFS/btrfs allocate, journal" },
+          { "label": "Block layer", "detail": "queues and merges I/O" },
+          { "label": "Device", "detail": "NVMe SSD or HDD" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Inodes", "role": "Per-file metadata records holding size, permissions, timestamps and pointers (or extents) to data blocks. A filename is just a directory entry pointing at an inode number." },
+          { "name": "Extents and allocators", "role": "Modern file systems describe files as runs of contiguous blocks (extents) and use B-trees or bitmaps to track free space, reducing fragmentation for large files." },
+          { "name": "Journal (write-ahead log)", "role": "ext4 and XFS log metadata changes before applying them, so after a crash they replay or discard incomplete transactions in seconds instead of scanning the disk with fsck." },
+          { "name": "Copy-on-write designs", "role": "ZFS, btrfs and APFS write new versions of blocks elsewhere and atomically update pointers up to the root, enabling cheap snapshots, clones and checksums." },
+          { "name": "Page cache and writeback", "role": "The kernel caches file data in RAM; dirty pages are flushed by background writeback after ~30 s or under memory pressure, or immediately on fsync." }
+        ],
+        "flow": [
+          "Application calls write(fd, buf, 4096); the VFS routes it to the file system.",
+          "The file system copies data into page cache pages and marks them dirty; write() returns in microseconds.",
+          "If the file grows, the allocator reserves blocks (often delayed allocation, deciding placement at flush time).",
+          "On fsync (or writeback), dirty data pages are submitted to the block layer and written to the device.",
+          "Metadata changes (inode size, extent tree, bitmaps) are written to the journal as a transaction, followed by a commit record and a device cache flush (FUA/flush).",
+          "Later, the journaled metadata is checkpointed to its home locations and journal space is reclaimed.",
+          "After a crash, mount replays committed journal transactions and discards uncommitted ones, restoring a consistent tree."
+        ],
+        "tradeoffs": [
+          { "choice": "ext4 / XFS (journaling, in-place)", "pro": "Mature, fast, predictable; XFS scales well to large files and parallel I/O", "con": "No data checksums or native snapshots; silent corruption goes undetected" },
+          { "choice": "ZFS / btrfs (copy-on-write)", "pro": "End-to-end checksums, snapshots, clones, built-in RAID and compression", "con": "Fragmentation under random overwrite workloads, higher write amplification and memory use" },
+          { "choice": "data=ordered vs data=journal", "pro": "Ordered (ext4 default) journals only metadata, fast", "con": "Full data journaling writes data twice; ordered can leave old data in a file after a crash if the app did not fsync" },
+          { "choice": "Local FS vs distributed FS (Lustre, CephFS, NFS)", "pro": "Local is simple and fast", "con": "Distributed gives shared access at scale but adds metadata-server bottlenecks and weaker POSIX semantics" }
+        ],
+        "numbers": [
+          { "metric": "Default block / page size (ext4, x86)", "value": "4 KB" },
+          { "metric": "Linux dirty writeback expiry", "value": "~30 s (dirty_expire_centisecs=3000)" },
+          { "metric": "Max file size ext4 / XFS", "value": "16 TB / 8 EB" },
+          { "metric": "fsync latency on NVMe with PLP", "value": "~20-100 us" },
+          { "metric": "fsync latency on HDD", "value": "~5-20 ms" },
+          { "metric": "ZFS checksum options", "value": "fletcher4 default, SHA-256, BLAKE3" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Crash consistency for applications is subtle: writing a new file and renaming it over the old one is atomic only if you fsync the file before the rename and fsync the parent directory afterward. The 2009 ext4 delayed-allocation controversy, where files became zero-length after crashes, and the 2018 PostgreSQL fsyncgate, where Linux cleared the error flag after a failed writeback so a retried fsync falsely succeeded, both showed that POSIX durability semantics are weaker and more implementation-dependent than developers assume. Many databases now treat any fsync error as fatal and recover from their own WAL.",
+          "Databases often want to bypass parts of the file system: O_DIRECT skips the page cache to avoid double caching and get predictable I/O, at the cost of needing aligned buffers and their own caching. Preallocation (fallocate) avoids metadata updates on every append so that fdatasync only flushes data. Copy-on-write file systems interact badly with databases that do their own logging; it is common to disable CoW (chattr +C on btrfs) or set ZFS recordsize to match the database page size (for example 16 KB for InnoDB, 8 KB for Postgres).",
+          "At scale, metadata is the bottleneck, not bandwidth: directories with millions of files, small-file workloads and stat storms crush single-node metadata paths. Distributed file systems separate metadata (Lustre MDS, HDFS NameNode, CephFS MDS, Google Colossus's Bigtable-backed metadata) from data servers. Colossus moved metadata into a scalable database precisely because GFS's single master limited file counts. For ML, file systems like Lustre, WEKA, VAST and DAOS target millions of IOPS for training data and checkpointing."
+        ],
+        "failureModes": [
+          { "name": "Lost data after crash without fsync", "description": "Application writes then crashes or power fails before writeback; data in page cache is gone, or renamed files are empty. Fix with the write-temp, fsync, rename, fsync-directory pattern, or a WAL." },
+          { "name": "Silent data corruption (bit rot)", "description": "A disk, controller or cable returns wrong data without an error; non-checksumming file systems pass it to the application. Use ZFS/btrfs checksums, application-level checksums, and periodic scrubs." },
+          { "name": "Inode or metadata exhaustion", "description": "Millions of small files exhaust inodes or slow directory lookups even with free space remaining; ENOSPC appears with the disk half empty. Pack small files into larger containers, use hashed directory layouts, or object storage." }
+        ],
+        "realSystems": [
+          { "name": "Google Colossus", "note": "Successor to GFS that stores file metadata in Bigtable-style tables, scaling to exabytes and billions of files per cluster, underpinning Google Cloud Storage and BigQuery." },
+          { "name": "ZFS / OpenZFS", "note": "Pooled copy-on-write storage with checksums, RAID-Z, snapshots and send/receive replication; widely used for NAS and backups (TrueNAS, Netflix's FreeBSD caches)." },
+          { "name": "Apple APFS", "note": "Copy-on-write file system on all Apple devices since 2017, with clones, snapshots for Time Machine and native encryption, optimized for flash." }
+        ],
+        "questions": [
+          { "q": "How would you atomically update a configuration file so readers never see a partial version, even across a crash?", "a": "Write the new contents to a temp file in the same directory, fsync it, rename it over the original (rename is atomic within one file system), then fsync the directory so the rename itself is durable. Readers see either the old or new file, never a mix." },
+          { "q": "Why might a database prefer O_DIRECT, and what does it lose?", "a": "O_DIRECT avoids double caching (database buffer pool plus page cache), gives predictable latency, and lets the database control write ordering and eviction. It loses kernel readahead and the free cache of unused RAM, requires aligned I/O, and means the database must implement its own caching well." },
+          { "q": "A job writes 50 million 10 KB files to one directory and everything slows down. What is happening and what would you change?", "a": "Directory and inode metadata operations dominate: each create journals metadata, directory indexes grow, and backups or listings become very slow. Batch small files into larger container files (Parquet, TFRecord, tar shards), shard directories by hash prefix, or store objects in an object store designed for large key counts." }
+        ]
+      },
+      "related": [ "storage-devices", "lsm-btree", "object-storage", "virtual-memory", "checkpointing" ]
+    },
+    {
+      "id": "lsm-btree",
+      "title": "B-Trees vs LSM Trees",
+      "gist": "B-trees keep data sorted in place for fast reads; LSM trees buffer writes in memory and merge sorted files later for fast writes. Most databases use one.",
+      "overview": [
+        "Every database needs a way to find a record by key quickly. A **B-tree** is like a well-kept filing cabinet with an index: drawers are labelled with ranges, folders inside are sorted, and when you add a document you put it exactly where it belongs. Finding anything takes only a few lookups, but every update means opening the right drawer and rewriting a page in place, which costs random disk writes.",
+        "An **LSM tree** (Log-Structured Merge tree) works like an inbox. New writes go into a sorted pile in memory and are appended to a log for safety. When the pile is full it is written to disk as an immutable sorted file. In the background, files are merged (*compacted*) into bigger sorted files. Writes are very fast and sequential, but a read may have to check several files, and the merging uses extra disk bandwidth.",
+        "Postgres, MySQL InnoDB, SQLite and most relational databases use B-trees. RocksDB, Cassandra, ScyllaDB, CockroachDB (Pebble) and many write-heavy systems use LSM trees. Choosing between them is a classic example of trading read cost, write cost and space against each other."
+      ],
+      "diagram": {
+        "caption": "The LSM write path, from memory to deeper levels.",
+        "steps": [
+          { "label": "WAL", "detail": "append write for crash safety" },
+          { "label": "Memtable", "detail": "sorted in-memory buffer, ~64 MB" },
+          { "label": "L0 SSTables", "detail": "flushed files, may overlap" },
+          { "label": "L1..Ln", "detail": "each level ~10x larger" },
+          { "label": "Compaction", "detail": "merges, drops overwritten keys" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "B+tree pages", "role": "Fixed-size pages (8 KB in Postgres, 16 KB in InnoDB) with sorted keys; internal pages hold separators and child pointers, leaves hold rows or row pointers and are linked for range scans." },
+          { "name": "Write-ahead log", "role": "Both designs append changes to a log before modifying structures, so a crash can be recovered by replay; B-trees also use it to make multi-page splits atomic." },
+          { "name": "Memtable and SSTables", "role": "LSM writes land in a skiplist memtable; when full it is flushed as an immutable sorted string table with an index block and a Bloom filter." },
+          { "name": "Compaction strategy", "role": "Leveled compaction (RocksDB default) keeps one sorted run per level for low read and space amplification; tiered/size-tiered (Cassandra STCS) merges similar-sized files for lower write amplification." },
+          { "name": "Bloom filters and block cache", "role": "Per-SSTable Bloom filters (~10 bits/key gives ~1% false positives) let reads skip files that cannot contain the key; a block cache keeps hot data blocks in RAM." }
+        ],
+        "flow": [
+          "B-tree write: traverse from root to the target leaf (3-4 levels for billions of rows), log the change to the WAL, modify the page in the buffer pool.",
+          "If the leaf overflows, split it and insert a separator into the parent; dirty pages are written back later by checkpointing.",
+          "LSM write: append to the WAL, insert into the memtable, and acknowledge; no random I/O at all.",
+          "When the memtable reaches its size limit it becomes immutable and is flushed as an L0 SSTable.",
+          "Background compaction merges overlapping SSTables into the next level, discarding overwritten values and tombstones that have aged out.",
+          "LSM read: check memtable, then L0 files, then one file per level, using Bloom filters to skip most files and the block cache to avoid I/O.",
+          "Range scans merge iterators across the memtable and all levels into one sorted stream."
+        ],
+        "tradeoffs": [
+          { "choice": "B-tree", "pro": "Predictable reads, 1 lookup per level, efficient range scans, mature transactional engines", "con": "Random in-place writes; write amplification from rewriting whole pages for small changes; fragmentation" },
+          { "choice": "LSM tree", "pro": "High write throughput, sequential I/O, better compression and space efficiency with leveled compaction", "con": "Read amplification across levels, compaction stalls and bandwidth use, tombstone problems" },
+          { "choice": "Leveled compaction", "pro": "Low space (~1.1x) and read amplification", "con": "Write amplification ~10-30x" },
+          { "choice": "Tiered compaction", "pro": "Lower write amplification (~4-10x), good for write-heavy ingest", "con": "Up to 2x temporary space, more files to check per read" }
+        ],
+        "numbers": [
+          { "metric": "B-tree depth for ~1B rows with 16 KB pages", "value": "~3-4 levels" },
+          { "metric": "RocksDB level size multiplier", "value": "10x per level" },
+          { "metric": "Leveled LSM write amplification", "value": "~10-30x" },
+          { "metric": "Bloom filter at 10 bits/key", "value": "~1% false positive rate" },
+          { "metric": "Default RocksDB memtable (write_buffer_size)", "value": "64 MB" },
+          { "metric": "Postgres / InnoDB page size", "value": "8 KB / 16 KB" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The RUM conjecture frames the design space: you can optimize two of read, update and memory/space overhead, not all three. B-trees pay on writes (a 100-byte update rewrites a 16 KB page, plus full-page images in the WAL after checkpoints in Postgres); LSMs pay on reads and compaction bandwidth. Production engines blur the line: WiredTiger (MongoDB) is a B-tree with copy-on-write pages and in-memory update chains, Bw-trees use delta records, and RocksDB adds partitioned indexes, prefix Bloom filters and Ribbon filters to tame read cost.",
+          "LSM tombstones are a notorious trap. Deletes write a marker that must propagate to the bottom level before space is freed, and range scans over regions full of tombstones read huge amounts of dead data; Cassandra fails queries above tombstone_failure_threshold (100k by default). Queue-like workloads that insert and delete continuously are especially bad. Range deletes, TTL compaction filters and time-window compaction (TWCS) for time-series help. Compaction debt is the other trap: if ingest exceeds compaction throughput, L0 file count grows until RocksDB throttles and then stalls writes entirely.",
+          "Separating keys from values (WiscKey, RocksDB BlobDB, TiKV Titan) keeps large values out of compaction, cutting write amplification for big payloads at the cost of extra GC. On the B-tree side, Postgres's MVCC stores new row versions in the heap and needs VACUUM to reclaim old ones, while InnoDB keeps undo logs; both suffer when long transactions hold back cleanup. Choosing in an interview comes down to workload: write-heavy with point reads and good compression favors LSM; read-heavy, latency-sensitive OLTP with range scans favors B-trees."
+        ],
+        "failureModes": [
+          { "name": "Compaction falling behind (write stalls)", "description": "Sustained ingest outpaces compaction; L0 files pile up, reads slow, and RocksDB eventually stops accepting writes. Fix with more compaction threads, rate limiting ingest, tuning level sizes, or tiered compaction." },
+          { "name": "Tombstone accumulation", "description": "Delete-heavy workloads leave masses of tombstones that slow scans and cause query timeouts or failures until compacted. Avoid queue-on-LSM patterns, use TTL/TWCS, and tune gc_grace and compaction." },
+          { "name": "B-tree bloat and page splits", "description": "Random-key inserts (UUIDv4) split pages everywhere, leaving them half full and destroying cache locality; MVCC dead tuples bloat tables. Use time-ordered keys (UUIDv7), fillfactor tuning, and regular VACUUM or OPTIMIZE." }
+        ],
+        "realSystems": [
+          { "name": "RocksDB", "note": "Meta's LSM engine forked from LevelDB, embedded in MyRocks, Kafka Streams, TiKV, Flink state and many others; offers leveled, universal and FIFO compaction." },
+          { "name": "PostgreSQL and InnoDB", "note": "B+tree indexes with WAL; InnoDB clusters rows in the primary-key B-tree, so primary key choice directly affects insert locality and secondary index size." },
+          { "name": "Cassandra and ScyllaDB", "note": "LSM-based wide-column stores built for write-heavy, multi-region workloads, offering size-tiered, leveled, time-window and incremental compaction strategies." }
+        ],
+        "questions": [
+          { "q": "You are storing 1M writes/s of IoT telemetry, queried mostly by device and recent time range. B-tree or LSM, and how would you configure it?", "a": "LSM: writes are sequential and compress well, and the B-tree's random page writes would saturate the disks. Key by (device_id, timestamp) so a device's recent data is contiguous, use time-window compaction so whole old SSTables expire by TTL without tombstones, and use Bloom filters for point lookups." },
+          { "q": "Why can switching primary keys from auto-increment to random UUIDs slow down MySQL inserts dramatically?", "a": "InnoDB clusters rows by primary key, so random UUIDs insert into random leaf pages across the whole tree, which no longer fits in the buffer pool, causing random reads, page splits and half-empty pages. Sequential keys append to the rightmost leaf. Use UUIDv7 or another time-ordered ID to get global uniqueness with locality." },
+          { "q": "What is write amplification in an LSM tree and how would you reduce it?", "a": "It is total bytes written to disk divided by bytes written by the user: every byte is rewritten once per level during compaction, so leveled LSMs see ~10-30x. Reduce it with tiered or universal compaction, a larger memtable, fewer levels, key-value separation for large values, or a larger level multiplier, accepting more read or space amplification." }
+        ]
+      },
+      "related": [ "file-systems", "storage-devices", "partitioning", "replication", "change-data-capture" ]
+    },
+    {
+      "id": "object-storage",
+      "title": "Object Storage",
+      "gist": "Object storage like Amazon S3 keeps any amount of data as whole files addressed by a key, trading file-system features for nearly unlimited scale, durability and low cost.",
+      "overview": [
+        "A file system is like a filing cabinet in your office: you can open a drawer, edit a page in the middle of a file and rearrange folders. **Object storage** is more like a vast warehouse with a coat-check counter. You hand over a whole box (an *object*), get a ticket (its *key*, like `photos/2026/cat.jpg`), and later ask for the box back by ticket. You cannot edit part of a box in place; you replace the whole thing.",
+        "Giving up in-place editing and real folders lets the system scale almost without limit. Objects are spread across thousands of disks in several buildings, and copies or coded fragments are kept so that even losing a whole datacenter does not lose data. Amazon S3 is designed for 99.999999999% (eleven nines) durability and stores hundreds of trillions of objects.",
+        "Because it is cheap, durable and reachable over plain HTTP, object storage has become the foundation of modern data systems: data lakes, backups, ML training sets, media, and even databases that keep their files in S3 rather than on local disks."
+      ],
+      "diagram": {
+        "caption": "A PUT request flowing through an S3-style object store.",
+        "steps": [
+          { "label": "Client SDK", "detail": "signed HTTP PUT, multipart for large" },
+          { "label": "Front-end API", "detail": "auth, routing, rate limits" },
+          { "label": "Metadata index", "detail": "key to location, versioning" },
+          { "label": "Storage nodes", "detail": "erasure-coded shards across AZs" },
+          { "label": "Ack to client", "detail": "after durable write, strongly consistent" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Buckets, keys and objects", "role": "A flat namespace per bucket; slashes in keys are just characters, and folders are simulated by prefix listing. Objects are immutable blobs up to 5 TB in S3, with metadata and optional versions." },
+          { "name": "Front-end / API layer", "role": "Stateless HTTP servers that authenticate (SigV4), authorize via IAM and bucket policies, and route requests to the index and storage fleets." },
+          { "name": "Metadata / index service", "role": "A distributed, partitioned key-value index mapping (bucket, key, version) to data locations; it scales by splitting key-range partitions as request rates grow." },
+          { "name": "Storage fleet", "role": "Large HDD-based servers storing erasure-coded shards spread across failure domains and availability zones, with background scrubbing and repair." },
+          { "name": "Storage classes and lifecycle", "role": "Tiers from hot (S3 Standard, S3 Express One Zone) to cold (Glacier Deep Archive) with different price, latency and retrieval costs; lifecycle rules move objects automatically." }
+        ],
+        "flow": [
+          "The client signs a PUT with its credentials; large objects are split into multipart uploads with parts of 5 MB to 5 GB uploaded in parallel.",
+          "A front-end server authenticates, checks policy, and computes or verifies a checksum (CRC32C, CRC64NVME or SHA-256).",
+          "The data is erasure-coded into shards and written to storage nodes spread across multiple availability zones.",
+          "Once enough shards are durable, the metadata index records the new version for the key.",
+          "The client receives 200 OK with an ETag; any subsequent read or list sees the new object (S3 is strongly read-after-write consistent since December 2020).",
+          "On GET, the front end looks up the location, reads shards (possibly using ranged reads), reconstructs and streams the bytes.",
+          "Background processes scrub shards, repair lost ones from survivors, and apply lifecycle transitions or expirations."
+        ],
+        "tradeoffs": [
+          { "choice": "Object storage vs block/file storage", "pro": "Practically unlimited scale, eleven-nines durability, ~$0.023/GB-month, HTTP access from anywhere", "con": "Higher latency (~10-100 ms first byte), no partial overwrite, no atomic rename, request costs add up for small objects" },
+          { "choice": "Many small objects", "pro": "Simple mapping of one record to one object", "con": "Per-request cost and latency dominate; listing millions of keys is slow; better to batch into larger files (Parquet, ~100 MB-1 GB)" },
+          { "choice": "S3 Express One Zone", "pro": "Single-digit ms latency and up to ~2M requests/s per directory bucket", "con": "Single AZ (lower availability guarantees), higher storage price" },
+          { "choice": "Cold tiers (Glacier)", "pro": "~$0.001/GB-month for Deep Archive", "con": "Retrieval takes hours and costs per GB; minimum storage durations" }
+        ],
+        "numbers": [
+          { "metric": "S3 design durability", "value": "99.999999999% (11 nines)" },
+          { "metric": "Objects stored in S3 (2025)", "value": "~400+ trillion, hundreds of exabytes" },
+          { "metric": "S3 per-prefix request rate", "value": "~3,500 PUT / 5,500 GET per second, scales by prefix" },
+          { "metric": "Max object size / multipart parts", "value": "5 TB / 10,000 parts" },
+          { "metric": "S3 Standard first-byte latency", "value": "~10-100 ms" },
+          { "metric": "S3 Standard storage price (us-east-1)", "value": "~$0.023 per GB-month" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Throughput comes from parallelism, not single-stream speed. A single GET might deliver ~50-100 MB/s, so clients reach 10-100 Gb/s by issuing many concurrent ranged GETs (the AWS Common Runtime does this automatically). Request rates scale per key prefix partition: S3 splits partitions as load grows, but sudden spikes can return 503 SlowDown until it does, so clients need exponential backoff with jitter and hot prefixes should be spread. Tail latency is handled by hedging: issue a second request if the first has not returned by the p95.",
+          "Semantics matter for building systems on top. S3 now offers strong read-after-write and list consistency, conditional writes (If-None-Match since 2024 and If-Match), which enable lock-free commits for table formats and leader election without a separate coordination service. There is still no atomic rename or append on standard buckets, which is why Hadoop-style commit protocols were slow and unsafe and why table formats like Iceberg and Delta use a metadata pointer swap. Listing is paginated at 1,000 keys and can be slow at billions of keys, so systems keep their own manifests rather than listing.",
+          "Cost modeling is a design skill: request charges (~$0.005 per 1k PUTs, ~$0.0004 per 1k GETs) can exceed storage cost for small objects, and cross-region or internet egress (~$0.02-0.09/GB) often dwarfs both. A new generation of systems treats S3 as the primary durable store: WarpStream and Confluent Freight put Kafka logs on S3, Neon and Turbopuffer use it as the bottom tier, and caches on local NVMe hide its latency. Alternatives with compatible APIs include Cloudflare R2 (no egress fees), Google Cloud Storage, Azure Blob, MinIO and Ceph RGW."
+        ],
+        "failureModes": [
+          { "name": "503 SlowDown on hot prefixes", "description": "A sudden burst concentrated on one key prefix exceeds its partition's rate before S3 splits it. Spread keys across prefixes, ramp up gradually, and retry with exponential backoff and jitter." },
+          { "name": "Small-file explosion", "description": "Millions of tiny objects make request costs, list times and query planning blow up; a data lake query spends most of its time opening files. Compact into larger files and maintain manifests." },
+          { "name": "Accidental exposure or deletion", "description": "Public bucket policies leak data; buggy jobs or attackers delete objects. Enable Block Public Access, versioning, MFA delete or Object Lock, replication and least-privilege IAM." }
+        ],
+        "realSystems": [
+          { "name": "Amazon S3", "note": "Launched 2006; uses erasure coding across AZs, ShardStore (a Rust storage engine verified with lightweight formal methods) on storage nodes, and strong consistency since 2020." },
+          { "name": "Cloudflare R2", "note": "S3-compatible object storage with zero egress fees, built on Cloudflare's network and Durable Objects for metadata." },
+          { "name": "Ceph RADOS Gateway / MinIO", "note": "Self-hosted S3-compatible stores; Ceph places objects with the CRUSH algorithm instead of a central index, MinIO uses per-object erasure sets." }
+        ],
+        "questions": [
+          { "q": "Design a photo storage service for 1B users. Where does object storage fit?", "a": "Store originals and resized variants as objects with keys derived from a photo ID (not user-sequential, to spread load), keep metadata (owner, albums, permissions) in a database, and serve through a CDN with signed URLs. Use lifecycle rules to move old originals to infrequent-access or cold tiers, and versioning or Object Lock to protect against deletion." },
+          { "q": "How do lakehouse table formats commit atomically on S3 without rename?", "a": "They write immutable data files first, then a new metadata/manifest file, and finally atomically swap the table's current-metadata pointer using a catalog compare-and-swap or S3 conditional write. Readers always follow the pointer, so they see a complete snapshot, and conflicting writers detect the failed CAS and retry." },
+          { "q": "A batch job reading 100 TB from S3 is far slower than expected. What do you check?", "a": "Concurrency: one stream per file caps around 100 MB/s, so use many parallel ranged GETs across instances. Check that objects are reasonably sized (not millions of tiny files), that you are in the same region (no cross-region hops), instance network bandwidth limits, 503 throttling and retry behavior, and whether a columnar format with predicate pushdown could avoid reading most bytes." }
+        ]
+      },
+      "related": [ "erasure-coding", "warehouse-lakehouse", "cdn", "file-systems", "checkpointing" ]
+    },
+    {
+      "id": "erasure-coding",
+      "title": "RAID & Erasure Coding",
+      "gist": "RAID and erasure coding spread data plus extra math-based backup pieces across many disks, so losing several disks loses no data without storing full copies.",
+      "overview": [
+        "Disks fail all the time: at a ~1.5% yearly failure rate, a fleet of a million drives loses dozens every day. The simplest protection is to keep two or three full copies, *replication*, but that doubles or triples your storage bill.",
+        "**Erasure coding** is a cleverer kind of backup. Imagine splitting a message into 6 pieces and computing 3 extra *parity* pieces from them, with math such that any 6 of the 9 are enough to rebuild the whole message. You can lose any 3 disks and still recover, yet you only store 1.5x the original size instead of 3x. The simplest version, XOR parity, is what classic RAID-5 uses.",
+        "**RAID** applies these ideas inside a single server across a handful of disks. Large-scale systems like S3, Azure Storage and HDFS apply erasure coding across servers, racks and even datacenters. The price is extra computation and, more importantly, much heavier work when rebuilding a lost piece, because you must read several surviving pieces to reconstruct it."
+      ],
+      "diagram": {
+        "caption": "A Reed-Solomon RS(6,3) stripe written across nine disks.",
+        "steps": [
+          { "label": "Object or block", "detail": "split into fixed-size stripes" },
+          { "label": "6 data chunks", "detail": "original bytes, one per disk" },
+          { "label": "3 parity chunks", "detail": "computed via Galois field math" },
+          { "label": "9 failure domains", "detail": "different disks, racks or zones" },
+          { "label": "Any 6 rebuild", "detail": "tolerates 3 losses at 1.5x" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Mirroring (RAID-1, replication)", "role": "Full copies on separate devices; simplest and fastest to rebuild, but storage overhead is 2x or 3x." },
+          { "name": "Parity RAID (RAID-5/6, RAID-Z)", "role": "Stripes data across disks with one (XOR) or two (P+Q Reed-Solomon) parity blocks per stripe, tolerating one or two disk failures." },
+          { "name": "Reed-Solomon codes", "role": "RS(k,m) turns k data chunks into k+m chunks using polynomial arithmetic over GF(2^8); any k recover the data. This is the optimal (MDS) code for overhead." },
+          { "name": "Locally repairable codes (LRC)", "role": "Add local parity for small groups so a single lost chunk can be rebuilt from a few neighbors instead of all k, slashing repair traffic; used by Azure Storage." },
+          { "name": "Placement and repair service", "role": "Spreads chunks across failure domains, scrubs data to detect latent errors, and schedules rebuilds prioritized by how many chunks a stripe has lost." }
+        ],
+        "flow": [
+          "Incoming data is buffered and split into stripes, each divided into k equal data chunks (for example 6 chunks of 1 MB).",
+          "The encoder computes m parity chunks using SIMD-accelerated Galois field multiplication (Intel ISA-L reaches several GB/s per core).",
+          "All k+m chunks are written to distinct disks in distinct racks or zones, and the write is acknowledged once enough are durable.",
+          "Normal reads fetch only the data chunks needed; no decoding is required when all data chunks are healthy.",
+          "If a chunk is unavailable, a degraded read fetches any k surviving chunks and decodes the missing data on the fly.",
+          "When a disk dies, the repair service reconstructs every chunk it held from survivors and writes them to new disks, throttled to protect foreground traffic.",
+          "Background scrubbing reads and checksums all chunks periodically to catch silent corruption before more failures accumulate."
+        ],
+        "tradeoffs": [
+          { "choice": "3x replication", "pro": "Fast reads from any replica, cheap repair (copy one replica), simple", "con": "3x storage cost; only tolerates 2 failures" },
+          { "choice": "Reed-Solomon RS(6,3) or RS(10,4)", "pro": "1.4-1.5x overhead, tolerates 3-4 failures", "con": "Repair reads k chunks per lost chunk; small-object writes and degraded reads are expensive" },
+          { "choice": "LRC (Azure 12+2+2)", "pro": "~1.33x overhead with cheap single-chunk repair from 6 chunks", "con": "Not MDS: some failure patterns of 4 are unrecoverable; more complex" },
+          { "choice": "RAID-5 on large HDDs", "pro": "Minimal overhead for small arrays", "con": "Rebuilding a 20+ TB disk takes a day or more, and a second failure or unrecoverable read error during it loses the array; use RAID-6 or wider codes" }
+        ],
+        "numbers": [
+          { "metric": "Annualized HDD failure rate (Backblaze 2024-2025)", "value": "~1-1.5%" },
+          { "metric": "HDFS RS(6,3) storage overhead", "value": "1.5x vs 3x for replication" },
+          { "metric": "Azure LRC(12,2,2) overhead", "value": "~1.33x" },
+          { "metric": "Rebuild time for a 24 TB HDD at ~200 MB/s", "value": "~1.5+ days" },
+          { "metric": "Intel ISA-L RS encode throughput", "value": "~several GB/s per core" },
+          { "metric": "HDD unrecoverable read error spec", "value": "~1 per 10^15 bits read" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Durability is a function of failure rate, number of tolerated failures and repair time: the window between a failure and its repair is when additional failures can lose data, so faster repair buys as much durability as more parity. That is why large systems spread each disk's chunks across many other disks (declustered placement) so thousands of disks share a rebuild in parallel, cutting repair from days to minutes, and why they prioritize stripes that have lost the most chunks. Correlated failures (a rack power loss, a bad firmware batch, an AZ outage) break independence assumptions, so placement across failure domains matters more than code parameters.",
+          "Repair traffic is the dominant operational cost of erasure coding. With RS(k,m), recovering one lost chunk requires reading k chunks, so at scale repair bandwidth can saturate cross-rack links. Facebook's analysis of its warehouse cluster found RS repair accounted for a large share of cross-rack traffic, motivating LRCs, regenerating codes (Clay codes in Ceph) and piggybacking codes. Wide stripes (for example 20+ data chunks, as in VAST and Backblaze's 17+3) reduce overhead further but make small writes and repair harder, so systems often replicate new data first and erasure-code it later once it is cold and sealed.",
+          "Cross-region erasure coding (for example Azure GZRS-like designs, or Google Colossus with RS across zones) trades WAN bandwidth on every degraded read for tolerating a full zone loss at lower cost than three regional copies. Codes protect against loss, not corruption or bugs: you still need end-to-end checksums to know which chunk is bad, versioning against logical deletes, and backups or snapshots against software errors that corrupt all chunks consistently. RAID controllers' write hole, where a crash between data and parity updates leaves an inconsistent stripe, is solved by journaling or copy-on-write designs like RAID-Z."
+        ],
+        "failureModes": [
+          { "name": "Second failure during rebuild", "description": "A slow rebuild of a large disk leaves the array unprotected, and another failure or unreadable sector loses data; classic with RAID-5 on big HDDs. Use double/triple parity, declustered rebuilds, and fast repair prioritization." },
+          { "name": "Correlated failure domain loss", "description": "Chunks of a stripe placed in the same rack, power feed or AZ are lost together, exceeding the code's tolerance. Enforce placement constraints and test them with failure injection." },
+          { "name": "Repair storms", "description": "A rack or AZ outage triggers mass reconstruction that saturates network and disks, hurting foreground latency and possibly cascading. Throttle and prioritize repair, and add a grace delay before treating temporarily unavailable nodes as lost." }
+        ],
+        "realSystems": [
+          { "name": "Azure Storage LRC", "note": "Uses Local Reconstruction Codes such as (12,2,2) so most single failures are repaired from 6 chunks, saving petabytes versus Reed-Solomon at equal durability." },
+          { "name": "HDFS erasure coding", "note": "Hadoop 3 added striped RS(6,3) and RS(10,4) policies, cutting storage overhead from 3x to 1.5x for cold data at the cost of locality and repair bandwidth." },
+          { "name": "Backblaze Vaults", "note": "Spreads each file as 17 data + 3 parity shards across 20 servers in different cabinets, publishing its durability math openly." }
+        ],
+        "questions": [
+          { "q": "You store 100 PB. Compare 3x replication with RS(10,4) and say when you would use each.", "a": "Replication needs 300 PB raw, RS(10,4) needs 140 PB, saving ~160 PB, while tolerating 4 failures instead of 2. Replication gives faster reads, cheap repairs and easy small writes, so it suits hot, frequently updated data. Use RS for sealed, colder data, often writing replicated first and erasure-coding in the background." },
+          { "q": "How does repair time affect durability, and how would you shrink it?", "a": "Data loss happens when extra failures occur before repair completes, so mean time to data loss scales roughly with (MTTF / MTTR)^m. Shrink MTTR by declustered placement so many disks rebuild in parallel, prioritizing stripes with the fewest survivors, using LRCs to reduce bytes read per repair, and provisioning repair bandwidth." },
+          { "q": "Why not use RAID-5 with 24 TB drives?", "a": "Rebuilding reads every other drive in full; at ~200 MB/s a 24 TB drive takes over a day, during which a second failure loses the array, and reading ~200 TB of survivors makes an unrecoverable read error likely at a 1 in 10^15 bit spec. Use RAID-6 or triple parity, or distributed erasure coding with declustered rebuilds." }
+        ]
+      },
+      "related": [ "object-storage", "storage-devices", "replication", "file-systems", "checkpointing" ]
+    }
+  ]
+}

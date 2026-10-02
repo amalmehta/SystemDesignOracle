@@ -1,0 +1,376 @@
+{
+  "id": "security",
+  "name": "Security",
+  "symbol": "lock.shield",
+  "summary": "How systems prove who you are, decide what you may do, protect data in transit and at rest, contain untrusted code, and systematically find weaknesses before attackers do.",
+  "topics": [
+    {
+      "id": "authn-authz",
+      "title": "Authentication & Authorization",
+      "gist": "Authentication proves who you are; authorization decides what you are allowed to do. Modern systems use tokens, passkeys and policy engines to handle both at scale.",
+      "overview": [
+        "Think of a hotel. At the front desk you show ID to prove who you are: that is **authentication** (authn). You then get a key card that opens your room and the gym but not other guests' rooms: that is **authorization** (authz). The key card is like a **token**: you do not show your ID at every door, you just tap the card.",
+        "On the web, you sign in once with a password, a **passkey** (a cryptographic key stored on your phone or laptop that cannot be phished), or through another provider like Google using **OpenID Connect**. The server then hands your browser a session cookie or a signed token such as a **JWT** that later requests carry.",
+        "Authorization asks \"can this user do this action on this thing?\" Simple apps use roles (admin, editor, viewer). Bigger systems use relationships (\"Alice can edit this doc because she is in a team that owns the folder it is in\"), checked by a dedicated policy service so every part of the system gives the same answer."
+      ],
+      "diagram": {
+        "caption": "A login produces a token that services verify, then a policy check decides access.",
+        "steps": [
+          { "label": "User signs in", "detail": "Passkey, password+MFA, or SSO" },
+          { "label": "Identity provider", "detail": "Verifies identity, issues tokens" },
+          { "label": "Token in request", "detail": "Cookie or bearer JWT, short-lived" },
+          { "label": "Service verifies token", "detail": "Checks signature, expiry, audience" },
+          { "label": "Policy decision", "detail": "RBAC/ReBAC engine: allow or deny" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Identity provider (IdP)", "role": "Authenticates users and issues tokens via OAuth 2.0 / OpenID Connect or SAML; e.g. Okta, Microsoft Entra ID, Auth0, Keycloak, Google." },
+          { "name": "Credentials and authenticators", "role": "Passwords hashed with Argon2id/bcrypt, TOTP codes, and WebAuthn/FIDO2 passkeys that sign a server challenge with a device-bound or synced private key." },
+          { "name": "Tokens and sessions", "role": "Opaque session ids looked up server-side, or self-contained signed JWTs (ID tokens, access tokens) with claims like sub, aud, exp and scope; plus longer-lived refresh tokens." },
+          { "name": "Policy decision point", "role": "Evaluates whether a principal may perform an action on a resource: RBAC roles, ABAC attributes (OPA/Rego, AWS Cedar) or ReBAC relationship graphs (Google Zanzibar, SpiceDB, OpenFGA)." },
+          { "name": "Policy enforcement point", "role": "The API gateway, middleware or service code that calls the decision point and actually blocks the request." }
+        ],
+        "flow": [
+          "The app redirects the user to the IdP using the OAuth 2.0 authorization code flow with PKCE.",
+          "The user authenticates, ideally with a passkey: the browser signs the IdP's challenge with a private key scoped to the IdP's domain.",
+          "The IdP redirects back with a one-time code, which the app's backend exchanges for an ID token, access token and refresh token.",
+          "The app sets a secure, HttpOnly, SameSite session cookie or passes the access token as a bearer header to APIs.",
+          "Each API verifies the token signature against the IdP's published JWKS keys and checks issuer, audience and expiry.",
+          "The service asks the policy engine whether this subject can perform this action on this resource, and enforces the answer.",
+          "When the access token expires (~5-60 min), the client uses the refresh token, which can be revoked centrally."
+        ],
+        "tradeoffs": [
+          { "choice": "Stateless JWTs vs server-side sessions", "pro": "JWTs verify locally with no database lookup, scaling across services", "con": "Hard to revoke before expiry; sessions revoke instantly but need a shared store" },
+          { "choice": "RBAC vs ReBAC/ABAC", "pro": "RBAC is simple to understand and audit", "con": "Role explosion for per-object sharing; ReBAC handles sharing but needs a dedicated service" },
+          { "choice": "Centralized authz service vs library in each service", "pro": "Consistent decisions and one audit log", "con": "Extra network hop on every request and a critical dependency; needs caching and high availability" },
+          { "choice": "Passkeys vs passwords + SMS OTP", "pro": "Phishing-resistant and nothing reusable to steal from the server", "con": "Account recovery and cross-device flows are harder to design" }
+        ],
+        "numbers": [
+          { "metric": "Typical access token lifetime", "value": "~5-60 minutes" },
+          { "metric": "Google Zanzibar scale (2019 paper)", "value": "~millions of checks/s, p95 < 10 ms" },
+          { "metric": "Argon2id OWASP minimum config", "value": "~19 MiB memory, 2 iterations" },
+          { "metric": "Credential-based share of breaches (Verizon DBIR)", "value": "~20-30% initial access vector" },
+          { "metric": "OAuth 2.1", "value": "PKCE required, implicit flow removed" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Most token bugs are verification bugs, not cryptography bugs. Services must pin the expected algorithm (never trust the JWT header's alg, which enabled the classic alg=none and RS256-to-HS256 confusion attacks), validate iss, aud and exp, and fetch keys only from a configured JWKS URL, caching them with rotation in mind. Audience checks matter: an access token minted for service A replayed against service B is accepted if B ignores aud. Sender-constrained tokens (DPoP, mTLS-bound tokens) prevent stolen bearer tokens from being replayed elsewhere.",
+          "Revocation and consistency are the hard parts of distributed authz. Short-lived access tokens plus revocable refresh tokens bound the exposure window. For authorization, Zanzibar's key insight is the 'new enemy' problem: if Alice removes Bob from a doc and then adds secret content, a stale replica must not let Bob see it. Zanzibar solves this with zookies, consistency tokens tied to Spanner timestamps, so checks are evaluated at a snapshot at least as fresh as the content change. SpiceDB and OpenFGA implement similar ideas.",
+          "Authorization failures dominate real incidents: the OWASP Top 10 has ranked Broken Access Control first since 2021. Classic IDOR bugs come from checking that a user is logged in but not that they own object id 1234. Defenses are structural: deny by default, enforce object-level checks in a shared layer, derive tenant id from the token rather than the request body, and write tests that try every endpoint as a different tenant. Session cookies need Secure, HttpOnly and SameSite=Lax or Strict, and SSO adds risks like open redirects and mis-validated redirect_uri."
+        ],
+        "failureModes": [
+          { "name": "IDOR / broken object-level authorization", "description": "API checks authentication but not ownership, so changing an id in the URL exposes other users' data. Fix: enforce resource-level authz centrally, scope queries by tenant from the token, automated cross-tenant tests." },
+          { "name": "JWT validation flaws", "description": "Accepting alg=none, confusing HMAC and RSA keys, skipping audience or expiry checks, leading to forged or replayed tokens. Fix: use a vetted library with pinned algorithms, strict claim validation, short lifetimes." },
+          { "name": "MFA fatigue and phishing", "description": "Attackers phish passwords and OTPs via proxy kits or spam push approvals until a user accepts (as in the 2022 Uber breach). Fix: passkeys/FIDO2, number matching, rate-limiting push prompts." }
+        ],
+        "realSystems": [
+          { "name": "Google Zanzibar", "note": "Global relationship-based authz for Drive, YouTube and more, storing trillions of ACL tuples in Spanner with snapshot-consistent checks." },
+          { "name": "AWS IAM and Cedar", "note": "IAM evaluates JSON policies on every AWS API call; Cedar is AWS's open-source policy language used in Verified Permissions." },
+          { "name": "Passkeys (Apple, Google, Microsoft)", "note": "FIDO2/WebAuthn credentials synced via platform keychains, now the default sign-in option for Google accounts and many large consumer sites." }
+        ],
+        "questions": [
+          { "q": "Design authorization for a Google Docs-like product with sharing, folders and groups.", "a": "Model permissions as relationship tuples (doc#viewer@user, doc#parent@folder, group#member@user) in a ReBAC service like SpiceDB or OpenFGA, with a schema where viewers of a folder are viewers of its docs. Checks traverse the graph with caching and are evaluated at a snapshot at least as new as the content (consistency tokens). List-filtering (what can I see?) needs a reverse index or materialized permission sets, since checking each doc individually does not scale." },
+          { "q": "How do you revoke a user's access immediately when you use JWTs?", "a": "Keep access tokens short-lived (~5-15 minutes) and revoke the refresh token so no new ones are issued. For immediate cutoff, maintain a small deny-list of revoked token ids or a per-user 'tokens valid after' timestamp checked at the gateway, distributed via cache. Critical actions can additionally require a fresh server-side session check." },
+          { "q": "Why are passkeys phishing-resistant when OTP codes are not?", "a": "A passkey's signature is bound to the website's origin by the browser, so a look-alike phishing domain cannot obtain a valid assertion for the real site. OTP codes are just secrets a user can be tricked into typing into a proxy that relays them in real time. Passkeys also leave no shared secret on the server to steal." }
+        ]
+      },
+      "related": ["tls-crypto", "secrets-management", "threat-modeling", "caching", "consensus"]
+    },
+    {
+      "id": "tls-crypto",
+      "title": "TLS & Applied Cryptography",
+      "gist": "TLS lets two computers that have never met agree on secret keys and verify each other's identity, so data on the internet cannot be read or altered in transit.",
+      "overview": [
+        "When you visit your bank, your data crosses dozens of networks you do not control. **TLS** (the S in HTTPS) solves two problems: *privacy* (nobody in the middle can read it) and *authenticity* (you are really talking to your bank, not an impostor).",
+        "It works like this. Both sides use a clever bit of math called **key exchange** that lets them agree on a shared secret over a public channel, like two people mixing paint colors in public and ending up with a color only they know. The server also presents a **certificate**, a digital ID card signed by a trusted **certificate authority** (CA), proving it owns the domain name.",
+        "After that handshake, everything is encrypted with fast **symmetric** ciphers like AES-GCM or ChaCha20-Poly1305, which also detect any tampering. Modern TLS 1.3 does all this in a single round trip, and in 2026 most major browsers and CDNs also mix in **post-quantum** key exchange (ML-KEM) so recorded traffic stays safe even against future quantum computers."
+      ],
+      "diagram": {
+        "caption": "A TLS 1.3 handshake establishes keys in one round trip.",
+        "steps": [
+          { "label": "ClientHello", "detail": "Ciphers plus key share (X25519MLKEM768)" },
+          { "label": "ServerHello", "detail": "Server key share, both derive secrets" },
+          { "label": "Certificate + Verify", "detail": "Server proves identity, encrypted" },
+          { "label": "Finished", "detail": "Both confirm handshake transcript integrity" },
+          { "label": "Encrypted data", "detail": "AES-GCM or ChaCha20-Poly1305 records" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Key exchange", "role": "Ephemeral Diffie-Hellman (X25519 or P-256), now commonly hybridized with ML-KEM-768 (FIPS 203), produces a fresh shared secret per connection for forward secrecy." },
+          { "name": "Certificates and PKI", "role": "X.509 certificates bind a public key to domain names, chained to a root CA in the client's trust store; publicly logged in Certificate Transparency logs." },
+          { "name": "Signatures", "role": "The server signs the handshake transcript with its certificate's private key (ECDSA P-256, RSA-PSS or Ed25519) to prove possession." },
+          { "name": "Key schedule (HKDF)", "role": "Derives separate handshake and traffic keys for each direction from the shared secret and transcript hash." },
+          { "name": "AEAD record layer", "role": "Authenticated encryption (AES-128/256-GCM, ChaCha20-Poly1305) encrypts and integrity-protects each record with a unique nonce." }
+        ],
+        "flow": [
+          "The client sends ClientHello with supported cipher suites, the server name (SNI), and key shares for its preferred groups.",
+          "The server picks parameters, sends its own key share; both compute the shared secret and derive handshake keys.",
+          "The server sends its certificate chain and a CertificateVerify signature over the transcript, all encrypted.",
+          "The client validates the chain to a trusted root, checks the hostname, validity dates and revocation/CT status, then verifies the signature.",
+          "Both send Finished MACs over the transcript, detecting any tampering or downgrade; application data can now flow after one RTT.",
+          "On reconnect, a session ticket (PSK) enables resumption, and optionally 0-RTT early data at the cost of replay risk."
+        ],
+        "tradeoffs": [
+          { "choice": "0-RTT resumption", "pro": "Saves a full round trip on repeat connections", "con": "Early data can be replayed; only safe for idempotent requests" },
+          { "choice": "Hybrid post-quantum key exchange", "pro": "Protects against harvest-now-decrypt-later attacks", "con": "~1.1 KB larger ClientHello, occasional middlebox breakage" },
+          { "choice": "Short-lived certificates (e.g. 6-47 days)", "pro": "Limits damage from key compromise, reduces need for revocation", "con": "Requires fully automated issuance (ACME); manual processes break" },
+          { "choice": "TLS termination at the edge vs end-to-end", "pro": "Edge termination enables caching, WAF and load balancing", "con": "Plaintext inside the network unless re-encrypted with mTLS" }
+        ],
+        "numbers": [
+          { "metric": "TLS 1.3 full handshake", "value": "1 RTT (0-RTT on resumption)" },
+          { "metric": "AES-GCM throughput per modern x86 core", "value": "~5-10 GB/s with AES-NI/VAES" },
+          { "metric": "Public TLS cert max lifetime (CA/B Forum)", "value": "398 days, dropping to 47 by 2029" },
+          { "metric": "ML-KEM-768 public key size", "value": "1,184 bytes" },
+          { "metric": "Let's Encrypt active certificates", "value": "~500M+" },
+          { "metric": "Share of Cloudflare human traffic using PQ key exchange (late 2025)", "value": "~40-50%" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "TLS 1.3 removed a decade of foot-guns: static RSA key exchange (no forward secrecy), CBC mode ciphers (padding oracles like Lucky13 and POODLE), compression (CRIME), renegotiation, and custom DH groups. The handshake is encrypted after ServerHello, hiding the certificate, though SNI still leaks the hostname unless Encrypted Client Hello (ECH) is used, which Cloudflare and Firefox/Chrome support. Downgrade protection works by embedding a sentinel in ServerHello.random when a TLS 1.3 server negotiates an older version, and the Finished MAC covers the full transcript.",
+          "Applied crypto failures are almost always misuse, not broken primitives. AES-GCM catastrophically fails on nonce reuse under the same key (an attacker recovers the authentication key and can forge messages), so high-volume systems use random 96-bit nonces with key rotation well before ~2^32 messages, or misuse-resistant AES-GCM-SIV, or XChaCha20 with 192-bit nonces. Use high-level libraries (libsodium, Tink, BoringSSL/AWS-LC, rustls) rather than composing primitives. Compare MACs in constant time, never roll your own protocols, and hash passwords with a slow KDF (Argon2id), not SHA-256.",
+          "The PKI is the weakest link. Any trusted CA can issue for any domain, so Certificate Transparency (required by Chrome and Safari) makes mis-issuance detectable, and CAA DNS records restrict which CAs may issue. Revocation is effectively broken: OCSP has privacy and availability problems and Let's Encrypt ended OCSP support in 2025, moving browsers toward CRLite-style compressed CRLs and ever-shorter lifetimes. Post-quantum migration is happening in two halves: key exchange first (X25519MLKEM768 is default in Chrome, Firefox, Safari on iOS 26 and Cloudflare) because recorded traffic is at risk now, and signatures (ML-DSA, Merkle Tree Certificates) later because forging requires a quantum computer at connection time and PQ signatures are large."
+        ],
+        "failureModes": [
+          { "name": "Expired certificate outage", "description": "A manually managed cert expires and every client fails hard; famous examples include Microsoft Teams (2020) and Spotify. Fix: ACME automation, expiry monitoring at 30/14/7 days, inventory of all certs including internal ones." },
+          { "name": "Disabled certificate verification", "description": "Code sets verify=False or InsecureSkipVerify to fix a dev issue and ships it, allowing trivial man-in-the-middle. Fix: lint and test for it, use proper internal CAs, pin trust roots for internal services." },
+          { "name": "Nonce reuse in AEAD", "description": "Counter resets after restart or VM cloning cause the same nonce with the same key, breaking confidentiality and integrity. Fix: random nonces with rotation limits, nonce-misuse-resistant modes, library-managed nonces." }
+        ],
+        "realSystems": [
+          { "name": "Let's Encrypt and ACME", "note": "Free automated CA issuing hundreds of millions of 90-day certs via the ACME protocol (RFC 8555), with 6-day short-lived certs available from 2025." },
+          { "name": "Cloudflare / Google post-quantum rollout", "note": "Hybrid X25519MLKEM768 is enabled by default between modern browsers and their edges, protecting a large share of web traffic." },
+          { "name": "BoringSSL, AWS-LC and rustls", "note": "Hardened TLS libraries used by Chrome, AWS and many Rust services; AWS-LC has FIPS 140-3 validation and formally verified primitives." }
+        ],
+        "questions": [
+          { "q": "What does forward secrecy mean and how does TLS 1.3 guarantee it?", "a": "Forward secrecy means stealing the server's long-term private key later does not decrypt past recorded sessions. TLS 1.3 only allows ephemeral (EC)DHE key exchange, so each session's keys come from throwaway secrets that are deleted after use; the certificate key is only used to sign, not to transport keys. Session ticket keys must also be rotated, or they become a forward-secrecy hole." },
+          { "q": "Design TLS for 50,000 internal microservices.", "a": "Use mutual TLS issued by an internal CA with automated identity, e.g. SPIFFE IDs via SPIRE or a service mesh (Istio, Linkerd), so every workload gets a short-lived (~hours) certificate rotated automatically. Authorization policies reference workload identities, not IPs. Keep root keys in an HSM, use intermediates per cluster, and monitor issuance and handshake failures." },
+          { "q": "Why is the post-quantum migration prioritizing key exchange over signatures?", "a": "Attackers can record encrypted traffic today and decrypt it once a large quantum computer exists, so key exchange must be quantum-safe now. Forging a signature requires a quantum computer during the handshake itself, so signatures are less urgent. PQ signatures like ML-DSA are also several KB, which bloats certificate chains, so the ecosystem is exploring options like Merkle Tree Certificates first." }
+        ]
+      },
+      "related": ["authn-authz", "secrets-management", "quic-http", "tcp-ip", "cdn"]
+    },
+    {
+      "id": "secrets-management",
+      "title": "Secrets & Key Management",
+      "gist": "Secrets management keeps passwords, API keys and encryption keys out of code, hands them only to the right programs, and rotates them so leaks expire quickly.",
+      "overview": [
+        "Every program needs secrets: a database password, an API key for a payment provider, the key that encrypts customer data. The worst place for them is where they usually end up first: written in the code, in a config file, or pasted into a chat. Anyone who sees the code or the logs then has the keys to the kingdom.",
+        "A **secrets manager** is like a bank vault with a strict teller. Programs prove who they are (not with another password, but with an identity the platform vouches for, like \"I am the billing service running in this Kubernetes cluster\") and get back only the secrets they need, often for a short time. Every access is logged.",
+        "For encryption keys, companies use **key management services** (KMS) backed by **hardware security modules** (HSMs): tamper-resistant boxes that hold master keys and never let them out. Instead of handing out the master key, the KMS uses it to wrap (encrypt) smaller data keys, a pattern called **envelope encryption**. Losing one data key exposes little; the master never leaves the vault."
+      ],
+      "diagram": {
+        "caption": "A workload authenticates with its identity and receives a short-lived secret.",
+        "steps": [
+          { "label": "Workload identity", "detail": "K8s service account, cloud IAM role" },
+          { "label": "Auth to vault", "detail": "Signed identity token, no password" },
+          { "label": "Policy check", "detail": "Which paths may this identity read" },
+          { "label": "Issue secret", "detail": "Dynamic credential with short lease" },
+          { "label": "Rotate or revoke", "detail": "Expires automatically, access audited" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Secrets store", "role": "HashiCorp Vault / OpenBao, AWS Secrets Manager, GCP Secret Manager or Azure Key Vault: encrypted storage with access policies, versions and audit logs." },
+          { "name": "KMS and HSMs", "role": "AWS KMS, Cloud KMS or on-prem HSMs (FIPS 140-3 Level 3) hold root keys and perform encrypt, decrypt and sign operations without exporting key material." },
+          { "name": "Workload identity", "role": "Platform-issued identities such as Kubernetes projected service-account tokens, AWS IAM roles via IMDSv2 or IRSA, or SPIFFE SVIDs replace bootstrap passwords." },
+          { "name": "Dynamic secrets engine", "role": "Generates credentials on demand (e.g. a unique Postgres user valid for 1 hour) and revokes them when the lease ends." },
+          { "name": "Secret scanning", "role": "Pre-commit hooks and platform scanners (GitHub push protection, gitleaks, TruffleHog) catch keys before or after they land in repositories." }
+        ],
+        "flow": [
+          "A pod starts with a projected Kubernetes service-account token signed by the cluster's OIDC issuer.",
+          "Its sidecar or CSI driver presents the token to Vault, which validates it against the cluster's public keys and maps it to a role.",
+          "Vault checks the role's policy and returns a lease-bound secret, e.g. dynamic database credentials valid for 1 hour.",
+          "The app reads the secret from a tmpfs file or memory, never from environment variables baked into images.",
+          "For data encryption, the app asks KMS for a data key: it gets a plaintext key to use and a KMS-encrypted copy to store beside the data.",
+          "Before the lease expires the agent renews or fetches new credentials; on revocation the database user is dropped.",
+          "Every request is written to an audit log, and anomalies (unusual reads, new identities) trigger alerts."
+        ],
+        "tradeoffs": [
+          { "choice": "Dynamic short-lived credentials vs static secrets", "pro": "A leaked credential expires within minutes or hours; per-instance credentials pinpoint leaks", "con": "Vault becomes a critical dependency; apps must handle rotation and reconnection" },
+          { "choice": "Environment variables vs mounted files", "pro": "Env vars are simple and universal", "con": "Leak via process listings, crash dumps, child processes and debug endpoints" },
+          { "choice": "Cloud KMS vs self-managed HSM", "pro": "KMS: managed, cheap per key, integrated with IAM", "con": "Trust in the provider; HSMs give sole custody but are expensive and operationally heavy" },
+          { "choice": "Envelope encryption per object vs one key per table", "pro": "Fine-grained keys enable crypto-shredding of individual tenants", "con": "More key metadata and KMS calls; needs data-key caching" }
+        ],
+        "numbers": [
+          { "metric": "Secrets leaked on public GitHub in 2024 (GitGuardian)", "value": "~23-24 million" },
+          { "metric": "AWS KMS key price", "value": "~$1 per key-month, ~$0.03 per 10k requests" },
+          { "metric": "AWS KMS symmetric request quota (shared)", "value": "~5,500-100,000 req/s by region" },
+          { "metric": "Typical dynamic DB credential TTL", "value": "~1-24 hours" },
+          { "metric": "Median time for leaked AWS key to be exploited", "value": "Minutes after public push" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "The bootstrap problem, often called 'secret zero', is the real design question: how does a workload authenticate to the secrets store without already holding a secret? The modern answer is to lean on platform attestation: cloud instance identity documents, Kubernetes service-account tokens with audience binding, or SPIRE attesting node and workload properties, then exchange them for short-lived credentials. Better still is eliminating secrets entirely: cloud IAM federation (GitHub Actions OIDC to AWS roles), IAM database authentication, and mTLS between services remove long-lived keys from the system.",
+          "Envelope encryption scales KMS: a KMS call per row would hit quotas and add ~ms latency, so systems generate a data encryption key (DEK) per object, file or tenant, encrypt locally with AES-GCM, and store the KMS-wrapped DEK alongside the ciphertext, caching plaintext DEKs briefly in memory. Rotating the key-encryption key only requires rewrapping DEKs, not re-encrypting data. Deleting a tenant's DEK renders their data unreadable everywhere, including backups, which is how crypto-shredding meets GDPR erasure requirements. Encryption context or AAD should bind ciphertext to its owner to stop ciphertext-swapping attacks.",
+          "Rotation is where secrets programs fail operationally. A secret that has never been rotated usually cannot be rotated safely, because nobody knows every consumer. Design for dual validity: issue the new secret, let consumers pick it up, then revoke the old one, and rehearse it. Kubernetes Secrets are only base64-encoded and stored in etcd, so enable etcd encryption with a KMS provider and restrict RBAC on secrets. Logging and tracing are common leak paths: redact authorization headers and connection strings at the logging library, not by convention."
+        ],
+        "failureModes": [
+          { "name": "Secret committed to git", "description": "An AWS key pushed to a public repo is scraped and used for crypto-mining within minutes; deleting the commit does not help because history and forks persist. Fix: push protection, revoke immediately, prefer OIDC federation over long-lived keys." },
+          { "name": "Secrets store as single point of failure", "description": "Vault is sealed or unreachable after an outage and every service that needs credentials at startup fails, blocking recovery. Fix: HA clusters with auto-unseal via KMS, cached credentials with grace periods, break-glass procedures." },
+          { "name": "Over-broad access", "description": "One CI token or service role can read all secrets, so a single compromise (e.g. a malicious dependency in a build) exfiltrates everything, as in several 2024-2025 CI supply-chain incidents. Fix: per-service paths, least privilege, short-lived scoped tokens." }
+        ],
+        "realSystems": [
+          { "name": "HashiCorp Vault / OpenBao", "note": "Widely used secrets platform with dynamic secrets, transit encryption-as-a-service and PKI engines; OpenBao is the Linux Foundation fork after Vault's 2023 license change." },
+          { "name": "AWS KMS and Secrets Manager", "note": "KMS keys live in FIPS 140-3 validated HSMs and never leave them; Secrets Manager adds rotation Lambdas for RDS and other credentials." },
+          { "name": "SPIFFE/SPIRE", "note": "CNCF standard for workload identity issuing short-lived X.509 or JWT SVIDs after node and workload attestation, used at Uber, Bloomberg and others." }
+        ],
+        "questions": [
+          { "q": "How would you encrypt a multi-tenant database so one tenant's data can be destroyed on request?", "a": "Use envelope encryption with a per-tenant data key: encrypt sensitive fields or files with AES-GCM using that tenant's DEK, store the DEK wrapped by a KMS key, and include tenant id as AAD. To erase a tenant, delete their wrapped DEK (and any caches); all their ciphertext, including in backups, becomes unrecoverable. Rotating the KMS key only rewraps DEKs." },
+          { "q": "A developer pushed a production database password to a public GitHub repo. Walk through the response.", "a": "Rotate the credential immediately, since rewriting history does not remove it from forks, caches or scrapers. Check database and audit logs for use since the push time, and treat it as a potential breach if any unknown access occurred. Then fix root causes: enable push protection and pre-commit scanning, move the service to dynamic or IAM-based credentials, and verify no other secrets exist in history." },
+          { "q": "How do CI pipelines deploy to the cloud without storing cloud keys?", "a": "Use OIDC federation: the CI platform (e.g. GitHub Actions) issues a signed token describing the repo, branch and workflow; the cloud trusts that issuer and exchanges the token for short-lived role credentials if claims match a policy. No long-lived secret is stored, and policies can restrict deployment to protected branches." }
+        ]
+      },
+      "related": ["authn-authz", "tls-crypto", "isolation-sandboxing", "containers-vms", "replication"]
+    },
+    {
+      "id": "isolation-sandboxing",
+      "title": "Isolation & Sandboxing",
+      "gist": "Isolation and sandboxing run code inside walls it cannot climb, so a bug or malicious program can only damage its own small box instead of the whole machine.",
+      "overview": [
+        "Modern computers constantly run code they do not fully trust: web pages, plugins, customer workloads on a cloud server, and now AI agents executing generated code. **Sandboxing** puts that code in a box with only the tools it needs, like letting a contractor into one room of your house with a locked door, not handing them the master key.",
+        "Walls come in different strengths. A **process** is separated from other processes by the operating system. A **container** adds more walls inside the same OS kernel, giving each app its own view of files and network. A **virtual machine** goes further by giving each guest its own kernel on emulated hardware. Lighter tools like **WebAssembly** and browser sandboxes restrict code within a single program.",
+        "The tradeoff is always strength versus cost: thicker walls take more memory and start more slowly. Clouds solved this with **micro-VMs** like AWS Firecracker, which start in about a tenth of a second yet give each customer's function its own kernel."
+      ],
+      "diagram": {
+        "caption": "Isolation boundaries from weakest and cheapest to strongest.",
+        "steps": [
+          { "label": "Language sandbox", "detail": "Wasm, V8 isolates: in-process" },
+          { "label": "OS process", "detail": "Separate address space, seccomp filters" },
+          { "label": "Container", "detail": "Namespaces, cgroups, shared kernel" },
+          { "label": "Sandboxed kernel", "detail": "gVisor intercepts syscalls in userspace" },
+          { "label": "MicroVM / VM", "detail": "Own kernel, hardware virtualization" },
+          { "label": "Confidential VM", "detail": "Memory encrypted from host (SEV-SNP/TDX)" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Linux namespaces", "role": "Give a process its own view of PIDs, mounts, network, users, IPC and hostnames; the basis of containers." },
+          { "name": "cgroups v2", "role": "Limit and account CPU, memory, I/O and process counts so one tenant cannot starve others." },
+          { "name": "seccomp-bpf and LSMs", "role": "seccomp filters which syscalls a process may make; AppArmor, SELinux and Landlock enforce file and network access policies." },
+          { "name": "Hypervisor", "role": "KVM plus a minimal VMM (Firecracker, Cloud Hypervisor) uses CPU virtualization extensions (VT-x/AMD-V) and EPT to give guests their own kernel and memory." },
+          { "name": "Userspace kernels and runtimes", "role": "gVisor reimplements Linux syscalls in a Go process; WebAssembly runtimes (Wasmtime, V8) bound memory access with software checks and guard pages." }
+        ],
+        "flow": [
+          "An untrusted workload is scheduled; the platform chooses a boundary based on trust level, e.g. a microVM per tenant.",
+          "The VMM creates a VM with a minimal device model (virtio net and block only) and boots a stripped kernel in ~125 ms.",
+          "Inside, the workload runs as a non-root user in a container with namespaces, a read-only root filesystem and dropped capabilities.",
+          "seccomp restricts syscalls to an allowlist, so even a compromised process cannot call unusual kernel interfaces.",
+          "Network egress passes through a policy proxy that permits only approved destinations.",
+          "cgroups cap CPU and memory; when the job ends, the VM is destroyed rather than reused across tenants."
+        ],
+        "tradeoffs": [
+          { "choice": "Containers vs VMs for multi-tenant code", "pro": "Containers: ms startup, dense packing, low overhead", "con": "Shared kernel means one kernel bug escapes to the host; VMs have a much smaller attack surface" },
+          { "choice": "gVisor vs microVM", "pro": "gVisor needs no nested virtualization and starts fast", "con": "Syscall-heavy workloads pay ~10-50%+ overhead and some syscalls are unsupported" },
+          { "choice": "WebAssembly / V8 isolates", "pro": "Microsecond startup, thousands per process (Cloudflare Workers)", "con": "Limited to supported languages and APIs; Spectre side channels need extra mitigations" },
+          { "choice": "Reusing warm sandboxes across requests", "pro": "Avoids cold starts", "con": "Must never be reused across tenants; leftover state can leak data" }
+        ],
+        "numbers": [
+          { "metric": "Firecracker microVM boot time", "value": "~125 ms, <5 MiB memory overhead" },
+          { "metric": "Firecracker creation rate per host", "value": "~150 microVMs/s" },
+          { "metric": "V8 isolate startup (Cloudflare Workers)", "value": "~5 ms or less" },
+          { "metric": "Container startup (runc)", "value": "~100s of ms" },
+          { "metric": "Linux syscalls on x86-64", "value": "~360+, typical seccomp allowlist ~50-150" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Container escapes usually come from kernel bugs or misconfiguration rather than broken namespaces. Privileged containers, mounted Docker sockets, hostPath mounts, CAP_SYS_ADMIN, and running as root without user namespaces each collapse the boundary. Notable bugs: runc CVE-2019-5736 (overwriting the host runc binary), CVE-2024-21626 'Leaky Vessels' (leaked file descriptor to host filesystem), and recurring kernel flaws reachable through unprivileged user namespaces such as io_uring and netfilter, which is why Google disabled io_uring on production and ChromeOS. Rootless containers and user namespaces map container root to an unprivileged host uid.",
+          "Hypervisors shrink attack surface by minimizing what the guest can touch. Firecracker exposes only five emulated devices, is written in Rust, and runs each VMM inside a 'jailer' with seccomp, cgroups and chroot, a defense-in-depth pattern where escaping the VM still lands in a sandboxed process. Side channels are the residual risk: Spectre, L1TF, MDS and later Downfall and Inception leak data across hyperthreads and VMs, so clouds avoid co-scheduling different tenants on sibling hyperthreads and apply microcode plus kernel mitigations, at measurable performance cost.",
+          "Confidential computing flips the threat model to distrust the host itself: AMD SEV-SNP and Intel TDX encrypt guest memory with per-VM keys and provide remote attestation, and NVIDIA H100/Blackwell GPUs offer confidential-compute modes for AI workloads. Browser and agent sandboxes compose layers: Chrome's renderer runs in a process with seccomp and namespaces plus site isolation to defend against Spectre, and code-executing AI agents are typically run in disposable microVMs or gVisor with egress allowlists, because the generated code is untrusted by definition."
+        ],
+        "failureModes": [
+          { "name": "Privileged container escape", "description": "A container running privileged or with the Docker socket mounted lets an attacker control the host and all neighbors. Fix: Pod Security Admission 'restricted', drop capabilities, no host mounts, user namespaces." },
+          { "name": "Kernel exploit through shared kernel", "description": "A local privilege escalation bug in a syscall reachable from containers gives host root to any tenant. Fix: tighter seccomp profiles, gVisor or microVMs for untrusted code, rapid kernel patching." },
+          { "name": "Cross-tenant state leakage", "description": "Reused warm workers keep temp files, caches or env vars from a previous tenant. Fix: one sandbox per tenant, destroy-after-use, scrub memory and disks, test for residue." }
+        ],
+        "realSystems": [
+          { "name": "AWS Firecracker", "note": "Rust microVM monitor powering Lambda and Fargate, running trillions of invocations a month with a VM boundary per function." },
+          { "name": "Google gVisor", "note": "Userspace kernel used in Cloud Run, GKE Sandbox and App Engine to give container ergonomics with a much smaller host kernel surface." },
+          { "name": "Cloudflare Workers / Chrome sandbox", "note": "Workers run many tenants as V8 isolates in one process with extra Spectre mitigations; Chrome isolates sites into separate sandboxed renderer processes." }
+        ],
+        "questions": [
+          { "q": "Design a service that runs untrusted user-submitted Python code, like an online judge or AI code interpreter.", "a": "Run each execution in a fresh microVM (Firecracker) or gVisor sandbox from a pre-warmed snapshot pool for fast start, with a non-root user, read-only base image, tmpfs scratch, and strict CPU, memory, time and process limits. Deny network by default or allow only an egress proxy. Destroy the sandbox after each run and never share across users; log and rate-limit to stop abuse such as mining." },
+          { "q": "Why do public clouds not run different customers in plain containers on the same kernel?", "a": "Containers share the host kernel, which exposes hundreds of syscalls and a steady stream of privilege-escalation bugs; one exploitable bug compromises every tenant on the host. A VM boundary reduces the attack surface to a small virtual device model and the hypervisor. Clouds therefore use VMs or microVMs per tenant and containers only within a tenant." },
+          { "q": "What does confidential computing protect against that normal VMs do not?", "a": "Normal VMs trust the hypervisor and cloud operator, who can read guest memory. SEV-SNP and TDX encrypt guest memory with keys held by the CPU and add integrity protection, so a compromised host or insider cannot read or tamper with it, and attestation lets the workload prove to a remote party what code it runs. It does not fix bugs inside the guest or all side channels." }
+        ]
+      },
+      "related": ["containers-vms", "syscalls-kernel", "virtual-memory", "threat-modeling", "secrets-management"]
+    },
+    {
+      "id": "threat-modeling",
+      "title": "Threat Modeling",
+      "gist": "Threat modeling is a structured way to ask what could go wrong with a system, who might attack it, and which defenses matter most, before building it.",
+      "overview": [
+        "Before you install locks in a new house, you think: where are the doors and windows, what is valuable inside, who might break in, and how? **Threat modeling** is that same thinking applied to software. You sketch how data moves through your system, mark where it crosses from less trusted to more trusted places, and ask what an attacker could do at each crossing.",
+        "A popular framing is four questions: *What are we working on? What can go wrong? What are we going to do about it? Did we do a good job?* Checklists like **STRIDE** help with the second question by reminding you of six kinds of threats: Spoofing identity, Tampering with data, Repudiation (denying you did something), Information disclosure, Denial of service, and Elevation of privilege.",
+        "The output is not a thick document but a short, prioritized list of risks with owners and fixes. Done early, it is far cheaper than discovering the same problem after a breach. It also guides where to spend effort: you cannot defend everything equally, so you focus on the most valuable assets and the most likely attackers."
+      ],
+      "diagram": {
+        "caption": "The threat modeling loop from system model to verified mitigations.",
+        "steps": [
+          { "label": "Model the system", "detail": "Data flow diagram, assets, actors" },
+          { "label": "Mark trust boundaries", "detail": "Where trust level changes" },
+          { "label": "Enumerate threats", "detail": "STRIDE per element and flow" },
+          { "label": "Prioritize risks", "detail": "Likelihood times impact" },
+          { "label": "Mitigate and verify", "detail": "Controls, tests, revisit on change" }
+        ]
+      },
+      "howItWorks": {
+        "components": [
+          { "name": "Data flow diagram (DFD)", "role": "Shows external entities, processes, data stores and data flows, with trust boundaries drawn where privilege or ownership changes." },
+          { "name": "Assets and adversaries", "role": "What must be protected (customer data, signing keys, availability) and who realistically attacks it (fraudsters, insiders, nation-states, compromised dependencies)." },
+          { "name": "Threat taxonomy", "role": "STRIDE for design-level threats, LINDDUN for privacy, MITRE ATT&CK for attacker techniques, and OWASP Top 10 / LLM Top 10 for common app risks." },
+          { "name": "Risk scoring", "role": "Ranks threats by likelihood and impact, e.g. simple high/medium/low, DREAD-like scores, or CVSS for concrete vulnerabilities." },
+          { "name": "Mitigations and tracking", "role": "Each accepted threat maps to a control (authn, input validation, encryption, rate limiting, logging), an owner and a test, tracked like any engineering work." }
+        ],
+        "flow": [
+          "The team draws a DFD of the feature, including third-party services, queues, admin tools and CI/CD.",
+          "Trust boundaries are marked: internet to edge, edge to services, services to databases, tenant to tenant, and humans to admin consoles.",
+          "For each element and boundary-crossing flow, the team walks STRIDE categories and lists concrete threats.",
+          "Attack trees or abuse cases expand the highest-value goals, such as 'read another tenant's invoices'.",
+          "Threats are ranked, and mitigations are chosen: eliminate, reduce, transfer or explicitly accept with sign-off.",
+          "Mitigations become tickets and tests; the model is revisited when architecture changes or after incidents and pen tests."
+        ],
+        "tradeoffs": [
+          { "choice": "Lightweight per-feature models vs big upfront model", "pro": "Small models stay current and fit agile delivery", "con": "May miss cross-cutting threats that only a system-wide view reveals" },
+          { "choice": "STRIDE checklist vs attacker-centric (ATT&CK, red team)", "pro": "STRIDE is systematic and teachable to any engineer", "con": "Can produce long generic lists; attacker-centric methods find realistic chains but need expertise" },
+          { "choice": "Accepting a risk vs mitigating", "pro": "Saves effort for low-impact, unlikely threats", "con": "Accepted risks must be documented and revisited or they become forgotten liabilities" }
+        ],
+        "numbers": [
+          { "metric": "STRIDE categories", "value": "6" },
+          { "metric": "Typical feature threat-model session", "value": "~1-2 hours" },
+          { "metric": "Median attacker dwell time (Mandiant M-Trends 2025)", "value": "~11 days" },
+          { "metric": "Average breach cost (IBM 2025)", "value": "~$4.4M globally" },
+          { "metric": "MITRE ATT&CK Enterprise techniques", "value": "~200 techniques, ~400+ sub-techniques" }
+        ]
+      },
+      "expert": {
+        "details": [
+          "Good threat models focus on trust boundaries and assumptions, not components. The most valuable findings are usually implicit assumptions: 'the internal network is trusted', 'only our frontend calls this API', 'the queue message came from our service', 'the tenant id in the request is honest'. Each assumption is a potential vulnerability if an attacker can reach the interface directly. Zero-trust architecture is essentially the result of threat modeling the network boundary away: authenticate and authorize every request regardless of origin.",
+          "Supply chain and the build system are now first-class threat surfaces. SolarWinds (2020), the Codecov bash uploader (2021), the xz-utils backdoor (2024) and repeated npm package compromises show attackers targeting what you trust implicitly. Mitigations include SLSA provenance levels, signed artifacts (Sigstore/cosign), pinned and reviewed dependencies, hermetic builds, and least-privilege CI tokens. Model CI/CD as a production system with its own trust boundaries, since it usually holds the keys to deploy everything.",
+          "LLM-powered features introduce new threat classes that classic STRIDE handles only partially. Prompt injection, where untrusted content (a web page, email or document) carries instructions the model follows, is effectively a confused-deputy problem: the model acts with the user's privileges on attacker-supplied input. Mitigations are architectural rather than filter-based: treat model output as untrusted, limit tool permissions, require human confirmation for side effects, separate data from instructions, and isolate agents that read untrusted content from those that hold sensitive capabilities (OWASP Top 10 for LLM Applications 2025 ranks prompt injection first)."
+        ],
+        "failureModes": [
+          { "name": "Shelfware threat model", "description": "A document is written once for compliance and never updated, so new features and integrations bypass it. Fix: lightweight models per design review, stored with the code, refreshed on architecture changes and incidents." },
+          { "name": "Implicit trust in internal callers", "description": "Services skip authentication because 'only the gateway calls us'; an SSRF bug or compromised pod then reaches everything (as in the 2019 Capital One breach via SSRF to cloud metadata). Fix: mutual authentication, IMDSv2, per-service authorization." },
+          { "name": "Ignoring availability and abuse", "description": "Teams model data theft but not cost or abuse: account-creation spam, expensive queries, unbounded uploads. Fix: include DoS, rate limits, quotas and business-logic abuse cases in every model." }
+        ],
+        "realSystems": [
+          { "name": "Microsoft SDL and Threat Modeling Tool", "note": "Microsoft formalized STRIDE in the late 1990s and made threat modeling a mandatory Security Development Lifecycle step." },
+          { "name": "Google BeyondCorp", "note": "Zero-trust access model born from re-threat-modeling the corporate network after Operation Aurora (2009): no implicit trust from network location." },
+          { "name": "OWASP Threat Dragon / Threat Modeling Manifesto", "note": "Open-source DFD-based modeling tool and community principles emphasizing continuous, collaborative, lightweight modeling." }
+        ],
+        "questions": [
+          { "q": "Threat model a file-upload feature for a multi-tenant SaaS.", "a": "Draw the flow from browser to upload API to object storage to processing workers to viewer. Key threats: spoofing (uploads without auth), tampering (overwriting another tenant's object via predictable keys), information disclosure (public bucket, guessable URLs, IDOR on download), DoS (huge files, zip bombs), and elevation of privilege (malicious files exploiting image parsers in workers). Mitigations: signed scoped upload URLs, tenant-prefixed random keys, size and type limits, sandboxed processing, short-lived signed download URLs with authz checks." },
+          { "q": "How would you threat model an AI agent that reads email and can send messages?", "a": "The core boundary is between untrusted email content and the agent's privileged actions. Threats include prompt injection causing data exfiltration or unwanted sends, over-broad tool scopes, and leaking data in links or URLs. Mitigations: least-privilege tools, explicit user confirmation for sends and other side effects, treating retrieved content as data, output filtering for exfiltration channels, and audit logs of every action." },
+          { "q": "How do you prioritize when the threat model produces 80 threats?", "a": "Rank by impact on the most valuable assets and by realistic likelihood given your actual adversaries and exposure, focusing on internet-reachable boundaries first. Group threats that share a mitigation (e.g. central authz fixes ten IDOR threats). Fix critical ones before launch, schedule the rest with owners, and explicitly accept the low ones with a review date." }
+        ]
+      },
+      "related": ["authn-authz", "isolation-sandboxing", "secrets-management", "av-safety", "load-balancing"]
+    }
+  ]
+}
