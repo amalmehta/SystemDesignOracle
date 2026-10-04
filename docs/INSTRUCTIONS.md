@@ -44,7 +44,8 @@ The website in `website/` shows the same content as the app. Build it and previe
 python3 scripts/build_site.py --serve
 ```
 
-Then open http://localhost:8000. The build checks the content, copies `website/` to
+Then open the address it prints (http://localhost:8000, or the next free port if 8000 is busy);
+Ctrl-C stops it. Rerun the command after editing content or `website/`. The build checks the content, copies `website/` to
 `build/site/`, and merges all content into `build/site/content.json`.
 
 **Deploying:** every push to `main` runs `.github/workflows/pages.yml`, which builds the site

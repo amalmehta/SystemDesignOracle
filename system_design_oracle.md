@@ -100,3 +100,4 @@ CHANGELOG:
 - 2026-10-02 — built v1.0 of the Mac app: 10 domains, 56 topics, 10 worked design problems, 4 reading layers; filled in OPEN QUESTIONS / ASSUMPTIONS
 - 2026-10-02 — built the website version (same content and features) with GitHub Pages deploy
 - 2026-10-02 — made the repo public so GitHub Pages can host the website; site live
+- 2026-10-04 — website preview: picks the next free port if 8000 is busy, quiet log, clean Ctrl-C
